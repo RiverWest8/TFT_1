@@ -48,7 +48,7 @@ import numpy as np
 import pandas as pd
 import pandas as _pd
 pd = _pd  # Ensure pd always refers to pandas module
-import lightning as pl
+import lightning.pytorch as pl
 from lightning.pytorch import Trainer, seed_everything
 import torch
 import torch.nn as nn
@@ -1874,7 +1874,7 @@ if __name__ == "__main__":
         tail_q=0.85,
         tail_weight=3.0
     )
-    tail_cb = TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=9.0, ramp_epochs=6),
+    tail_cb = TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=9.0, ramp_epochs=6)
     from pytorch_forecasting.metrics import MultiLoss
     # one-off in your data prep (TRAIN split)
     counts = train_df["direction"].value_counts()
