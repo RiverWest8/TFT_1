@@ -281,13 +281,6 @@ import torch
 import torch.nn.functional as F
 
 class AsymmetricQuantileLoss(QuantileLoss):
-    """
-    Pinball (quantile) loss with:
-      - Underestimation penalty (heavier cost when forecasts are too low)
-      - Optional mean-bias penalty to align median prediction with batch mean
-      - Optional tail emphasis to give more weight to large targets (spikes)
-    """
-
     def __init__(self, quantiles, underestimation_factor: float = 1.1115,
                  mean_bias_weight: float = 0.0, tail_q: float = 0.85,
                  tail_weight: float = 0.0, **kwargs):
@@ -302,41 +295,40 @@ class AsymmetricQuantileLoss(QuantileLoss):
             self._q50_idx = len(self.quantiles) // 2
 
     def loss_per_prediction(self, y_pred, target):
-        diff = target.unsqueeze(-1) - y_pred  # positive ⇒ under-prediction
-        q = torch.tensor(self.quantiles, device=y_pred.device).view(
+        if isinstance(target, tuple):
+            target = target[0]
+        diff = target.unsqueeze(-1) - y_pred
+        q = torch.tensor(self.quantiles, device=y_pred.device, dtype=y_pred.dtype).view(
             *([1] * (diff.ndim - 1)), -1
         )
         alpha = torch.as_tensor(self.underestimation_factor, dtype=y_pred.dtype, device=y_pred.device)
-        # Base pinball loss with underestimation factor
         loss = torch.where(
             diff >= 0,
             alpha * q * diff,
             (1 - q) * (-diff),
         )
-
-        # Tail emphasis: scale loss for extreme values
-        if self.tail_weight > 0:
+        # Tail weighting
+        if self.tail_weight and self.tail_weight > 0:
             try:
                 thresh = torch.quantile(target.detach(), self.tail_q)
-                w = torch.where(target.unsqueeze(-1) > thresh, self.tail_weight, 1.0)
+                w = torch.where(target.unsqueeze(-1) > thresh, 1.0 + (self.tail_weight - 1.0), 1.0)
                 loss = loss * w
             except Exception:
                 pass
-
         return loss
 
     def forward(self, y_pred, target):
         base = self.loss_per_prediction(y_pred, target).mean()
         if self.mean_bias_weight > 0:
             try:
+                if isinstance(target, tuple):
+                    target = target[0]
                 med = y_pred[..., self._q50_idx]
                 mean_diff = (target - med).mean()
-                penalty = F.relu(mean_diff) ** 2 * self.mean_bias_weight
-                return base + penalty
+                base = base + (F.relu(mean_diff) ** 2) * self.mean_bias_weight
             except Exception:
-                return base
+                pass
         return base
-
 class PerAssetMetrics(pl.Callback):
     """Collects per-asset predictions during validation and prints/saves metrics.
     Computes MAE, RMSE, MSE, QLIKE for realised_vol and Accuracy for direction.
