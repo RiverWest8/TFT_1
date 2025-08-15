@@ -280,6 +280,7 @@ class LabelSmoothedBCE(nn.Module):
 import torch
 import torch.nn.functional as F
 
+
 class AsymmetricQuantileLoss(QuantileLoss):
     def __init__(self, quantiles, underestimation_factor: float = 1.1115,
                  mean_bias_weight: float = 0.0, tail_q: float = 0.85,
@@ -311,7 +312,8 @@ class AsymmetricQuantileLoss(QuantileLoss):
         if self.tail_weight and self.tail_weight > 0:
             try:
                 thresh = torch.quantile(target.detach(), self.tail_q)
-                w = torch.where(target.unsqueeze(-1) > thresh, 1.0 + (self.tail_weight - 1.0), 1.0)
+                w = torch.where(target.unsqueeze(-1) > thresh,
+                                1.0 + (self.tail_weight - 1.0), 1.0)
                 loss = loss * w
             except Exception:
                 pass
@@ -325,10 +327,13 @@ class AsymmetricQuantileLoss(QuantileLoss):
                     target = target[0]
                 med = y_pred[..., self._q50_idx]
                 mean_diff = (target - med).mean()
-                base = base + (F.relu(mean_diff) ** 2) * self.mean_bias_weight
+                # Symmetric penalty: penalize both over- and under-prediction of median
+                base = base + (mean_diff ** 2) * self.mean_bias_weight
             except Exception:
                 pass
         return base
+
+
 class PerAssetMetrics(pl.Callback):
     """Collects per-asset predictions during validation and prints/saves metrics.
     Computes MAE, RMSE, MSE, QLIKE for realised_vol and Accuracy for direction.
@@ -1073,6 +1078,16 @@ class MirrorCheckpoints(pl.Callback):
         mirror_local_ckpts_to_gcs()
     def on_train_end(self, trainer, pl_module):
         mirror_local_ckpts_to_gcs()
+
+class TailWeightRamp(pl.Callback):
+    def __init__(self, vol_loss, start: float = 1.0, end: float = 9.0, ramp_epochs: int = 6):
+        super().__init__()
+        self.vol_loss, self.start, self.end, self.ramp = vol_loss, float(start), float(end), int(ramp_epochs)
+    def on_train_epoch_start(self, trainer, pl_module):
+        e = int(getattr(trainer, "current_epoch", 0))
+        prog = 1.0 if self.ramp <= 0 else min(1.0, e / float(self.ramp))
+        self.vol_loss.tail_weight = self.start + (self.end - self.start) * prog
+        print(f"[TAIL] epoch={e} tail_weight={self.vol_loss.tail_weight}")
 
 class ReduceLROnPlateauCallback(pl.Callback):
     def __init__(self, monitor="val_loss_decoded", factor=0.5, patience=3, min_lr=1e-5, cooldown=0):
@@ -1850,6 +1865,7 @@ if __name__ == "__main__":
     mirror_cb = MirrorCheckpoints()
 
     red_cb = ReduceLROnPlateauCallback(monitor="val_loss_decoded", factor=0.5, patience=3, min_lr=1e-5)
+    tail_cb = TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=9.0, ramp_epochs=6),
     from pytorch_forecasting.metrics import MultiLoss
 
     VOL_LOSS = AsymmetricQuantileLoss(
@@ -1857,7 +1873,7 @@ if __name__ == "__main__":
         underestimation_factor=3,
         mean_bias_weight=0.05,
         tail_q=0.85,
-        tail_weight=9.0
+        tail_weight=3.0
     )
     # one-off in your data prep (TRAIN split)
     counts = train_df["direction"].value_counts()
@@ -1875,10 +1891,10 @@ if __name__ == "__main__":
 
     tft = TemporalFusionTransformer.from_dataset(
         training_dataset,
-        hidden_size=128,
+        hidden_size=96,
         attention_head_size=4,
         dropout=0.0833704625250354, #0.0833704625250354,
-        hidden_continuous_size=32,
+        hidden_continuous_size=24,
         learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.000815), #0.0019 0017978
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
@@ -1930,7 +1946,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, bias_cb, red_cb],
+        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, bias_cb, red_cb, tail_cb],
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
     )
