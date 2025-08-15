@@ -1865,8 +1865,7 @@ if __name__ == "__main__":
     mirror_cb = MirrorCheckpoints()
 
     red_cb = ReduceLROnPlateauCallback(monitor="val_loss_decoded", factor=0.5, patience=3, min_lr=1e-5)
-    tail_cb = TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=9.0, ramp_epochs=6),
-    from pytorch_forecasting.metrics import MultiLoss
+
 
     VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
@@ -1875,6 +1874,8 @@ if __name__ == "__main__":
         tail_q=0.85,
         tail_weight=3.0
     )
+    tail_cb = TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=9.0, ramp_epochs=6),
+    from pytorch_forecasting.metrics import MultiLoss
     # one-off in your data prep (TRAIN split)
     counts = train_df["direction"].value_counts()
     n_pos = counts.get(1, 1)
