@@ -282,21 +282,20 @@ import torch.nn.functional as F
 
 class AsymmetricQuantileLoss(QuantileLoss):
     """
-    Pinball (quantile) loss with an extra multiplier applied only when the
-    prediction is BELOW the ground-truth value (i.e. under-prediction).
-
-    Setting ``underestimation_factor`` > 1 makes the model pay a larger
-    penalty for forecasts that are too low.
-
-    Additionally, an optional small mean-bias penalty encourages the
-    median prediction to match the target mean across the batch, helping
-    correct persistent under-prediction on the decoded scale.
+    Pinball (quantile) loss with:
+      - Underestimation penalty (heavier cost when forecasts are too low)
+      - Optional mean-bias penalty to align median prediction with batch mean
+      - Optional tail emphasis to give more weight to large targets (spikes)
     """
+
     def __init__(self, quantiles, underestimation_factor: float = 1.1115,
-                 mean_bias_weight: float = 0.0, **kwargs):
+                 mean_bias_weight: float = 0.0, tail_q: float = 0.85,
+                 tail_weight: float = 0.0, **kwargs):
         super().__init__(quantiles=quantiles, **kwargs)
         self.underestimation_factor = float(underestimation_factor)
         self.mean_bias_weight = float(mean_bias_weight)
+        self.tail_q = float(tail_q)
+        self.tail_weight = float(tail_weight)
         try:
             self._q50_idx = self.quantiles.index(0.5)
         except Exception:
@@ -308,16 +307,26 @@ class AsymmetricQuantileLoss(QuantileLoss):
             *([1] * (diff.ndim - 1)), -1
         )
         alpha = torch.as_tensor(self.underestimation_factor, dtype=y_pred.dtype, device=y_pred.device)
-        # Heavier penalty when under-predicting
+        # Base pinball loss with underestimation factor
         loss = torch.where(
             diff >= 0,
             alpha * q * diff,
             (1 - q) * (-diff),
         )
+
+        # Tail emphasis: scale loss for extreme values
+        if self.tail_weight > 0:
+            try:
+                thresh = torch.quantile(target.detach(), self.tail_q)
+                w = torch.where(target.unsqueeze(-1) > thresh, self.tail_weight, 1.0)
+                loss = loss * w
+            except Exception:
+                pass
+
         return loss
 
     def forward(self, y_pred, target):
-        base = super().forward(y_pred, target)
+        base = self.loss_per_prediction(y_pred, target).mean()
         if self.mean_bias_weight > 0:
             try:
                 med = y_pred[..., self._q50_idx]
@@ -327,7 +336,6 @@ class AsymmetricQuantileLoss(QuantileLoss):
             except Exception:
                 return base
         return base
-
 
 class PerAssetMetrics(pl.Callback):
     """Collects per-asset predictions during validation and prints/saves metrics.
@@ -429,12 +437,9 @@ class PerAssetMetrics(pl.Callback):
             pred = pred["prediction"]
 
         def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
-            """
-            Use the 0.5 quantile (median) to compute a point forecast, matching the
-            PerAssetMetrics callback behaviour. Assumes last dim is quantiles:
-            [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95]
-            """
-            return vol_q[..., 3]
+            q50 = vol_q[..., 3]
+            q75 = vol_q[..., 4] if vol_q.size(-1) > 4 else vol_q[..., 3]
+            return 0.5 * vol_q[..., 3] + 0.5 * vol_q[..., 4]
 
         def _extract_heads(pred):
             """Return (p_vol, p_dir) as 1D tensors [B] on DEVICE.
@@ -1076,6 +1081,35 @@ class MirrorCheckpoints(pl.Callback):
         mirror_local_ckpts_to_gcs()
     def on_train_end(self, trainer, pl_module):
         mirror_local_ckpts_to_gcs()
+
+class ReduceLROnPlateauCallback(pl.Callback):
+    def __init__(self, monitor="val_loss_decoded", factor=0.5, patience=3, min_lr=1e-5, cooldown=0):
+        self.monitor, self.factor, self.patience, self.min_lr, self.cooldown = monitor, factor, patience, min_lr, cooldown
+        self.best, self.bad, self.cool = float("inf"), 0, 0
+
+    def on_validation_end(self, trainer, pl_module):
+        if self.cool:
+            self.cool -= 1
+            return
+        val = trainer.callback_metrics.get(self.monitor)
+        if val is None:
+            return
+        try:
+            val = float(val.item())
+        except Exception:
+            val = float(val)
+        if val + 1e-12 < self.best:
+            self.best, self.bad = val, 0
+        else:
+            self.bad += 1
+            if self.bad >= self.patience:
+                for opt in trainer.optimizers:
+                    for pg in opt.param_groups:
+                        if "lr" in pg and pg["lr"] is not None:
+                            pg["lr"] = max(self.min_lr, float(pg["lr"]) * self.factor)
+                new_lr = trainer.optimizers[0].param_groups[0]["lr"]
+                print(f"[LR Plateau] ↓ lr → {new_lr:.6g}")
+                self.bad, self.cool = 0, self.cooldown
 
 GROUP_ID: List[str] = ["asset"]
 TIME_COL = "Time"
@@ -1822,14 +1856,16 @@ if __name__ == "__main__":
 
     # If you have a custom checkpoint mirroring callback
     mirror_cb = MirrorCheckpoints()
+
+    red_cb = ReduceLROnPlateauCallback(monitor="val_loss_decoded", factor=0.5, patience=3, min_lr=1e-5),
     from pytorch_forecasting.metrics import MultiLoss
 
-        # Fixed weights
-        # ---- Build losses as named variables so callbacks can tune them ----
     VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-        underestimation_factor=3,   # final target (will be warmed up)
-        mean_bias_weight=0.05,        # will be 0 during warmup, then enabled
+        underestimation_factor=3,
+        mean_bias_weight=0.05,
+        tail_q=0.85,
+        tail_weight=9.0
     )
     # one-off in your data prep (TRAIN split)
     counts = train_df["direction"].value_counts()
@@ -1842,7 +1878,7 @@ if __name__ == "__main__":
 
 
     FIXED_VOL_WEIGHT = 1.0
-    FIXED_DIR_WEIGHT = 0.0
+    FIXED_DIR_WEIGHT = 0.1
  
 
     tft = TemporalFusionTransformer.from_dataset(
@@ -1902,7 +1938,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, bias_cb],
+        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, bias_cb, red_cb],
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
     )
