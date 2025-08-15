@@ -192,6 +192,40 @@ def safe_decode_vol(y: torch.Tensor, normalizer, group_ids: torch.Tensor | None)
             pass
     return manual_inverse_transform_groupnorm(normalizer, y, group_ids)
 
+
+# ---------------- Regime-dependent calibration helper ----------------
+@torch.no_grad()
+def calibrate_vol_predictions(y_true_dec: torch.Tensor, y_pred_dec: torch.Tensor) -> torch.Tensor:
+    """
+    Simple 2‑regime multiplicative calibration computed on validation targets.
+    We match the mean in the bottom and top terciles separately to stretch tails
+    (helps when predictions are cramped at the low end).
+    """
+    # ensure 1D
+    y = y_true_dec.reshape(-1)
+    p = y_pred_dec.reshape(-1).clone()
+    if y.numel() == 0 or p.numel() == 0:
+        return y_pred_dec
+
+    # compute terciles
+    q33, q66 = torch.quantile(y, torch.tensor([0.33, 0.66], device=y.device))
+    low_mask = y <= q33
+    high_mask = y >= q66
+
+    def _apply(mask: torch.Tensor):
+        if mask is None or mask.sum() == 0:
+            return
+        yp = p[mask].mean()
+        yt = y[mask].mean()
+        if torch.isfinite(yp) and torch.isfinite(yt) and float(torch.abs(yp)) > 1e-12:
+            s = (yt / yp).clamp(0.5, 2.0)
+            p[mask] = p[mask] * s
+
+    _apply(low_mask)
+    _apply(high_mask)
+
+    return p.view_as(y_pred_dec)
+
 if not hasattr(GroupNormalizer, "decode"):
     def _gn_decode(self, y, group_ids=None, **kwargs):
         """
@@ -522,25 +556,8 @@ class PerAssetMetrics(pl.Callback):
             (yv_dec.mean() / pv_dec.mean()).item() if float(pv_dec.mean()) != 0.0 else float("inf"),
         )
 
-        # --- Regime-dependent scaling ---
-        q33, q66 = torch.quantile(yv_dec, torch.tensor([0.33, 0.66], device=yv_dec.device))
-        low_mask  = yv_dec <= q33
-        high_mask = yv_dec >= q66
-
-        mean_p_low = pv_dec[low_mask].mean()
-        mean_y_low = yv_dec[low_mask].mean()
-        mean_p_high = pv_dec[high_mask].mean()
-        mean_y_high = yv_dec[high_mask].mean()
-
-        if torch.isfinite(mean_y_low) and torch.isfinite(mean_p_low) and mean_p_low.abs() > 1e-12:
-            scale_low = (mean_y_low / mean_p_low).clamp(0.5, 2.0)
-            pv_dec[low_mask] *= scale_low
-            print(f"[SCALE DEBUG] Low-vol scale: {float(scale_low):.4f}")
-
-        if torch.isfinite(mean_y_high) and torch.isfinite(mean_p_high) and mean_p_high.abs() > 1e-12:
-            scale_high = (mean_y_high / mean_p_high).clamp(0.5, 2.0)
-            pv_dec[high_mask] *= scale_high
-            print(f"[SCALE DEBUG] High-vol scale: {float(scale_high):.4f}")
+        # --- Regime-dependent calibration (stretches tails) ---
+        pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
 
         # Move to CPU for metric computation
         y_cpu  = yv_dec.detach().cpu()
@@ -693,6 +710,8 @@ class PerAssetMetrics(pl.Callback):
             if g_cpu is not None and yv_cpu is not None and pv_cpu is not None:
                 yv_dec = self.vol_norm.decode(yv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
                 pv_dec = self.vol_norm.decode(pv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
+                # Apply the same calibration used in metrics so saved preds match the plots
+                pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
                 # map group id -> name
                 assets = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
                 # time index (may be missing)
