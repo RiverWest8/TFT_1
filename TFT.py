@@ -1857,7 +1857,7 @@ if __name__ == "__main__":
     # If you have a custom checkpoint mirroring callback
     mirror_cb = MirrorCheckpoints()
 
-    red_cb = ReduceLROnPlateauCallback(monitor="val_loss_decoded", factor=0.5, patience=3, min_lr=1e-5),
+    red_cb = ReduceLROnPlateauCallback(monitor="val_loss_decoded", factor=0.5, patience=3, min_lr=1e-5)
     from pytorch_forecasting.metrics import MultiLoss
 
     VOL_LOSS = AsymmetricQuantileLoss(
