@@ -285,11 +285,20 @@ class AsymmetricQuantileLoss(QuantileLoss):
     """
     Quantile loss with:
       • asymmetric underestimation penalty on all quantiles
-      • optional mean-bias regulariser on the median
-      • QLIKE term computed on a scale-free "decoded" space via sinh()
-        (works with GroupNormalizer(asinh, center=False, scale_by_group=True)
-         because the group scale cancels in the y/ŷ ratio).
+      • optional mean-bias regulariser on the median (q=0.5)
+      • optional tail emphasis (up-weights samples above a quantile threshold)
+      • numerically-stable QLIKE term on a scale-free decoded space via sinh()
+
+    Notes
+    -----
+    - Use with GroupNormalizer(transformation="asinh", center=False, scale_by_group=True)
+      so that the y/ŷ ratio is scale-free across assets.
+    - QLIKE is stabilized by:
+        * clipping encoded values before sinh (med_clip)
+        * working in log-variance space with clamped log-ratio (log_ratio_clip)
+        * epsilon floors
     """
+
     def __init__(
         self,
         quantiles,
@@ -299,6 +308,8 @@ class AsymmetricQuantileLoss(QuantileLoss):
         tail_weight: float = 0.0,
         qlike_weight: float = 0.2,
         eps: float = 1e-8,
+        med_clip: float = 5.0,
+        log_ratio_clip: float = 20.0,
         **kwargs,
     ):
         super().__init__(quantiles=quantiles, **kwargs)
@@ -308,39 +319,47 @@ class AsymmetricQuantileLoss(QuantileLoss):
         self.tail_weight = float(tail_weight)
         self.qlike_weight = float(qlike_weight)
         self.eps = float(eps)
+        self.med_clip = float(med_clip)
+        self.log_ratio_clip = float(log_ratio_clip)
+
         try:
             self._q50_idx = self.quantiles.index(0.5)
         except Exception:
             self._q50_idx = len(self.quantiles) // 2
 
+    # ----- core quantile component (with optional tail up-weighting) -----
     def loss_per_prediction(self, y_pred, target):
         if isinstance(target, tuple):
             target = target[0]
-        diff = target.unsqueeze(-1) - y_pred
-        q = torch.tensor(self.quantiles, device=y_pred.device, dtype=y_pred.dtype).view(
+
+        diff = target.unsqueeze(-1) - y_pred                      # [..., K]
+        q = y_pred.new_tensor(self.quantiles).view(               # broadcast
             *([1] * (diff.ndim - 1)), -1
         )
-        alpha = torch.as_tensor(self.underestimation_factor, dtype=y_pred.dtype, device=y_pred.device)
+        alpha = y_pred.new_tensor(self.underestimation_factor)
+
         loss = torch.where(
             diff >= 0,
-            alpha * q * diff,
-            (1 - q) * (-diff),
+            alpha * q * diff,             # under-prediction → amplified
+            (1.0 - q) * (-diff),          # over-prediction
         )
-        # optional tail up-weighting
+
         if self.tail_weight and self.tail_weight > 0:
             try:
                 thresh = torch.quantile(target.detach(), self.tail_q)
                 w = torch.where(target.unsqueeze(-1) > thresh,
-                                1.0 + (self.tail_weight - 1.0), 1.0)
+                                 1.0 + (self.tail_weight - 1.0),
+                                 1.0)
                 loss = loss * w
             except Exception:
                 pass
+
         return loss
 
     def forward(self, y_pred, target):
         base = self.loss_per_prediction(y_pred, target).mean()
 
-        # mean-bias penalty on the median
+        # ---- mean-bias regulariser on the median (q=0.5) ----
         if self.mean_bias_weight > 0:
             try:
                 if isinstance(target, tuple):
@@ -351,23 +370,38 @@ class AsymmetricQuantileLoss(QuantileLoss):
             except Exception:
                 pass
 
-        # ---- QLIKE on scale-free decoded values (sinh) ----
+        # ---- QLIKE on scale-free decoded values (sinh), numerically safe ----
         if self.qlike_weight:
             try:
                 if isinstance(target, tuple):
                     target = target[0]
                 med = y_pred[..., self._q50_idx]
-                y_dec = torch.sinh(target)
-                p_dec = torch.sinh(med)
-                sigma2_y = torch.clamp(y_dec.abs(), min=self.eps) ** 2
-                sigma2_p = torch.clamp(p_dec.abs(), min=self.eps) ** 2
-                r = sigma2_y / sigma2_p
-                qlike = (r - torch.log(r) - 1.0).mean()
+
+                # Clip encoded values before sinh to avoid overflow early in training
+                t_enc = torch.clamp(target, -self.med_clip, self.med_clip)
+                m_enc = torch.clamp(med,    -self.med_clip, self.med_clip)
+
+                y_dec = torch.sinh(t_enc)
+                p_dec = torch.sinh(m_enc)
+
+                sigma2_y = (y_dec.abs().clamp_min(self.eps)) ** 2
+                sigma2_p = (p_dec.abs().clamp_min(self.eps)) ** 2
+
+                # Work in log-variance ratio space and clamp
+                z = (sigma2_y + self.eps).log() - (sigma2_p + self.eps).log()
+                z = torch.clamp(z, -self.log_ratio_clip, self.log_ratio_clip)
+
+                # qlike = exp(z) - z - 1 (equivalent to σ_y^2/σ̂^2 - log(σ_y^2/σ̂^2) - 1)
+                ql = torch.exp(z) - z - 1.0
+                ql = torch.where(torch.isfinite(ql), ql, torch.zeros_like(ql))
+                qlike = ql.mean()
+
                 base = base + self.qlike_weight * qlike
             except Exception:
                 pass
 
-        return base
+        # final guard
+        return torch.nan_to_num(base, nan=0.0, posinf=1e4, neginf=1e4)
 
 
 class PerAssetMetrics(pl.Callback):
@@ -817,12 +851,30 @@ class PerAssetMetrics(pl.Callback):
         except Exception as e:
             print(f"[WARN] Could not save validation predictions: {e}")
 
+import lightning.pytorch as pl
+
 class BiasWarmupCallback(pl.Callback):
-    def __init__(self, vol_loss, target_under=1.3, target_mean_bias=0.15, warmup_epochs=3):
+    """
+    Warms up:
+      • underestimation_factor: ramps 1.0 → target_under over `warmup_epochs`
+      • mean_bias_weight: 0.0 during warm-up, then -> target_mean_bias
+      • (optional) qlike_weight: ramps 0.0 → qlike_target_weight over `warmup_epochs`
+    """
+    def __init__(
+        self,
+        vol_loss,
+        target_under: float = 1.3,
+        target_mean_bias: float = 0.15,
+        warmup_epochs: int = 3,
+        qlike_target_weight: float | None = None,
+    ):
         super().__init__()
         self.vol_loss = vol_loss
         self.target_under = float(target_under)
         self.target_mean_bias = float(target_mean_bias)
+        self.qlike_target_weight = (
+            None if qlike_target_weight is None else float(qlike_target_weight)
+        )
         self.warm = int(max(0, warmup_epochs))
 
     def on_train_epoch_start(self, trainer, pl_module):
@@ -832,24 +884,31 @@ class BiasWarmupCallback(pl.Callback):
             # no warmup: use targets directly
             self.vol_loss.underestimation_factor = self.target_under
             self.vol_loss.mean_bias_weight = self.target_mean_bias
+            if hasattr(self.vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
+                self.vol_loss.qlike_weight = self.qlike_target_weight
         else:
-            prog = min(1.0, float(e) / float(self.warm))
+            prog = min(1.0, float(e) / float(self.warm))  # linear ramp 0→1 across warmup
             # ramp underestimation from 1.0 → target
             self.vol_loss.underestimation_factor = 1.0 + (self.target_under - 1.0) * prog
             # keep mean-bias OFF until warmup finishes
             self.vol_loss.mean_bias_weight = 0.0 if e < self.warm else self.target_mean_bias
+            # ramp QLIKE if configured
+            if hasattr(self.vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
+                self.vol_loss.qlike_weight = self.qlike_target_weight * prog
 
         # Debug print
         try:
             lr0 = trainer.optimizers[0].param_groups[0]["lr"]
         except Exception:
             lr0 = None
-        print(f"[BIAS] epoch={e} under={self.vol_loss.underestimation_factor:.3f} "
-              f"mean_bias={self.vol_loss.mean_bias_weight:.3f} "
-              f"lr={lr0 if lr0 is not None else 'n/a'}")
-        
-# Decay the optimizer LR at the end of each epoch to prevent overshoot/oscillation
-import lightning.pytorch as pl
+        qlw = getattr(self.vol_loss, "qlike_weight", None)
+        print(
+            f"[BIAS] epoch={e} "
+            f"under={self.vol_loss.underestimation_factor:.3f} "
+            f"mean_bias={self.vol_loss.mean_bias_weight:.3f} "
+            f"qlike_w={qlw if qlw is not None else 'n/a'} "
+            f"lr={lr0 if lr0 is not None else 'n/a'}"
+        )
 
 class MedianMSELoss(nn.Module):
     def forward(self, y_hat_quantiles, y_true):
@@ -1962,12 +2021,14 @@ if __name__ == "__main__":
         dirpath=str(LOCAL_CKPT_DIR),
     )
 
+  
     bias_cb = BiasWarmupCallback(
-        vol_loss=VOL_LOSS,
-        target_under=1.115,        # smaller than 3.0 to avoid overshoot
-        target_mean_bias=0.12,    # add a mild mean-bias penalty
-        warmup_epochs=5
-    )
+    vol_loss= VOL_LOSS,
+    target_under=1.0,           # “baseline” (no global under-penalty)
+    target_mean_bias=0.05,
+    warmup_epochs=3,
+    qlike_target_weight=getattr(BASE_VOL_LOSS, "qlike_weight", 0.2),
+    )   
 
 
    
