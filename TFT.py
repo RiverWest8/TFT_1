@@ -608,8 +608,7 @@ class PerAssetMetrics(pl.Callback):
         pv_dec = safe_decode_vol(pv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
         pv_dec = torch.clamp(pv_dec, min=2e-7)  # avoid zero in QLIKE
 
-
-        # Quick sanity prints (match overfit_test style)
+        # Debug prints
         print("DEBUG transformation:", getattr(self.vol_norm, "transformation", None))
         print("DEBUG mean after decode:", yv_dec.mean().item())
         print(
@@ -630,7 +629,7 @@ class PerAssetMetrics(pl.Callback):
         yd_cpu = yd.detach().cpu() if yd is not None else None
         pd_cpu = pd.detach().cpu() if pd is not None else None
 
-        # --- Calibration diagnostic (no effect on metrics) ---
+        # Calibration diagnostic (not used in loss)
         try:
             mean_scale = float((y_cpu.mean() / (p_cpu.mean() + 1e-12)).item())
         except Exception:
@@ -652,26 +651,28 @@ class PerAssetMetrics(pl.Callback):
         ratio    = sigma2_y / sigma2_p
         overall_qlike = (ratio - torch.log(ratio) - 1.0).mean().item()
 
-        # --- Optional direction accuracy (logits or probs supported) ---
+        # --- Optional direction accuracy ---
         acc = None
         if yd_cpu is not None and pd_cpu is not None and yd_cpu.numel() > 0 and pd_cpu.numel() > 0:
             pt = pd_cpu
             try:
                 if torch.isfinite(pt).any() and (pt.min() < 0 or pt.max() > 1):
-                    pt = torch.sigmoid(pt)  # convert logits to probs
+                    pt = torch.sigmoid(pt)  # logits → probs
             except Exception:
                 pt = torch.sigmoid(pt)
             pt = torch.clamp(pt, 0.0, 1.0)
             acc = ((pt >= 0.5).int() == yd_cpu.int()).float().mean().item()
 
-        # --- Print one concise per-epoch line + expose to Lightning ---
+        # --- Epoch summary ---
         N = int(y_cpu.numel())
         try:
             epoch_num = int(getattr(trainer, "current_epoch", -1)) + 1
         except Exception:
             epoch_num = None
 
-        val_loss_value = overall_mae + overall_rmse  # decoded objective
+        # 🔑 Use QLIKE as the validation loss
+        val_loss_value = overall_qlike
+
         msg = (
             f"[VAL EPOCH {epoch_num}] "
             f"MAE={overall_mae:.6f} "
@@ -683,17 +684,24 @@ class PerAssetMetrics(pl.Callback):
         )
         print(msg)
 
-        # Log the same metrics for checkpoints/early-stopping
-        trainer.callback_metrics["val_mae_overall"]  = torch.tensor(float(overall_mae))
-        trainer.callback_metrics["val_rmse_overall"] = torch.tensor(float(overall_rmse))
-        trainer.callback_metrics["val_mse_overall"]  = torch.tensor(float(overall_mse))
-        trainer.callback_metrics["val_qlike_overall"]= torch.tensor(float(overall_qlike))
-        trainer.callback_metrics["val_loss"]         = torch.tensor(float(val_loss_value))
-        trainer.callback_metrics["val_loss_decoded"] = torch.tensor(float(val_loss_value))
+        # --- Log metrics for checkpoints/early stopping ---
+        trainer.callback_metrics["val_mae_overall"]   = torch.tensor(float(overall_mae))
+        trainer.callback_metrics["val_rmse_overall"]  = torch.tensor(float(overall_rmse))
+        trainer.callback_metrics["val_mse_overall"]   = torch.tensor(float(overall_mse))
+        trainer.callback_metrics["val_qlike_overall"] = torch.tensor(float(overall_qlike))
+        trainer.callback_metrics["val_loss"]          = torch.tensor(float(val_loss_value))
+        trainer.callback_metrics["val_loss_decoded"]  = torch.tensor(float(val_loss_value))
         if acc is not None:
             trainer.callback_metrics["val_acc_overall"] = torch.tensor(float(acc))
-        trainer.callback_metrics["val_N_overall"]    = torch.tensor(float(N))
-        self._last_overall = {"mae": overall_mae, "rmse": overall_rmse, "mse": overall_mse, "qlike": overall_qlike, "val_loss": val_loss_value}
+        trainer.callback_metrics["val_N_overall"]     = torch.tensor(float(N))
+
+        self._last_overall = {
+            "mae": overall_mae,
+            "rmse": overall_rmse,
+            "mse": overall_mse,
+            "qlike": overall_qlike,
+            "val_loss": val_loss_value,
+        }
         self._last_rows = []
 
 
@@ -1403,15 +1411,12 @@ def _evaluate_decoded_metrics(
     pin_memory: bool,
     vol_norm=None,
 ):
-    # Resolve the normalizer if not provided
+    """
+    Compute decoded MAE, RMSE, DirBCE and QLIKE on up to `max_batches`.
+    Returns: (mae, rmse, dir_bce, val_loss, n) with `val_loss == QLIKE`.
+    """
     if vol_norm is None:
         vol_norm = _extract_norm_from_dataset(ds)
-
-    # ... rest of your function ...
-    """
-    Compute decoded MAE, RMSE, DirBCE and combined val_loss on up to max_batches.
-    Returns: (mae, rmse, dir_bce, val_loss, n)
-    """
 
     dl = ds.to_dataloader(
         train=False,
@@ -1422,21 +1427,18 @@ def _evaluate_decoded_metrics(
         pin_memory=pin_memory,
     )
 
-    # Get model device (first parameter device)
     try:
         model_device = next(model.parameters()).device
     except Exception:
         model_device = torch.device("cpu")
 
     model.eval()
-    y_all, p_all, yd_all, pd_all, g_all = [], [], [], [], []
-    skipped_reasons = {"no_groups": 0, "no_targets": 0, "bad_pred_format": 0}
+    y_all, p_all, yd_all, pd_all = [], [], [], []
+
     with torch.no_grad():
         for b_idx, batch in enumerate(dl):
             if max_batches is not None and b_idx >= int(max_batches):
                 break
-            # Move all tensors in batch to the model's device
-            batch = tuple(t.to(model_device) if torch.is_tensor(t) else t for t in batch)
 
             if isinstance(batch, (list, tuple)) and len(batch) >= 2:
                 x, y = batch[0], batch[1]
@@ -1444,217 +1446,127 @@ def _evaluate_decoded_metrics(
                 x, y = batch, None
 
             if not isinstance(x, dict):
-                skipped_reasons["bad_pred_format"] += 1
                 continue
 
-            # ---- groups (robust; avoid `or` with tensors) ----
-            g = x.get("groups", None)
-            if g is None:
-                g = x.get("group_ids", None)
+            # groups
+            g = x.get("groups") or x.get("group_ids")
             if isinstance(g, (list, tuple)):
-                g = g[0] if len(g) > 0 else None
+                g = g[0] if g else None
             if torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
                 g = g.squeeze(-1)
             if not torch.is_tensor(g):
-                skipped_reasons["no_groups"] += 1
                 continue
 
-            # ---- targets (robust; avoid `or` with tensors) ----
-            # ---- targets (robust; handles tensor OR list/tuple; avoids truthiness on tensors) ----
-            y_vol, y_dir = None, None
-
-            def _extract_targets(obj):
-                """Return (y_vol, y_dir) from PF-style targets."""
+            # targets
+            def _extract(obj):
                 if torch.is_tensor(obj):
                     t = obj
-                    # PF often gives [B, 1, n_targets] for decoder_target
                     if t.ndim == 3 and t.size(-1) == 1:
-                        t = t[..., 0]  # -> [B, n_targets]
-                    # Also seen: [B, 1, n_targets] (pred_len=1) but with the middle dim as length 1
+                        t = t[..., 0]
                     if t.ndim == 3 and t.size(1) == 1:
-                        t = t[:, 0, :]  # -> [B, n_targets]
+                        t = t[:, 0, :]
                     if t.ndim == 2 and t.size(1) >= 1:
-                        yv = t[:, 0]
-                        yd = t[:, 1] if t.size(1) > 1 else None
-                        return yv, yd
+                        return t[:, 0], (t[:, 1] if t.size(1) > 1 else None)
                     return None, None
-
-                if isinstance(obj, (list, tuple)) and len(obj) >= 1:
-                    yv = obj[0]
-                    yd = obj[1] if len(obj) > 1 else None
-                    # yv may itself be [B, 1, 1] or [B, 1]
-                    if torch.is_tensor(yv):
-                        if yv.ndim == 3 and yv.size(-1) == 1:
-                            yv = yv[..., 0]
-                        if yv.ndim == 3 and yv.size(1) == 1:
-                            yv = yv[:, 0, :]
-                        if yv.ndim == 2 and yv.size(-1) == 1:
-                            yv = yv[:, 0]
-                    if torch.is_tensor(yd):
-                        if yd.ndim == 3 and yd.size(-1) == 1:
-                            yd = yd[..., 0]
-                        if yd.ndim == 3 and yd.size(1) == 1:
-                            yd = yd[:, 0, :]
-                        if yd.ndim == 2 and yd.size(-1) == 1:
-                            yd = yd[:, 0]
-                    return yv if torch.is_tensor(yv) else None, yd if torch.is_tensor(yd) else None
-
+                if isinstance(obj, (list, tuple)) and obj:
+                    yv, yd = obj[0], (obj[1] if len(obj) > 1 else None)
+                    for ref in ("yv", "yd"):
+                        v = locals()[ref]
+                        if torch.is_tensor(v):
+                            if v.ndim == 3 and v.size(-1) == 1:
+                                v = v[..., 0]
+                            if v.ndim == 3 and v.size(1) == 1:
+                                v = v[:, 0, :]
+                            if v.ndim == 2 and v.size(-1) == 1:
+                                v = v[:, 0]
+                            locals()[ref] = v
+                    return (yv if torch.is_tensor(yv) else None, yd if torch.is_tensor(yd) else None)
                 return None, None
 
-            # Preferred: decoder_target; else target
-            dec_t = x.get("decoder_target", None)
-            if dec_t is None:
-                dec_t = x.get("target", None)
-
-            if dec_t is not None:
-                y_vol, y_dir = _extract_targets(dec_t)
-
-            # Fallback: dataloader second item (PF often provides batch[1] = targets)
+            dec_t = x.get("decoder_target") or x.get("target")
+            y_vol, y_dir = _extract(dec_t)
             if (y_vol is None or (y_dir is None and y is not None)) and y is not None:
-                yv2, yd2 = _extract_targets(y)
-                if y_vol is None:
-                    y_vol = yv2
-                if y_dir is None and yd2 is not None:
-                    y_dir = yd2
-
+                yv2, yd2 = _extract(y)
+                if y_vol is None: y_vol = yv2
+                if y_dir is None: y_dir = yd2
             if not torch.is_tensor(y_vol):
-                skipped_reasons["no_targets"] += 1
                 continue
 
-            # ---- forward pass (move to model device) ----
-            x_dev = {}
-            for k, v in x.items():
-                if torch.is_tensor(v):
-                    x_dev[k] = v.to(model_device, non_blocking=True)
-                elif isinstance(v, (list, tuple)):
-                    x_dev[k] = [vv.to(model_device, non_blocking=True) if torch.is_tensor(vv) else vv for vv in v]
-                else:
-                    x_dev[k] = v
+            # forward
+            x_dev = {k: (v.to(model_device, non_blocking=True) if torch.is_tensor(v)
+                         else [vv.to(model_device, non_blocking=True) if torch.is_tensor(vv) else vv for vv in v]
+                         if isinstance(v, (list, tuple)) else v)
+                     for k, v in x.items()}
 
             y_hat = model(x_dev)
             pred = getattr(y_hat, "prediction", y_hat)
             if isinstance(pred, dict) and "prediction" in pred:
                 pred = pred["prediction"]
 
-            # ---- extract heads ----
-            # ---- extract heads (robust; mirrors callback) ----
-            def _to_median_q(t):
-                if t is None:
-                    return None
+            def _q50(t):
                 if torch.is_tensor(t):
-                    # squeeze pred_len dim if present
-                    if t.ndim >= 4 and t.size(1) == 1:
-                        t = t.squeeze(1)
-                    if t.ndim == 3 and t.size(1) == 1:
-                        t = t.squeeze(1)  # [B, K] or [B, 1]
-                    if t.ndim == 2 and t.size(-1) >= 1:
-                        return t.mean(dim=-1)  # mean-of-quantiles
-                    if t.ndim == 1:
-                        return t
+                    if t.ndim >= 4 and t.size(1) == 1: t = t.squeeze(1)
+                    if t.ndim == 3 and t.size(1) == 1: t = t.squeeze(1)
+                    if t.ndim == 2 and t.size(-1) >= 4: return t[:, 3]
+                return t
+            def _dir_logit(t):
+                if torch.is_tensor(t):
+                    if t.ndim >= 4 and t.size(1) == 1: t = t.squeeze(1)
+                    if t.ndim == 3 and t.size(1) == 1: t = t.squeeze(1)
+                    if t.ndim == 2: return t[:, t.size(-1)//2] if t.size(-1) > 1 else t.squeeze(-1)
                 return t
 
-            def _to_dir_logit(t):
-                if t is None:
-                    return None
-                if torch.is_tensor(t):
-                    # squeeze pred_len dim if present
-                    if t.ndim >= 4 and t.size(1) == 1:
-                        t = t.squeeze(1)
-                    if t.ndim == 3 and t.size(1) == 1:
-                        t = t.squeeze(1)  # [B, K] or [B, 1]
-                    if t.ndim == 2:
-                        # if replicated across K, take middle slot; else squeeze singleton
-                        if t.size(-1) > 1:
-                            return t[:, t.size(-1) // 2]
-                        return t.squeeze(-1)
-                    if t.ndim == 1:
-                        return t
-                return t
-
-            p_vol, p_dir = None, None
             if isinstance(pred, (list, tuple)):
-                p_vol = _point_from_quantiles(pred[0])
-                p_dir = _to_dir_logit(pred[1] if len(pred) > 1 else None)
-            elif torch.is_tensor(pred):
+                p_vol = _q50(pred[0])
+                p_dir = _dir_logit(pred[1] if len(pred) > 1 else None)
+            else:
                 t = pred
-                # squeeze prediction-length dim if present → [B, D]
-                if t.ndim >= 4 and t.size(1) == 1:
-                    t = t.squeeze(1)
-                if t.ndim == 3 and t.size(1) == 1:
-                    t = t[:, 0, :]
-                if t.ndim == 2:
-                    D = t.size(-1)
-                    if D >= 2:
-                        vol_q = t[:, : D-1]      # first K columns = vol quantiles
-                        d_log = t[:, D-1]        # last column = dir logit
-                        p_vol = _point_from_quantiles(vol_q)
-                        p_dir = d_log
-                    else:
-                        skipped_reasons["bad_pred_format"] += 1
-                        continue
+                if t.ndim >= 4 and t.size(1) == 1: t = t.squeeze(1)
+                if t.ndim == 3 and t.size(1) == 1: t = t[:, 0, :]
+                vol_q, p_dir = t[:, : t.size(-1)-1], t[:, -1]
+                p_vol = vol_q[:, 3] if vol_q.size(-1) >= 4 else vol_q.mean(dim=-1)
 
-            if not torch.is_tensor(p_vol) or not torch.is_tensor(g):
-                skipped_reasons["bad_pred_format"] += 1
-                continue
-
-            # collapse dir head to single logit if needed
-            if p_dir is not None and torch.is_tensor(p_dir) and p_dir.ndim >= 2 and p_dir.size(-1) > 1:
-                mid = p_dir.size(-1) // 2
-                p_dir = p_dir.index_select(-1, torch.tensor([mid], device=p_dir.device)).squeeze(-1)
-
-            # decode back to physical scale (vol only)
-            try:
-                y_dec = safe_decode_vol(y_vol.to(model_device).unsqueeze(-1),
-                                        vol_norm, g.to(model_device).unsqueeze(-1)).squeeze(-1)
-                p_dec = safe_decode_vol(p_vol.to(model_device).unsqueeze(-1),
-                                        vol_norm, g.to(model_device).unsqueeze(-1)).squeeze(-1)
-                p_dec = torch.clamp(p_dec, min=1e-8)    
-            except Exception:
-                y_dec, p_dec = y_vol.to(model_device), p_vol.to(model_device)
+            y_dec = safe_decode_vol(y_vol.to(model_device).unsqueeze(-1), vol_norm, g.to(model_device).unsqueeze(-1)).squeeze(-1)
+            p_dec = safe_decode_vol(p_vol.to(model_device).unsqueeze(-1), vol_norm, g.to(model_device).unsqueeze(-1)).squeeze(-1)
+            p_dec = torch.clamp(p_dec, min=1e-8)
+            p_dec = calibrate_vol_predictions(y_dec, p_dec)
 
             y_all.append(y_dec.detach().cpu())
             p_all.append(p_dec.detach().cpu())
-            g_all.append(g.detach().cpu())
-
-            # collect direction only if both available
             if torch.is_tensor(y_dir) and torch.is_tensor(p_dir):
-                yd_flat = y_dir.reshape(-1)
-                pd_flat = p_dir.reshape(-1)
+                yd_flat, pd_flat = y_dir.reshape(-1), p_dir.reshape(-1)
                 L2 = min(yd_flat.numel(), pd_flat.numel())
                 if L2 > 0:
                     yd_all.append(yd_flat[:L2].detach().cpu())
                     pd_all.append(pd_flat[:L2].detach().cpu())
 
     if not y_all:
-        print("[FI] No valid batches produced targets/predictions; dataset may be empty or shapes unexpected.")
-        print(f"[FI] Skips — groups:{skipped_reasons['no_groups']}, targets:{skipped_reasons['no_targets']}, pred:{skipped_reasons['bad_pred_format']}")
         return float("nan"), float("nan"), float("nan"), float("nan"), 0
 
-    y = torch.cat(y_all)
-    p = torch.cat(p_all)
-    mae = (p - y).abs().mean().item()
+    y, p = torch.cat(y_all), torch.cat(p_all)
+    mae  = (p - y).abs().mean().item()
     rmse = torch.sqrt(((p - y) ** 2).mean()).item()
 
-    # Direction BCE (logits-aware) with label smoothing 0.1
+    eps = 1e-8
+    sigma2_p = torch.clamp(p.abs(), min=eps) ** 2
+    sigma2_y = torch.clamp(y.abs(), min=eps) ** 2
+    ratio = sigma2_y / sigma2_p
+    qlike = (ratio - torch.log(ratio) - 1.0).mean().item()
+
     dir_bce = float("nan")
     if yd_all and pd_all:
-        yd = torch.cat(yd_all).float()
-        pd = torch.cat(pd_all)
+        yd, pd = torch.cat(yd_all).float(), torch.cat(pd_all)
         try:
             if torch.isfinite(pd).any() and (pd.min() < 0 or pd.max() > 1):
-                yt_s = yd * 0.9 + 0.05
-                dir_bce_t = F.binary_cross_entropy_with_logits(pd, yt_s)
+                dir_bce_t = F.binary_cross_entropy_with_logits(pd, yd * 0.9 + 0.05)
             else:
-                pr = torch.clamp(pd, 1e-7, 1 - 1e-7)
-                yt_s = yd * 0.9 + 0.05
-                dir_bce_t = F.binary_cross_entropy(pr, yt_s)
+                dir_bce_t = F.binary_cross_entropy(torch.clamp(pd, 1e-7, 1-1e-7), yd * 0.9 + 0.05)
             dir_bce = float(dir_bce_t.item())
         except Exception:
             pass
 
-    val_loss = (float(mae) + float(rmse)) + (0.05 * dir_bce if np.isfinite(dir_bce) else 0.0)
-    return float(mae), float(rmse), float(dir_bce), float(val_loss), int(y.numel())
-
+    # return QLIKE as val_loss
+    return float(mae), float(rmse), float(dir_bce), float(qlike), int(y.numel())
 
 
 def run_permutation_importance(
