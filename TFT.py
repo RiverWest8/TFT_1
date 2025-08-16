@@ -1191,7 +1191,7 @@ class TailWeightRamp(pl.Callback):
         print(f"[TAIL] epoch={e} tail_weight={self.vol_loss.tail_weight}")
 
 class ReduceLROnPlateauCallback(pl.Callback):
-    def __init__(self, monitor="val_loss_decoded", factor=0.5, patience=3, min_lr=1e-5, cooldown=0):
+    def __init__(self, monitor="val_loss", factor=0.5, patience=3, min_lr=1e-5, cooldown=0):
         self.monitor, self.factor, self.patience, self.min_lr, self.cooldown = monitor, factor, patience, min_lr, cooldown
         self.best, self.bad, self.cool = float("inf"), 0, 0
 
