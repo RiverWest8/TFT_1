@@ -1881,7 +1881,7 @@ if __name__ == "__main__":
         mean_bias_weight=0.0,          # or small value if you want median centering
         tail_q=0.85,
         tail_weight=1.0,               # set >0 if you want extra tail emphasis
-        qlike_weight=0.15,             # << QLIKE back in (tune 0.1–0.3)
+        qlike_weight=0.3,             # << QLIKE back in (tune 0.1–0.3)
         reduction="mean",
     )
     tail_cb = TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=1.2, ramp_epochs=12)
@@ -1942,8 +1942,8 @@ if __name__ == "__main__":
     vol_loss= VOL_LOSS,
     target_under=1.0,           # “baseline” (no global under-penalty)
     target_mean_bias=0.02,
-    warmup_epochs=10,
-    qlike_target_weight= 0.04 ,
+    warmup_epochs=6,
+    qlike_target_weight= 0.08 ,
     )   
 
 
