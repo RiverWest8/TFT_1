@@ -264,7 +264,7 @@ if not hasattr(GroupNormalizer, "decode"):
 from pytorch_forecasting.metrics import QuantileLoss, MultiLoss
 
 class LabelSmoothedBCE(nn.Module):
-    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.005):
+    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.001):
         super().__init__()
         self.smoothing = smoothing
         self.register_buffer("pos_weight", torch.tensor(pos_weight))
@@ -304,9 +304,9 @@ class AsymmetricQuantileLoss(QuantileLoss):
         quantiles,
         underestimation_factor: float = 1.1115,
         mean_bias_weight: float = 0.0,
-        tail_q: float = 0.90,
+        tail_q: float = 0.90,         # ← was 0.85
         tail_weight: float = 0.0,
-        qlike_weight: float = 0.08,
+        qlike_weight: float = 0.08,   # ← was 0.2
         eps: float = 1e-8,
         med_clip: float = 5.0,
         log_ratio_clip: float = 20.0,
@@ -381,18 +381,12 @@ class AsymmetricQuantileLoss(QuantileLoss):
                 y_dec = torch.sinh(t_enc)
                 p_dec = torch.sinh(m_enc)
 
-                # Stop-gradient batch scale to align first moment (prevents baseline drift)
-                s = ((y_dec.abs().mean() + self.eps) / (p_dec.abs().mean() + self.eps)).detach().clamp(0.8, 1.25)
-                p_adj = p_dec * s
-
                 sigma2_y = (y_dec.abs().clamp_min(self.eps)) ** 2
-                sigma2_p = (p_adj.abs().clamp_min(self.eps)) ** 2
+                sigma2_p = (p_dec.abs().clamp_min(self.eps)) ** 2
 
-                # Work in log-variance ratio space and clamp
                 z = (sigma2_y + self.eps).log() - (sigma2_p + self.eps).log()
                 z = torch.clamp(z, -self.log_ratio_clip, self.log_ratio_clip)
 
-                # qlike = exp(z) - z - 1 (equivalent to σ_y^2/σ̂^2 - log(σ_y^2/σ̂^2) - 1)
                 ql = torch.exp(z) - z - 1.0
                 ql = torch.where(torch.isfinite(ql), ql, torch.zeros_like(ql))
                 qlike = ql.mean()
@@ -503,8 +497,9 @@ class PerAssetMetrics(pl.Callback):
             pred = pred["prediction"]
 
         def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
-            return vol_q[..., 3]
-
+            q50 = vol_q[..., 3]
+            q75 = vol_q[..., 4] if vol_q.size(-1) > 4 else vol_q[..., 3]
+            return 0.5 * vol_q[..., 3] + 0.5 * vol_q[..., 4]
 
         def _extract_heads(pred):
             """Return (p_vol, p_dir) as 1D tensors [B] on DEVICE.
@@ -626,7 +621,7 @@ class PerAssetMetrics(pl.Callback):
         )
 
         # --- Regime-dependent calibration (stretches tails) ---
-        # pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
+        pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
 
         # Move to CPU for metric computation
         y_cpu  = yv_dec.detach().cpu()
@@ -788,7 +783,8 @@ class PerAssetMetrics(pl.Callback):
             if g_cpu is not None and yv_cpu is not None and pv_cpu is not None:
                 yv_dec = self.vol_norm.decode(yv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
                 pv_dec = self.vol_norm.decode(pv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
-                # (calibration disabled) pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
+                # Apply the same calibration used in metrics so saved preds match the plots
+                pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
                 # map group id -> name
                 assets = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
                 # time index (may be missing)
@@ -868,9 +864,9 @@ class BiasWarmupCallback(pl.Callback):
     def __init__(
         self,
         vol_loss,
-        target_under: float = 1.0,
-        target_mean_bias: float = 0.02,
-        warmup_epochs: int = 6,
+        target_under: float = 1.3,
+        target_mean_bias: float = 0.15,
+        warmup_epochs: int = 3,
         qlike_target_weight: float | None = None,
     ):
         super().__init__()
@@ -888,6 +884,7 @@ class BiasWarmupCallback(pl.Callback):
             self.vol_loss.underestimation_factor = self.target_under
             self.vol_loss.mean_bias_weight = self.target_mean_bias
             if hasattr(self.vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
+                # cap at 0.08 to avoid lifting the baseline
                 self.vol_loss.qlike_weight = min(float(self.qlike_target_weight), 0.08)
         else:
             prog = min(1.0, float(e) / float(self.warm))  # linear ramp 0→1 across warm-up
@@ -895,7 +892,7 @@ class BiasWarmupCallback(pl.Callback):
             self.vol_loss.underestimation_factor = 1.0 + (self.target_under - 1.0) * prog
             # keep mean-bias OFF until warmup finishes
             self.vol_loss.mean_bias_weight = 0.0 if e < self.warm else self.target_mean_bias
-            # ramp QLIKE if configured (gentle but effective)
+            # ramp QLIKE if configured (gentle & capped)
             if hasattr(self.vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
                 q_target = min(float(self.qlike_target_weight), 0.08)   # cap at 0.08
                 q_prog = min(1.0, float(e) / float(max(self.warm, 6)))  # ramp over ≥ 6 epochs
@@ -1186,9 +1183,9 @@ class TailWeightRamp(pl.Callback):
 
     def on_train_epoch_start(self, trainer, pl_module):
         e = int(getattr(trainer, "current_epoch", 0))
-        # Revert to the gentler-but-effective schedule that reached ~0.6 QLIKE
-        eff_end = min(self.end, 2.0)     # cap tail weight at 2.0 (not 1.1)
-        eff_ramp = max(self.ramp, 8)     # ramp over at least 8 epochs (not 10)
+        # Gentler schedule regardless of how it's instantiated
+        eff_end = min(self.end, 2.0)      # cap tail weight
+        eff_ramp = max(self.ramp, 8)      # ramp over at least 8 epochs
         prog = 1.0 if eff_ramp <= 0 else min(1.0, e / float(eff_ramp))
         self.vol_loss.tail_weight = self.start + (eff_end - self.start) * prog
         print(f"[TAIL] epoch={e} tail_weight={self.vol_loss.tail_weight}")
@@ -1233,7 +1230,7 @@ EMBEDDING_CARDINALITY = {}
 
 BATCH_SIZE   = 2048
 MAX_EPOCHS   = 5
-EARLY_STOP_PATIENCE = 15
+EARLY_STOP_PATIENCE = 4
 PERM_BLOCK_SIZE = 288
 
 # Artifacts are written locally then uploaded to GCS
@@ -1881,19 +1878,16 @@ if __name__ == "__main__":
         mean_bias_weight=0.0,          # or small value if you want median centering
         tail_q=0.85,
         tail_weight=1.0,               # set >0 if you want extra tail emphasis
-        qlike_weight=0.3,             # << QLIKE back in (tune 0.1–0.3)
+        qlike_weight=0.20,             # << QLIKE back in (tune 0.1–0.3)
         reduction="mean",
     )
-    tail_cb = TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=1.2, ramp_epochs=12)
+    tail_cb = TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=2.0, ramp_epochs=6)
     from pytorch_forecasting.metrics import MultiLoss
     # one-off in your data prep (TRAIN split)
-    '''
     counts = train_df["direction"].value_counts()
     n_pos = counts.get(1, 1)
     n_neg = counts.get(0, 1)
     pos_weight = float(n_neg / n_pos)
-    '''
-    pos_weight = 1.005
 
     # then build the loss with:
     DIR_LOSS = LabelSmoothedBCE(smoothing=0.05, pos_weight=pos_weight)
@@ -1949,7 +1943,7 @@ if __name__ == "__main__":
 
    
     
-    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=8) 
+    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=15) 
 
     # ----------------------------
     # Trainer instance
