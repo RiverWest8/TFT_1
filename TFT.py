@@ -620,7 +620,7 @@ class PerAssetMetrics(pl.Callback):
         )
 
         # --- Regime-dependent calibration (stretches tails) ---
-        pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
+        # pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
 
         # Move to CPU for metric computation
         y_cpu  = yv_dec.detach().cpu()
@@ -782,8 +782,7 @@ class PerAssetMetrics(pl.Callback):
             if g_cpu is not None and yv_cpu is not None and pv_cpu is not None:
                 yv_dec = self.vol_norm.decode(yv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
                 pv_dec = self.vol_norm.decode(pv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
-                # Apply the same calibration used in metrics so saved preds match the plots
-                pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
+                # (calibration disabled) pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
                 # map group id -> name
                 assets = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
                 # time index (may be missing)
@@ -1877,10 +1876,10 @@ if __name__ == "__main__":
         mean_bias_weight=0.0,          # or small value if you want median centering
         tail_q=0.85,
         tail_weight=1.0,               # set >0 if you want extra tail emphasis
-        qlike_weight=0.20,             # << QLIKE back in (tune 0.1–0.3)
+        qlike_weight=0.15,             # << QLIKE back in (tune 0.1–0.3)
         reduction="mean",
     )
-    tail_cb = TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=2.0, ramp_epochs=6)
+    tail_cb = TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=1.2, ramp_epochs=12)
     from pytorch_forecasting.metrics import MultiLoss
     # one-off in your data prep (TRAIN split)
     '''
@@ -1938,14 +1937,14 @@ if __name__ == "__main__":
     vol_loss= VOL_LOSS,
     target_under=1.0,           # “baseline” (no global under-penalty)
     target_mean_bias=0.02,
-    warmup_epochs=6,
-    qlike_target_weight= 0.08 ,
+    warmup_epochs=10,
+    qlike_target_weight= 0.04 ,
     )   
 
 
    
     
-    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=15) 
+    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=8) 
 
     # ----------------------------
     # Trainer instance
