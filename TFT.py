@@ -282,14 +282,32 @@ import torch.nn.functional as F
 
 
 class AsymmetricQuantileLoss(QuantileLoss):
-    def __init__(self, quantiles, underestimation_factor: float = 1.1115,
-                 mean_bias_weight: float = 0.0, tail_q: float = 0.85,
-                 tail_weight: float = 0.0, **kwargs):
+    """
+    Quantile loss with:
+      • asymmetric underestimation penalty on all quantiles
+      • optional mean-bias regulariser on the median
+      • QLIKE term computed on a scale-free "decoded" space via sinh()
+        (works with GroupNormalizer(asinh, center=False, scale_by_group=True)
+         because the group scale cancels in the y/ŷ ratio).
+    """
+    def __init__(
+        self,
+        quantiles,
+        underestimation_factor: float = 1.1115,
+        mean_bias_weight: float = 0.0,
+        tail_q: float = 0.85,
+        tail_weight: float = 0.0,
+        qlike_weight: float = 0.2,
+        eps: float = 1e-8,
+        **kwargs,
+    ):
         super().__init__(quantiles=quantiles, **kwargs)
         self.underestimation_factor = float(underestimation_factor)
         self.mean_bias_weight = float(mean_bias_weight)
         self.tail_q = float(tail_q)
         self.tail_weight = float(tail_weight)
+        self.qlike_weight = float(qlike_weight)
+        self.eps = float(eps)
         try:
             self._q50_idx = self.quantiles.index(0.5)
         except Exception:
@@ -308,7 +326,7 @@ class AsymmetricQuantileLoss(QuantileLoss):
             alpha * q * diff,
             (1 - q) * (-diff),
         )
-        # Tail weighting
+        # optional tail up-weighting
         if self.tail_weight and self.tail_weight > 0:
             try:
                 thresh = torch.quantile(target.detach(), self.tail_q)
@@ -321,16 +339,34 @@ class AsymmetricQuantileLoss(QuantileLoss):
 
     def forward(self, y_pred, target):
         base = self.loss_per_prediction(y_pred, target).mean()
+
+        # mean-bias penalty on the median
         if self.mean_bias_weight > 0:
             try:
                 if isinstance(target, tuple):
                     target = target[0]
                 med = y_pred[..., self._q50_idx]
                 mean_diff = (target - med).mean()
-                # Symmetric penalty: penalize both over- and under-prediction of median
                 base = base + (mean_diff ** 2) * self.mean_bias_weight
             except Exception:
                 pass
+
+        # ---- QLIKE on scale-free decoded values (sinh) ----
+        if self.qlike_weight:
+            try:
+                if isinstance(target, tuple):
+                    target = target[0]
+                med = y_pred[..., self._q50_idx]
+                y_dec = torch.sinh(target)
+                p_dec = torch.sinh(med)
+                sigma2_y = torch.clamp(y_dec.abs(), min=self.eps) ** 2
+                sigma2_p = torch.clamp(p_dec.abs(), min=self.eps) ** 2
+                r = sigma2_y / sigma2_p
+                qlike = (r - torch.log(r) - 1.0).mean()
+                base = base + self.qlike_weight * qlike
+            except Exception:
+                pass
+
         return base
 
 
@@ -1868,11 +1904,13 @@ if __name__ == "__main__":
 
 
     VOL_LOSS = AsymmetricQuantileLoss(
-        quantiles=[0.05, 0.165, 0.25, 0.5, 0.75, 0.835, 0.95],
-        underestimation_factor=3,
-        mean_bias_weight=0.05,
+        quantiles=VOL_QUANTILES,
+        underestimation_factor=1.25,   # you can keep your scheduler on this
+        mean_bias_weight=0.0,          # or small value if you want median centering
         tail_q=0.85,
-        tail_weight=3.0
+        tail_weight=1.0,               # set >0 if you want extra tail emphasis
+        qlike_weight=0.20,             # << QLIKE back in (tune 0.1–0.3)
+        reduction="mean",
     )
     tail_cb = TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=9.0, ramp_epochs=6)
     from pytorch_forecasting.metrics import MultiLoss
