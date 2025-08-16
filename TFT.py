@@ -381,12 +381,18 @@ class AsymmetricQuantileLoss(QuantileLoss):
                 y_dec = torch.sinh(t_enc)
                 p_dec = torch.sinh(m_enc)
 
-                sigma2_y = (y_dec.abs().clamp_min(self.eps)) ** 2
-                sigma2_p = (p_dec.abs().clamp_min(self.eps)) ** 2
+                # Stop-gradient batch scale to align first moment (prevents baseline drift)
+                s = ((y_dec.abs().mean() + self.eps) / (p_dec.abs().mean() + self.eps)).detach().clamp(0.8, 1.25)
+                p_adj = p_dec * s
 
+                sigma2_y = (y_dec.abs().clamp_min(self.eps)) ** 2
+                sigma2_p = (p_adj.abs().clamp_min(self.eps)) ** 2
+
+                # Work in log-variance ratio space and clamp
                 z = (sigma2_y + self.eps).log() - (sigma2_p + self.eps).log()
                 z = torch.clamp(z, -self.log_ratio_clip, self.log_ratio_clip)
 
+                # qlike = exp(z) - z - 1 (equivalent to σ_y^2/σ̂^2 - log(σ_y^2/σ̂^2) - 1)
                 ql = torch.exp(z) - z - 1.0
                 ql = torch.where(torch.isfinite(ql), ql, torch.zeros_like(ql))
                 qlike = ql.mean()
@@ -882,8 +888,8 @@ class BiasWarmupCallback(pl.Callback):
             self.vol_loss.underestimation_factor = self.target_under
             self.vol_loss.mean_bias_weight = self.target_mean_bias
             if hasattr(self.vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
-                # cap at 0.08 to avoid lifting the baseline
-                self.vol_loss.qlike_weight = min(float(self.qlike_target_weight), 0.08)
+                # cap at 0.03 to avoid lifting the baseline (gentler)
+                self.vol_loss.qlike_weight = min(float(self.qlike_target_weight), 0.03)
         else:
             prog = min(1.0, float(e) / float(self.warm))  # linear ramp 0→1 across warm-up
             # ramp underestimation from 1.0 → target
@@ -892,8 +898,8 @@ class BiasWarmupCallback(pl.Callback):
             self.vol_loss.mean_bias_weight = 0.0 if e < self.warm else self.target_mean_bias
             # ramp QLIKE if configured (gentle & capped)
             if hasattr(self.vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
-                q_target = min(float(self.qlike_target_weight), 0.08)   # cap at 0.08
-                q_prog = min(1.0, float(e) / float(max(self.warm, 6)))  # ramp over ≥ 6 epochs
+                q_target = min(float(self.qlike_target_weight), 0.03)   # cap at 0.03 (gentler)
+                q_prog = min(1.0, float(e) / float(max(self.warm, 10)))  # ramp over ≥ 10 epochs
                 self.vol_loss.qlike_weight = q_target * q_prog
 
         # Debug print
@@ -1182,8 +1188,8 @@ class TailWeightRamp(pl.Callback):
     def on_train_epoch_start(self, trainer, pl_module):
         e = int(getattr(trainer, "current_epoch", 0))
         # Gentler schedule regardless of how it's instantiated
-        eff_end = min(self.end, 2.0)      # cap tail weight
-        eff_ramp = max(self.ramp, 8)      # ramp over at least 8 epochs
+        eff_end = min(self.end, 1.1)      # tighter cap on tail weight
+        eff_ramp = max(self.ramp, 10)     # ramp over at least 10 epochs
         prog = 1.0 if eff_ramp <= 0 else min(1.0, e / float(eff_ramp))
         self.vol_loss.tail_weight = self.start + (eff_end - self.start) * prog
         print(f"[TAIL] epoch={e} tail_weight={self.vol_loss.tail_weight}")
