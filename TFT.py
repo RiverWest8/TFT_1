@@ -2027,7 +2027,7 @@ if __name__ == "__main__":
     target_under=1.0,           # “baseline” (no global under-penalty)
     target_mean_bias=0.05,
     warmup_epochs=3,
-    qlike_target_weight=getattr(BASE_VOL_LOSS, "qlike_weight", 0.2),
+    qlike_target_weight=getattr(VOL_LOSS, "qlike_weight", 0.2),
     )   
 
 
