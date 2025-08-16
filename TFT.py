@@ -304,9 +304,9 @@ class AsymmetricQuantileLoss(QuantileLoss):
         quantiles,
         underestimation_factor: float = 1.1115,
         mean_bias_weight: float = 0.0,
-        tail_q: float = 0.90,         # ← was 0.85
+        tail_q: float = 0.90,
         tail_weight: float = 0.0,
-        qlike_weight: float = 0.08,   # ← was 0.2
+        qlike_weight: float = 0.08,
         eps: float = 1e-8,
         med_clip: float = 5.0,
         log_ratio_clip: float = 20.0,
@@ -868,9 +868,9 @@ class BiasWarmupCallback(pl.Callback):
     def __init__(
         self,
         vol_loss,
-        target_under: float = 1.3,
-        target_mean_bias: float = 0.15,
-        warmup_epochs: int = 3,
+        target_under: float = 1.0,
+        target_mean_bias: float = 0.02,
+        warmup_epochs: int = 6,
         qlike_target_weight: float | None = None,
     ):
         super().__init__()
@@ -888,18 +888,17 @@ class BiasWarmupCallback(pl.Callback):
             self.vol_loss.underestimation_factor = self.target_under
             self.vol_loss.mean_bias_weight = self.target_mean_bias
             if hasattr(self.vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
-                # cap at 0.03 to avoid lifting the baseline (gentler)
-                self.vol_loss.qlike_weight = min(float(self.qlike_target_weight), 0.03)
+                self.vol_loss.qlike_weight = min(float(self.qlike_target_weight), 0.08)
         else:
             prog = min(1.0, float(e) / float(self.warm))  # linear ramp 0→1 across warm-up
             # ramp underestimation from 1.0 → target
             self.vol_loss.underestimation_factor = 1.0 + (self.target_under - 1.0) * prog
             # keep mean-bias OFF until warmup finishes
             self.vol_loss.mean_bias_weight = 0.0 if e < self.warm else self.target_mean_bias
-            # ramp QLIKE if configured (gentle & capped)
+            # ramp QLIKE if configured (gentle but effective)
             if hasattr(self.vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
-                q_target = min(float(self.qlike_target_weight), 0.03)   # cap at 0.03 (gentler)
-                q_prog = min(1.0, float(e) / float(max(self.warm, 10)))  # ramp over ≥ 10 epochs
+                q_target = min(float(self.qlike_target_weight), 0.08)   # cap at 0.08
+                q_prog = min(1.0, float(e) / float(max(self.warm, 6)))  # ramp over ≥ 6 epochs
                 self.vol_loss.qlike_weight = q_target * q_prog
 
         # Debug print
@@ -1187,9 +1186,9 @@ class TailWeightRamp(pl.Callback):
 
     def on_train_epoch_start(self, trainer, pl_module):
         e = int(getattr(trainer, "current_epoch", 0))
-        # Gentler schedule regardless of how it's instantiated
-        eff_end = min(self.end, 1.1)      # tighter cap on tail weight
-        eff_ramp = max(self.ramp, 10)     # ramp over at least 10 epochs
+        # Revert to the gentler-but-effective schedule that reached ~0.6 QLIKE
+        eff_end = min(self.end, 2.0)     # cap tail weight at 2.0 (not 1.1)
+        eff_ramp = max(self.ramp, 8)     # ramp over at least 8 epochs (not 10)
         prog = 1.0 if eff_ramp <= 0 else min(1.0, e / float(eff_ramp))
         self.vol_loss.tail_weight = self.start + (eff_end - self.start) * prog
         print(f"[TAIL] epoch={e} tail_weight={self.vol_loss.tail_weight}")
