@@ -264,7 +264,7 @@ if not hasattr(GroupNormalizer, "decode"):
 from pytorch_forecasting.metrics import QuantileLoss, MultiLoss
 
 class LabelSmoothedBCE(nn.Module):
-    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.001):
+    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.005):
         super().__init__()
         self.smoothing = smoothing
         self.register_buffer("pos_weight", torch.tensor(pos_weight))
@@ -497,9 +497,8 @@ class PerAssetMetrics(pl.Callback):
             pred = pred["prediction"]
 
         def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
-            q50 = vol_q[..., 3]
-            q75 = vol_q[..., 4] if vol_q.size(-1) > 4 else vol_q[..., 3]
-            return 0.5 * vol_q[..., 3] + 0.5 * vol_q[..., 4]
+            return vol_q[..., 3]
+
 
         def _extract_heads(pred):
             """Return (p_vol, p_dir) as 1D tensors [B] on DEVICE.
@@ -1884,10 +1883,13 @@ if __name__ == "__main__":
     tail_cb = TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=2.0, ramp_epochs=6)
     from pytorch_forecasting.metrics import MultiLoss
     # one-off in your data prep (TRAIN split)
+    '''
     counts = train_df["direction"].value_counts()
     n_pos = counts.get(1, 1)
     n_neg = counts.get(0, 1)
     pos_weight = float(n_neg / n_pos)
+    '''
+    pos_weight = 1.005
 
     # then build the loss with:
     DIR_LOSS = LabelSmoothedBCE(smoothing=0.05, pos_weight=pos_weight)
