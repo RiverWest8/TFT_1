@@ -277,6 +277,39 @@ class LabelSmoothedBCE(nn.Module):
             pos_weight=self.pos_weight,
         )
 
+class LabelSmoothedBCEWithBrier(nn.Module):
+    """
+    Direction loss = label-smoothed BCE + lambda * Brier score.
+    Brier uses probabilities (sigmoid over logits) and the SAME smoothed
+    targets as the BCE term for consistency. Set brier_weight=0 to
+    recover plain label-smoothed BCE.
+    """
+    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.001, brier_weight: float = 0.5):
+        super().__init__()
+        self.smoothing = float(smoothing)
+        self.register_buffer("pos_weight", torch.tensor(pos_weight))
+        self.brier_weight = float(brier_weight)
+
+    def forward(self, y_pred, target):
+        target = target.float()
+        # label smoothing as in LabelSmoothedBCE
+        target_smooth = target * (1.0 - self.smoothing) + 0.5 * self.smoothing
+
+        # BCE on logits
+        bce = F.binary_cross_entropy_with_logits(
+            y_pred.squeeze(-1), target_smooth.squeeze(-1),
+            pos_weight=self.pos_weight,
+        )
+
+        if self.brier_weight <= 0.0:
+            return bce
+
+        # Brier on probabilities
+        probs = torch.sigmoid(y_pred.squeeze(-1))
+        brier = ((probs - target_smooth.squeeze(-1)) ** 2).mean()
+
+        return bce + self.brier_weight * brier
+
 import torch
 import torch.nn.functional as F
 
@@ -663,6 +696,19 @@ class PerAssetMetrics(pl.Callback):
             pt = torch.clamp(pt, 0.0, 1.0)
             acc = ((pt >= 0.5).int() == yd_cpu.int()).float().mean().item()
 
+           
+        brier = None
+        if yd_cpu is not None and pd_cpu is not None and yd_cpu.numel() > 0 and pd_cpu.numel() > 0:
+            pt_b = pd_cpu
+            try:
+                if torch.isfinite(pt_b).any() and (pt_b.min() < 0 or pt_b.max() > 1):
+                    pt_b = torch.sigmoid(pt_b)  # logits → probs
+            except Exception:
+                pt_b = torch.sigmoid(pt_b)
+            pt_b = torch.clamp(pt_b, 0.0, 1.0)
+            brier = ((pt_b - yd_cpu.float()) ** 2).mean().item()
+            trainer.callback_metrics["val_brier_overall"] = torch.tensor(float(brier))
+
         # --- Epoch summary ---
         N = int(y_cpu.numel())
         try:
@@ -680,6 +726,7 @@ class PerAssetMetrics(pl.Callback):
             f"MSE={overall_mse:.6f} "
             f"QLIKE={overall_qlike:.6f} "
             + (f"| ACC={acc:.3f} " if acc is not None else "")
+            + (f"| Brier={brier:.4f} " if brier is not None else "")
             + f"| N={N} | VAL_LOSS={val_loss_value:.6f}"
         )
         print(msg)
@@ -701,6 +748,7 @@ class PerAssetMetrics(pl.Callback):
             "mse": overall_mse,
             "qlike": overall_qlike,
             "val_loss": val_loss_value,
+            "dir_bce": brier,
         }
         self._last_rows = []
 
@@ -1553,14 +1601,16 @@ def _evaluate_decoded_metrics(
     ratio = sigma2_y / sigma2_p
     qlike = (ratio - torch.log(ratio) - 1.0).mean().item()
 
-    dir_bce = float("nan")
+    dir_bce = float("nan")  # actually Brier score
     if yd_all and pd_all:
         yd, pd = torch.cat(yd_all).float(), torch.cat(pd_all)
         try:
             if torch.isfinite(pd).any() and (pd.min() < 0 or pd.max() > 1):
-                dir_bce_t = F.binary_cross_entropy_with_logits(pd, yd * 0.9 + 0.05)
-            else:
-                dir_bce_t = F.binary_cross_entropy(torch.clamp(pd, 1e-7, 1-1e-7), yd * 0.9 + 0.05)
+                pd = torch.sigmoid(pd)  # logits → probs
+            pd = torch.clamp(pd, 0.0, 1.0)
+            # same smoothing used in training, for stability
+            y_smooth = yd * 0.9 + 0.05
+            dir_bce_t = ((pd - y_smooth) ** 2).mean()
             dir_bce = float(dir_bce_t.item())
         except Exception:
             pass
@@ -1599,7 +1649,7 @@ def run_permutation_importance(
     b_mae, b_rmse, b_dir, b_val, n = _evaluate_decoded_metrics(
         model, ds_base, batch_size, max_batches, num_workers, prefetch, pin_memory, vol_norm = train_vol_norm
     )
-    print(f"[FI] Baseline val_loss = {b_val:.6f} (MAE={b_mae:.6f}, RMSE={b_rmse:.6f}, DirBCE={b_dir:.6f}) | N={n}")
+    print(f"[FI] Baseline val_loss = {b_val:.6f} (MAE={b_mae:.6f}, RMSE={b_rmse:.6f}, Brier={b_dir:.6f}) | N={n}")
 
     rows = []
     for feat in features:
@@ -1622,6 +1672,7 @@ def run_permutation_importance(
             "mae": p_mae,
             "rmse": p_rmse,
             "dir_bce": p_dir,
+            "brier" : p_dir,
             "n": n_p,
         })
 
@@ -1890,7 +1941,7 @@ if __name__ == "__main__":
     pos_weight = float(n_neg / n_pos)
 
     # then build the loss with:
-    DIR_LOSS = LabelSmoothedBCE(smoothing=0.05, pos_weight=pos_weight)
+    DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.05, pos_weight=pos_weight)
 
 
     FIXED_VOL_WEIGHT = 1.0
