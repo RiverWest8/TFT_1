@@ -976,6 +976,13 @@ class BiasWarmupCallback(pl.Callback):
             self._frozen = False
 
     def on_train_epoch_start(self, trainer, pl_module):
+        # Global CLI switch: if --disable_warmups is true, do nothing
+        try:
+            if globals().get("ARGS") is not None and getattr(ARGS, "disable_warmups", False):
+                print(f"[BIAS] epoch={int(getattr(trainer,'current_epoch',0))} DISABLED via --disable_warmups; skipping")
+                return
+        except Exception:
+            pass
         vol_loss = self._resolve_vol_loss(pl_module)
         if vol_loss is None:
             print("[BIAS] could not resolve vol loss; skipping warm-up tweaks")
@@ -1318,6 +1325,13 @@ class TailWeightRamp(pl.Callback):
         self.vol_loss, self.start, self.end, self.ramp = vol_loss, float(start), float(end), int(ramp_epochs)
 
     def on_train_epoch_start(self, trainer, pl_module):
+        # Global CLI switch: if --disable_warmups is true, hold tail_weight steady
+        try:
+            if globals().get("ARGS") is not None and getattr(ARGS, "disable_warmups", False):
+                print(f"[TAIL] epoch={int(getattr(trainer,'current_epoch',0))} DISABLED via --disable_warmups; tail_weight stays {self.vol_loss.tail_weight}")
+                return
+        except Exception:
+            pass
         frozen = False
         for cb in getattr(trainer, 'callbacks', []):
             if isinstance(cb, BiasWarmupCallback) and getattr(cb, '_frozen', False):
@@ -1790,7 +1804,8 @@ if __name__ == "__main__":
         f"[CONFIG] batch_size={BATCH_SIZE} | encoder={MAX_ENCODER_LENGTH} | epochs={MAX_EPOCHS} | "
         f"patience={EARLY_STOP_PATIENCE} | perm_len={PERM_BLOCK_SIZE} | "
         f"perm_importance={'on' if ENABLE_FEATURE_IMPORTANCE else 'off'} | fi_max_batches={FI_MAX_BATCHES} | "
-        f"train_max_rows={getattr(ARGS, 'train_max_rows', None)} | val_max_rows={getattr(ARGS, 'val_max_rows', None)} | subset_mode={getattr(ARGS, 'subset_mode', 'per_asset_tail')}"
+        f"train_max_rows={getattr(ARGS, 'train_max_rows', None)} | val_max_rows={getattr(ARGS, 'val_max_rows', None)} | subset_mode={getattr(ARGS, 'subset_mode', 'per_asset_tail')} | "
+        f"warmups={'off' if getattr(ARGS, 'disable_warmups', False) else 'on'}"
     )
     print("▶ Loading data …")
     train_df = add_time_idx(load_split(READ_PATHS[0]))
