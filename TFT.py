@@ -284,7 +284,7 @@ class LabelSmoothedBCEWithBrier(nn.Module):
     targets as the BCE term for consistency. Set brier_weight=0 to
     recover plain label-smoothed BCE.
     """
-    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.001, brier_weight: float = 0.5):
+    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.001, brier_weight: float = 0.18):
         super().__init__()
         self.smoothing = float(smoothing)
         self.register_buffer("pos_weight", torch.tensor(pos_weight))
@@ -1813,11 +1813,11 @@ if __name__ == "__main__":
     val_df   = add_calendar_features(val_df)
     test_df  = add_calendar_features(test_df)
 
-
+    '''
     train_df = train_df[train_df["asset"] == "BTC"].reset_index(drop=True)
     val_df   = val_df[val_df["asset"] == "BTC"].reset_index(drop=True)
     test_df  = test_df[test_df["asset"] == "BTC"].reset_index(drop=True)
-
+    '''
 
     # Optional quick-run subsetting for speed
     _mode = getattr(ARGS, "subset_mode", "per_asset_tail")
@@ -2028,7 +2028,7 @@ if __name__ == "__main__":
     pos_weight = float(n_neg / n_pos)
 
     # then build the loss with:
-    DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.05, pos_weight=pos_weight)
+    DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.03, pos_weight=pos_weight)
 
 
     FIXED_VOL_WEIGHT = 1.0
@@ -2039,9 +2039,9 @@ if __name__ == "__main__":
         training_dataset,
         hidden_size=96,
         attention_head_size=4,
-        dropout=0.0833704625250354, #0.0833704625250354,
+        dropout=0.13, #0.0833704625250354,
         hidden_continuous_size=24,
-        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.000815), #0.0019 0017978
+        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.00035), #0.0019 0017978
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
         output_size=[7, 1],  # 7 quantiles + 1 logit
@@ -2073,9 +2073,9 @@ if __name__ == "__main__":
     bias_cb = BiasWarmupCallback(
     vol_loss= VOL_LOSS,
     target_under=1.0,           # “baseline” (no global under-penalty)
-    target_mean_bias=0.02,
-    warmup_epochs=6,
-    qlike_target_weight= 0.08 ,
+    target_mean_bias=0.05,
+    warmup_epochs=10,
+    qlike_target_weight= 0.05 ,
     )   
 
 
