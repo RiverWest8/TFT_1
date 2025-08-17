@@ -1813,11 +1813,6 @@ if __name__ == "__main__":
     val_df   = add_calendar_features(val_df)
     test_df  = add_calendar_features(test_df)
 
-    '''
-    train_df = train_df[train_df["asset"] == "BTC"].reset_index(drop=True)
-    val_df   = val_df[val_df["asset"] == "BTC"].reset_index(drop=True)
-    test_df  = test_df[test_df["asset"] == "BTC"].reset_index(drop=True)
-    '''
 
     # Optional quick-run subsetting for speed
     _mode = getattr(ARGS, "subset_mode", "per_asset_tail")
