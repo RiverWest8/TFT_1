@@ -904,59 +904,147 @@ import lightning.pytorch as pl
 
 class BiasWarmupCallback(pl.Callback):
     """
-    Warms up:
-      • underestimation_factor: ramps 1.0 → target_under over `warmup_epochs`
-      • mean_bias_weight: 0.0 during warm-up, then -> target_mean_bias
-      • (optional) qlike_weight: ramps 0.0 → qlike_target_weight (capped) over warm-up
+    Adaptive warm‑up for volatility loss terms.
+
+    This version fixes the upward bias you are seeing by:
+      • Resolving the *actual* AsymmetricQuantileLoss instance inside the model each epoch
+      • Never pushing the underestimation bias > 1.0 when the model is already
+        **over‑predicting** (mean(y)/mean(p) < 1); instead it clamps to 1.0
+      • Ramping QLIKE slowly and capping it lower (default cap 0.05)
+      • Starting a small mean‑bias regulariser earlier and ramping gently
     """
     def __init__(
         self,
-        vol_loss,
-        target_under: float = 1.3,
-        target_mean_bias: float = 0.15,
-        warmup_epochs: int = 3,
-        qlike_target_weight: float | None = None,
+        vol_loss=None,
+        target_under: float = 1.15,            # gentler than 1.3
+        target_mean_bias: float = 0.05,        # small calibration regulariser
+        warmup_epochs: int = 4,                 # slightly longer warmup
+        qlike_target_weight: float | None = 0.05,  # lower cap than before
+        start_mean_bias: float = 0.0,
+        mean_bias_ramp_until: int = 8,         # ramp to target by this epoch
     ):
         super().__init__()
-        self.vol_loss = vol_loss
+        self._vol_loss_hint = vol_loss
         self.target_under = float(target_under)
         self.target_mean_bias = float(target_mean_bias)
         self.qlike_target_weight = None if qlike_target_weight is None else float(qlike_target_weight)
         self.warm = int(max(0, warmup_epochs))
+        self.start_mean_bias = float(start_mean_bias)
+        self.mean_bias_ramp_until = int(max(mean_bias_ramp_until, self.warm))
+        self._scale_ema = None  # EMA of mean(y)/mean(p) from validation
+
+    # ---- helpers ----
+    def _resolve_vol_loss(self, pl_module):
+        """Find the AsymmetricQuantileLoss instance inside the model's loss tree."""
+        import inspect
+        cand = self._vol_loss_hint
+        try:
+            from types import SimpleNamespace
+        except Exception:
+            SimpleNamespace = None
+
+        def is_vol_loss(obj):
+            if obj is None:
+                return False
+            name = obj.__class__.__name__
+            return hasattr(obj, "loss_per_prediction") and hasattr(obj, "quantiles") and (
+                name == "AsymmetricQuantileLoss" or hasattr(obj, "qlike_weight")
+            )
+
+        # direct hint
+        if is_vol_loss(cand):
+            return cand
+
+        # search common attributes
+        for attr in ("loss", "losses", "metrics"):
+            obj = getattr(pl_module, attr, None)
+            if is_vol_loss(obj):
+                return obj
+            # look inside containers
+            if isinstance(obj, (list, tuple)):
+                for o in obj:
+                    if is_vol_loss(o):
+                        return o
+                    for sub_attr in ("metrics", "losses"):
+                        oo = getattr(o, sub_attr, None)
+                        if isinstance(oo, (list, tuple)):
+                            for z in oo:
+                                if is_vol_loss(z):
+                                    return z
+            else:
+                for sub_attr in ("metrics", "losses"):
+                    oo = getattr(obj, sub_attr, None)
+                    if isinstance(oo, (list, tuple)):
+                        for z in oo:
+                            if is_vol_loss(z):
+                                return z
+
+        # fall back: scan all attributes
+        for _, v in inspect.getmembers(pl_module):
+            if is_vol_loss(v):
+                return v
+        return None
 
     def on_train_epoch_start(self, trainer, pl_module):
-        # current_epoch is 0-based
+        # Resolve the live vol loss inside the model
+        vol_loss = self._resolve_vol_loss(pl_module)
+        if vol_loss is None:
+            print("[BIAS] could not resolve vol loss; skipping warm‑up tweaks")
+            return
+
+        # Read last validation scale diagnostic (set in PerAssetMetrics)
+        scale = None
+        try:
+            val = trainer.callback_metrics.get("val_mean_scale")
+            if val is not None:
+                scale = float(val.item() if hasattr(val, "item") else val)
+        except Exception:
+            scale = None
+
+        # maintain an EMA of mean(y)/mean(p)
+        if scale is not None:
+            if self._scale_ema is None:
+                self._scale_ema = scale
+            else:
+                self._scale_ema = 0.8 * self._scale_ema + 0.2 * scale
+
+        # epoch index (0‑based)
         e = int(getattr(trainer, "current_epoch", 0))
-        if self.warm <= 0:
-            # no warmup: use targets directly
-            self.vol_loss.underestimation_factor = self.target_under
-            self.vol_loss.mean_bias_weight = self.target_mean_bias
-            if hasattr(self.vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
-                # cap at 0.08 to avoid lifting the baseline
-                self.vol_loss.qlike_weight = min(float(self.qlike_target_weight), 0.08)
+        prog = min(1.0, float(e) / float(max(self.warm, 1)))
+
+        # ---- Underestimation bias (alpha) ----
+        # If the model is over‑predicting (scale < 1), do NOT push alpha above 1.
+        # Otherwise ramp gently up to target.
+        if self._scale_ema is not None and self._scale_ema < 0.995:
+            alpha = 1.0  # neutralise upward bias
         else:
-            prog = min(1.0, float(e) / float(self.warm))  # linear ramp 0→1 across warm-up
-            # ramp underestimation from 1.0 → target
-            self.vol_loss.underestimation_factor = 1.0 + (self.target_under - 1.0) * prog
-            # keep mean-bias OFF until warmup finishes
-            self.vol_loss.mean_bias_weight = 0.0 if e < self.warm else self.target_mean_bias
-            # ramp QLIKE if configured (gentle & capped)
-            if hasattr(self.vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
-                q_target = min(float(self.qlike_target_weight), 0.08)   # cap at 0.08
-                q_prog = min(1.0, float(e) / float(max(self.warm, 6)))  # ramp over ≥ 6 epochs
-                self.vol_loss.qlike_weight = q_target * q_prog
+            alpha = 1.0 + (self.target_under - 1.0) * prog
+        vol_loss.underestimation_factor = float(alpha)
+
+        # ---- Mean‑bias regulariser ----
+        if e <= self.mean_bias_ramp_until:
+            mb_prog = min(1.0, max(0.0, (e - 0) / float(max(1, self.mean_bias_ramp_until))))
+            vol_loss.mean_bias_weight = self.start_mean_bias + (self.target_mean_bias - self.start_mean_bias) * mb_prog
+        else:
+            vol_loss.mean_bias_weight = self.target_mean_bias
+
+        # ---- QLIKE weight ----
+        if hasattr(vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
+            q_target = float(self.qlike_target_weight)
+            # slower ramp and lower cap
+            q_prog = min(1.0, float(e) / float(max(self.warm, 8)))
+            vol_loss.qlike_weight = min(q_target, 0.05) * q_prog
 
         # Debug print
         try:
             lr0 = trainer.optimizers[0].param_groups[0]["lr"]
         except Exception:
             lr0 = None
-        qlw = getattr(self.vol_loss, "qlike_weight", None)
         print(
-            f"[BIAS] epoch={e} "
-            f"under={self.vol_loss.underestimation_factor:.3f} "
-            f"mean_bias={self.vol_loss.mean_bias_weight:.3f} "
-            f"qlike_w={qlw if qlw is not None else 'n/a'} "
+            f"[BIAS] epoch={e} under={vol_loss.underestimation_factor:.3f} "
+            f"mean_bias={vol_loss.mean_bias_weight:.3f} "
+            f"qlike_w={getattr(vol_loss, 'qlike_weight', 'n/a')} "
+            f"scale_ema={self._scale_ema if self._scale_ema is not None else 'n/a'} "
             f"lr={lr0 if lr0 is not None else 'n/a'}"
         )
 
@@ -1225,21 +1313,20 @@ class MirrorCheckpoints(pl.Callback):
         mirror_local_ckpts_to_gcs()
 
 class TailWeightRamp(pl.Callback):
-    def __init__(self, vol_loss, start: float = 1.0, end: float = 2.0, ramp_epochs: int = 8):
+    def __init__(self, vol_loss, start: float = 1.0, end: float = 1.25, ramp_epochs: int = 12):
         super().__init__()
         self.vol_loss, self.start, self.end, self.ramp = vol_loss, float(start), float(end), int(ramp_epochs)
 
     def on_train_epoch_start(self, trainer, pl_module):
         e = int(getattr(trainer, "current_epoch", 0))
-        # Gentler schedule regardless of how it's instantiated
-        eff_end = min(self.end, 2.0)      # cap tail weight
-        eff_ramp = max(self.ramp, 8)      # ramp over at least 8 epochs
+        eff_end = min(self.end, 1.5)     # lower cap
+        eff_ramp = max(self.ramp, 12)    # slower ramp
         prog = 1.0 if eff_ramp <= 0 else min(1.0, e / float(eff_ramp))
         self.vol_loss.tail_weight = self.start + (eff_end - self.start) * prog
         print(f"[TAIL] epoch={e} tail_weight={self.vol_loss.tail_weight}")
 
 class ReduceLROnPlateauCallback(pl.Callback):
-    def __init__(self, monitor="val_loss", factor=0.5, patience=3, min_lr=1e-5, cooldown=0):
+    def __init__(self, monitor="val_qlike_overall", factor=0.5, patience=3, min_lr=1e-5, cooldown=0):
         self.monitor, self.factor, self.patience, self.min_lr, self.cooldown = monitor, factor, patience, min_lr, cooldown
         self.best, self.bad, self.cool = float("inf"), 0, 0
 
@@ -1663,7 +1750,7 @@ def run_permutation_importance(
             model, ds_p, batch_size, max_batches, num_workers, prefetch, pin_memory, vol_norm = train_vol_norm
         )
         delta = (p_val - b_val) if (np.isfinite(p_val) and np.isfinite(b_val)) else float("nan")
-        print(f"[FI] {feat:>20} | val_p={p_val:.6f} | Δ={delta:.6f} | (MAE={p_mae:.6f}, RMSE={p_rmse:.6f}, DirBCE={p_dir:.6f})")
+        print(f"[FI] {feat:>20} | val_p={p_val:.6f} | Δ={delta:.6f} | (MAE={p_mae:.6f}, RMSE={p_rmse:.6f}, Brier={p_dir:.6f})")
         rows.append({
             "feature": feat,
             "baseline_val_loss": b_val,
