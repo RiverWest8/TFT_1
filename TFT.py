@@ -1079,7 +1079,7 @@ if torch.cuda.is_available():
     ACCELERATOR = "gpu"
     DEVICES = "auto"          # use all visible GPUs if more than one
     # default to bf16 but fall back to fp16 if unsupported (e.g., T4)
-    PRECISION = "bf16-mixed" #bf16-mixed
+    PRECISION = "32" #bf16-mixed
     try:
         if hasattr(torch.cuda, "is_bf16_supported") and not torch.cuda.is_bf16_supported():
             PRECISION = "16-mixed"
