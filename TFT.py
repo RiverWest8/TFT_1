@@ -1278,7 +1278,7 @@ EMBEDDING_CARDINALITY = {}
 
 BATCH_SIZE   = 2048
 MAX_EPOCHS   = 5
-EARLY_STOP_PATIENCE = 4
+EARLY_STOP_PATIENCE = 12
 PERM_BLOCK_SIZE = 288
 
 # Artifacts are written locally then uploaded to GCS
