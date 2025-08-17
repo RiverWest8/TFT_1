@@ -904,24 +904,24 @@ import lightning.pytorch as pl
 
 class BiasWarmupCallback(pl.Callback):
     """
-    Adaptive warm‑up for volatility loss terms.
+    Adaptive warm-up with a safety guard.
 
-    This version fixes the upward bias you are seeing by:
-      • Resolving the *actual* AsymmetricQuantileLoss instance inside the model each epoch
-      • Never pushing the underestimation bias > 1.0 when the model is already
-        **over‑predicting** (mean(y)/mean(p) < 1); instead it clamps to 1.0
-      • Ramping QLIKE slowly and capping it lower (default cap 0.05)
-      • Starting a small mean‑bias regulariser earlier and ramping gently
+    • EMA of mean(y)/mean(p) steers underestimation bias (alpha).
+    • Warm-ups are frozen if validation worsens for `guard_patience` epochs.
+    • QLIKE ramps only when scale is near 1 to avoid fighting calibration.
     """
     def __init__(
         self,
         vol_loss=None,
-        target_under: float = 1.15,            # gentler than 1.3
-        target_mean_bias: float = 0.05,        # small calibration regulariser
-        warmup_epochs: int = 4,                 # slightly longer warmup
-        qlike_target_weight: float | None = 0.05,  # lower cap than before
+        target_under: float = 1.12,
+        target_mean_bias: float = 0.04,
+        warmup_epochs: int = 4,
+        qlike_target_weight: float | None = 0.04,
         start_mean_bias: float = 0.0,
-        mean_bias_ramp_until: int = 8,         # ramp to target by this epoch
+        mean_bias_ramp_until: int = 8,
+        guard_patience: int = 2,
+        guard_tol: float = 0.0,
+        alpha_step: float = 0.05,
     ):
         super().__init__()
         self._vol_loss_hint = vol_loss
@@ -931,18 +931,17 @@ class BiasWarmupCallback(pl.Callback):
         self.warm = int(max(0, warmup_epochs))
         self.start_mean_bias = float(start_mean_bias)
         self.mean_bias_ramp_until = int(max(mean_bias_ramp_until, self.warm))
-        self._scale_ema = None  # EMA of mean(y)/mean(p) from validation
+        self.guard_patience = int(max(1, guard_patience))
+        self.guard_tol = float(guard_tol)
+        self.alpha_step = float(alpha_step)
 
-    # ---- helpers ----
+        self._scale_ema = None
+        self._prev_val = None
+        self._worse_streak = 0
+        self._frozen = False
+
     def _resolve_vol_loss(self, pl_module):
-        """Find the AsymmetricQuantileLoss instance inside the model's loss tree."""
         import inspect
-        cand = self._vol_loss_hint
-        try:
-            from types import SimpleNamespace
-        except Exception:
-            SimpleNamespace = None
-
         def is_vol_loss(obj):
             if obj is None:
                 return False
@@ -950,92 +949,86 @@ class BiasWarmupCallback(pl.Callback):
             return hasattr(obj, "loss_per_prediction") and hasattr(obj, "quantiles") and (
                 name == "AsymmetricQuantileLoss" or hasattr(obj, "qlike_weight")
             )
-
-        # direct hint
+        cand = self._vol_loss_hint
         if is_vol_loss(cand):
             return cand
-
-        # search common attributes
-        for attr in ("loss", "losses", "metrics"):
-            obj = getattr(pl_module, attr, None)
-            if is_vol_loss(obj):
-                return obj
-            # look inside containers
-            if isinstance(obj, (list, tuple)):
-                for o in obj:
-                    if is_vol_loss(o):
-                        return o
-                    for sub_attr in ("metrics", "losses"):
-                        oo = getattr(o, sub_attr, None)
-                        if isinstance(oo, (list, tuple)):
-                            for z in oo:
-                                if is_vol_loss(z):
-                                    return z
-            else:
-                for sub_attr in ("metrics", "losses"):
-                    oo = getattr(obj, sub_attr, None)
-                    if isinstance(oo, (list, tuple)):
-                        for z in oo:
-                            if is_vol_loss(z):
-                                return z
-
-        # fall back: scan all attributes
         for _, v in inspect.getmembers(pl_module):
             if is_vol_loss(v):
                 return v
         return None
 
+    def on_validation_end(self, trainer, pl_module):
+        val = trainer.callback_metrics.get("val_loss") or trainer.callback_metrics.get("val_qlike_overall")
+        try:
+            val = float(val.item() if hasattr(val, "item") else val)
+        except Exception:
+            val = None
+        if val is None:
+            return
+        if self._prev_val is not None and val > self._prev_val + self.guard_tol:
+            self._worse_streak += 1
+        else:
+            self._worse_streak = 0
+        self._prev_val = val
+        if self._worse_streak >= self.guard_patience:
+            self._frozen = True
+        if self._worse_streak == 0:  # improved or equal
+            self._frozen = False
+
     def on_train_epoch_start(self, trainer, pl_module):
-        # Resolve the live vol loss inside the model
         vol_loss = self._resolve_vol_loss(pl_module)
         if vol_loss is None:
-            print("[BIAS] could not resolve vol loss; skipping warm‑up tweaks")
+            print("[BIAS] could not resolve vol loss; skipping warm-up tweaks")
             return
 
-        # Read last validation scale diagnostic (set in PerAssetMetrics)
+        # read last validation mean scale diagnostic
         scale = None
         try:
             val = trainer.callback_metrics.get("val_mean_scale")
             if val is not None:
                 scale = float(val.item() if hasattr(val, "item") else val)
         except Exception:
-            scale = None
+            pass
 
-        # maintain an EMA of mean(y)/mean(p)
         if scale is not None:
-            if self._scale_ema is None:
-                self._scale_ema = scale
-            else:
-                self._scale_ema = 0.8 * self._scale_ema + 0.2 * scale
+            self._scale_ema = scale if self._scale_ema is None else 0.8 * self._scale_ema + 0.2 * scale
 
-        # epoch index (0‑based)
         e = int(getattr(trainer, "current_epoch", 0))
         prog = min(1.0, float(e) / float(max(self.warm, 1)))
 
-        # ---- Underestimation bias (alpha) ----
-        # If the model is over‑predicting (scale < 1), do NOT push alpha above 1.
-        # Otherwise ramp gently up to target.
-        if self._scale_ema is not None and self._scale_ema < 0.995:
-            alpha = 1.0  # neutralise upward bias
-        else:
-            alpha = 1.0 + (self.target_under - 1.0) * prog
-        vol_loss.underestimation_factor = float(alpha)
+        # Freeze if getting worse
+        if self._frozen:
+            vol_loss.underestimation_factor = 1.0
+            if hasattr(vol_loss, "qlike_weight"):
+                vol_loss.qlike_weight = 0.0
+            vol_loss.mean_bias_weight = min(getattr(vol_loss, "mean_bias_weight", 0.0), self.target_mean_bias)
+            print(f"[BIAS] epoch={e} FROZEN: alpha=1.0 qlike_w=0.0 mean_bias={vol_loss.mean_bias_weight:.3f}")
+            return
 
-        # ---- Mean‑bias regulariser ----
+        # proportional (small) adjustment to alpha to avoid overshoot
+        alpha = 1.0
+        if self._scale_ema is not None:
+            err = np.log(max(1e-6, self._scale_ema))   # log mean(y)/mean(p)
+            step = np.clip(1.0 + self.alpha_step * err, 1.0 - self.alpha_step, 1.0 + self.alpha_step)
+            alpha = (1.0 + (self.target_under - 1.0) * prog) * step
+            if self._scale_ema < 0.995:  # already over-predicting
+                alpha = min(alpha, 1.0)
+        vol_loss.underestimation_factor = float(max(0.9, min(alpha, self.target_under)))
+
+        # mean-bias gentle ramp
         if e <= self.mean_bias_ramp_until:
-            mb_prog = min(1.0, max(0.0, (e - 0) / float(max(1, self.mean_bias_ramp_until))))
+            mb_prog = min(1.0, max(0.0, e / float(max(1, self.mean_bias_ramp_until))))
             vol_loss.mean_bias_weight = self.start_mean_bias + (self.target_mean_bias - self.start_mean_bias) * mb_prog
         else:
             vol_loss.mean_bias_weight = self.target_mean_bias
 
-        # ---- QLIKE weight ----
+        # qlike: only when calibration is roughly correct
         if hasattr(vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
             q_target = float(self.qlike_target_weight)
-            # slower ramp and lower cap
             q_prog = min(1.0, float(e) / float(max(self.warm, 8)))
-            vol_loss.qlike_weight = min(q_target, 0.05) * q_prog
+            near_ok = (self._scale_ema is None) or (0.9 <= self._scale_ema <= 1.1)
+            vol_loss.qlike_weight = (q_target * q_prog) if near_ok else 0.0
 
-        # Debug print
         try:
             lr0 = trainer.optimizers[0].param_groups[0]["lr"]
         except Exception:
@@ -1045,6 +1038,7 @@ class BiasWarmupCallback(pl.Callback):
             f"mean_bias={vol_loss.mean_bias_weight:.3f} "
             f"qlike_w={getattr(vol_loss, 'qlike_weight', 'n/a')} "
             f"scale_ema={self._scale_ema if self._scale_ema is not None else 'n/a'} "
+            f"guard={'ON' if self._frozen else 'off'} "
             f"lr={lr0 if lr0 is not None else 'n/a'}"
         )
 
@@ -1085,7 +1079,7 @@ if torch.cuda.is_available():
     ACCELERATOR = "gpu"
     DEVICES = "auto"          # use all visible GPUs if more than one
     # default to bf16 but fall back to fp16 if unsupported (e.g., T4)
-    PRECISION = "bf16-mixed"
+    PRECISION = "16-mixed" #bf16-mixed
     try:
         if hasattr(torch.cuda, "is_bf16_supported") and not torch.cuda.is_bf16_supported():
             PRECISION = "16-mixed"
@@ -1121,6 +1115,12 @@ else:
 # CLI overrides for common CONFIG knobs
 # -----------------------------------------------------------------------
 parser = argparse.ArgumentParser(description="TFT training with optional permutation importance", add_help=True)
+parser.add_argument("--disable_warmups", type=lambda s: str(s).lower() in ("1","true","t","yes","y","on"),
+                    default=False, help="Disable bias/QLIKE warm-ups and tail ramp")
+parser.add_argument("--warmup_guard_patience", type=int, default=2,
+                    help="Consecutive worsening epochs before freezing warm-ups")
+parser.add_argument("--warmup_guard_tol", type=float, default=0.0,
+                    help="Minimum delta in val_loss to count as worsening")
 parser.add_argument("--max_encoder_length", type=int, default=None, help="Max encoder length")
 parser.add_argument("--max_epochs", type=int, default=None, help="Max training epochs")
 parser.add_argument("--batch_size", type=int, default=None, help="Training batch size")
@@ -1318,9 +1318,18 @@ class TailWeightRamp(pl.Callback):
         self.vol_loss, self.start, self.end, self.ramp = vol_loss, float(start), float(end), int(ramp_epochs)
 
     def on_train_epoch_start(self, trainer, pl_module):
+        frozen = False
+        for cb in getattr(trainer, 'callbacks', []):
+            if isinstance(cb, BiasWarmupCallback) and getattr(cb, '_frozen', False):
+                frozen = True
+                break
+        if frozen:
+            print(f"[TAIL] epoch={int(getattr(trainer, 'current_epoch', 0))} frozen; tail_weight stays {self.vol_loss.tail_weight}")
+            return
+
         e = int(getattr(trainer, "current_epoch", 0))
-        eff_end = min(self.end, 1.5)     # lower cap
-        eff_ramp = max(self.ramp, 12)    # slower ramp
+        eff_end = min(self.end, 1.5)
+        eff_ramp = max(self.ramp, 12)
         prog = 1.0 if eff_ramp <= 0 else min(1.0, e / float(eff_ramp))
         self.vol_loss.tail_weight = self.start + (eff_end - self.start) * prog
         print(f"[TAIL] epoch={e} tail_weight={self.vol_loss.tail_weight}")
@@ -2073,6 +2082,15 @@ if __name__ == "__main__":
     qlike_target_weight= 0.05 ,
     )   
 
+    if not getattr(ARGS, "disable_warmups", False):
+        bias_cb = BiasWarmupCallback(
+            vol_loss=vol_loss,
+            guard_patience=int(getattr(ARGS, "warmup_guard_patience", 2)),
+            guard_tol=float(getattr(ARGS, "warmup_guard_tol", 0.0)),
+        )
+        callbacks += [bias_cb, TailWeightRamp(vol_loss, start=1.0, end=1.25, ramp_epochs=12)]
+    else:
+        print("[WARMUPS] Disabled via --disable_warmups")
 
    
     
