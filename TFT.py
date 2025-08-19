@@ -2053,7 +2053,6 @@ if __name__ == "__main__":
         qlike_weight=0.20,             # << QLIKE back in (tune 0.1–0.3)
         reduction="mean",
     )
-    tail_cb = TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=2.0, ramp_epochs=6)
     from pytorch_forecasting.metrics import MultiLoss
     # one-off in your data prep (TRAIN split)
     counts = train_df["direction"].value_counts()
@@ -2104,23 +2103,6 @@ if __name__ == "__main__":
     )
 
   
-    bias_cb = BiasWarmupCallback(
-    vol_loss= VOL_LOSS,
-    target_under=1.0,           # “baseline” (no global under-penalty)
-    target_mean_bias=0.05,
-    warmup_epochs=10,
-    qlike_target_weight= 0.05 ,
-    )   
-
-    if not getattr(ARGS, "disable_warmups", False):
-        bias_cb = BiasWarmupCallback(
-            vol_loss=vol_loss,
-            guard_patience=int(getattr(ARGS, "warmup_guard_patience", 2)),
-            guard_tol=float(getattr(ARGS, "warmup_guard_tol", 0.0)),
-        )
-        callbacks += [bias_cb, TailWeightRamp(vol_loss, start=1.0, end=1.25, ramp_epochs=12)]
-    else:
-        print("[WARMUPS] Disabled via --disable_warmups")
 
    
     
