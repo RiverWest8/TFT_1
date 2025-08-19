@@ -114,6 +114,19 @@ Q50_IDX = VOL_QUANTILES.index(0.50)  # -> 3
 
 from pytorch_forecasting.data.encoders import GroupNormalizer
 
+# Add a robust log1p mapping as well (for PF versions that lack it or store a bare function)
+if ("log1p" not in GroupNormalizer.TRANSFORMATIONS
+    or not isinstance(GroupNormalizer.TRANSFORMATIONS["log1p"], dict)):
+    GroupNormalizer.TRANSFORMATIONS["log1p"] = {
+        "forward": lambda x: torch.log1p(x) if torch.is_tensor(x) else np.log1p(x),
+        "inverse": lambda x: torch.expm1(x) if torch.is_tensor(x) else np.expm1(x),
+    }
+if hasattr(GroupNormalizer, "INVERSE_TRANSFORMATIONS"):
+    GroupNormalizer.INVERSE_TRANSFORMATIONS.setdefault(
+        "log1p",
+        lambda x: torch.expm1(x) if torch.is_tensor(x) else np.expm1(x),
+    )
+
 if ("asinh" not in GroupNormalizer.TRANSFORMATIONS
     or not isinstance(GroupNormalizer.TRANSFORMATIONS["asinh"], dict)):
     GroupNormalizer.TRANSFORMATIONS["asinh"] = {
@@ -162,6 +175,8 @@ def manual_inverse_transform_groupnorm(normalizer, y: torch.Tensor, group_ids: t
     tfm = getattr(normalizer, "transformation", None)
     if tfm == "asinh":
         x = torch.sinh(x)
+    elif tfm == "log1p" :
+        x = torch.expm1(x)
     elif tfm in (None, "identity"):
         pass
     else:
@@ -411,8 +426,8 @@ class AsymmetricQuantileLoss(QuantileLoss):
                 t_enc = torch.clamp(target, -self.med_clip, self.med_clip)
                 m_enc = torch.clamp(med,    -self.med_clip, self.med_clip)
 
-                y_dec = torch.sinh(t_enc)
-                p_dec = torch.sinh(m_enc)
+                y_dec = torch.expm1(t_enc)
+                p_dec = torch.expm1(m_enc)
 
                 sigma2_y = (y_dec.abs().clamp_min(self.eps)) ** 2
                 sigma2_p = (p_dec.abs().clamp_min(self.eps)) ** 2
@@ -1920,7 +1935,7 @@ if __name__ == "__main__":
                     groups=GROUP_ID,
                     center=False,
                     scale_by_group= True,
-                    transformation="asinh",
+                    transformation="log1p",
                 ),
                 TorchNormalizer(method="identity", center=False),   # direction
             ]),
@@ -2122,7 +2137,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, bias_cb, red_cb, tail_cb],
+        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, red_cb],
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
     )
