@@ -127,17 +127,6 @@ if hasattr(GroupNormalizer, "INVERSE_TRANSFORMATIONS"):
         lambda x: torch.expm1(x) if torch.is_tensor(x) else np.expm1(x),
     )
 
-if ("asinh" not in GroupNormalizer.TRANSFORMATIONS
-    or not isinstance(GroupNormalizer.TRANSFORMATIONS["asinh"], dict)):
-    GroupNormalizer.TRANSFORMATIONS["asinh"] = {
-        "forward": lambda x: torch.asinh(x) if torch.is_tensor(x) else np.arcsinh(x),
-        "inverse": lambda x: torch.sinh(x)  if torch.is_tensor(x) else np.sinh(x),
-    }
-if hasattr(GroupNormalizer, "INVERSE_TRANSFORMATIONS"):
-    GroupNormalizer.INVERSE_TRANSFORMATIONS.setdefault(
-        "asinh",
-        lambda x: torch.sinh(x) if torch.is_tensor(x) else np.sinh(x),
-    )
 
 
 
@@ -173,9 +162,7 @@ def manual_inverse_transform_groupnorm(normalizer, y: torch.Tensor, group_ids: t
         x = y_ * s + c
 
     tfm = getattr(normalizer, "transformation", None)
-    if tfm == "asinh":
-        x = torch.sinh(x)
-    elif tfm == "log1p" :
+    if tfm == "log1p":
         x = torch.expm1(x)
     elif tfm in (None, "identity"):
         pass
@@ -545,9 +532,12 @@ class PerAssetMetrics(pl.Callback):
             pred = pred["prediction"]
 
         def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
+            # Enforce non-decreasing quantiles along the last dim
+            vol_q = torch.cummax(vol_q, dim=-1).values
+            # Use median (index 3) or your blend
             q50 = vol_q[..., 3]
-            q75 = vol_q[..., 4] if vol_q.size(-1) > 4 else vol_q[..., 3]
-            return 0.5 * vol_q[..., 3] + 0.5 * vol_q[..., 4]
+            q75 = vol_q[..., 4] if vol_q.size(-1) > 4 else q50
+            return 0.5 * q50 + 0.5 * q75
 
         def _extract_heads(pred):
             """Return (p_vol, p_dir) as 1D tensors [B] on DEVICE.
@@ -1567,10 +1557,12 @@ def _extract_norm_from_dataset(ds: TimeSeriesDataSet):
 
 def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
     """
-    Use the 0.5 quantile (median) to compute a point forecast, matching the
-    PerAssetMetrics callback behaviour. Assumes last dim is quantiles:
-    [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95]
+    Use the 0.5 quantile (median) to compute a point forecast.
+    Enforces monotonic quantiles first to prevent crossing.
     """
+    # Enforce non-decreasing quantiles
+    vol_q = torch.cummax(vol_q, dim=-1).values
+    # Take median (index 3 in VOL_QUANTILES)
     return vol_q[..., 3]
 
 
