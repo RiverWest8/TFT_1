@@ -343,8 +343,8 @@ class AsymmetricQuantileLoss(QuantileLoss):
         tail_weight: float = 0.0,
         qlike_weight: float = 0.08,   # ← was 0.2
         eps: float = 1e-8,
-        med_clip: float = 5.0,
-        log_ratio_clip: float = 20.0,
+        med_clip: float = 3.0,
+        log_ratio_clip: float = 12.0,
         **kwargs,
     ):
         super().__init__(quantiles=quantiles, **kwargs)
@@ -2038,7 +2038,7 @@ if __name__ == "__main__":
 
     VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=VOL_QUANTILES,
-        underestimation_factor=1.25,   # you can keep your scheduler on this
+        underestimation_factor=1.1115,   # you can keep your scheduler on this
         mean_bias_weight=0.0,          # or small value if you want median centering
         tail_q=0.85,
         tail_weight=1.0,               # set >0 if you want extra tail emphasis
