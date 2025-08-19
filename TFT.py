@@ -266,7 +266,7 @@ if not hasattr(GroupNormalizer, "decode"):
 from pytorch_forecasting.metrics import QuantileLoss, MultiLoss
 
 class LabelSmoothedBCE(nn.Module):
-    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.001):
+    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.0):
         super().__init__()
         self.smoothing = smoothing
         self.register_buffer("pos_weight", torch.tensor(pos_weight))
@@ -337,7 +337,7 @@ class AsymmetricQuantileLoss(QuantileLoss):
     def __init__(
         self,
         quantiles,
-        underestimation_factor: float = 1.1115,
+        underestimation_factor: float = 1.0, #1.1115
         mean_bias_weight: float = 0.0,
         tail_q: float = 0.90,         # ← was 0.85
         tail_weight: float = 0.0,
