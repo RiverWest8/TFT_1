@@ -1926,7 +1926,7 @@ if __name__ == "__main__":
                 GroupNormalizer(
                     groups=GROUP_ID,
                     center=False,
-                    scale_by_group= True,
+                    scale_by_group= False, #True
                     transformation="log1p",
                 ),
                 TorchNormalizer(method="identity", center=False),   # direction
@@ -2038,7 +2038,7 @@ if __name__ == "__main__":
 
     VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=VOL_QUANTILES,
-        underestimation_factor=1.1115,   # you can keep your scheduler on this
+        underestimation_factor=1.0, #1.1115   # you can keep your scheduler on this
         mean_bias_weight=0.0,          # or small value if you want median centering
         tail_q=0.85,
         tail_weight=1.0,               # set >0 if you want extra tail emphasis
