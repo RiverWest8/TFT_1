@@ -3,20 +3,8 @@
 """
 Temporal Fusion Transformer (TFT) pipeline
 ==========================================
-python3 TFT.py \
-  --max_epochs 8 \
-  --batch_size 256 \
-  --max_encoder_length 96 \
-  --check_val_every_n_epoch 1 \
-  --log_every_n_steps 50 \
-  --num_workers 4 \
-  --prefetch_factor 2 \
-  --enable_perm_importance false \
-  --perm_len 288 \
-  --fi_max_batches 15 \
-  --resume false \
-  --gcs_data_prefix gs://river-ml-bucket/Data/CleanedData \
-  --gcs_output_prefix gs://river-ml-bucket/Dissertation/Feature_Ablation/f_$(date -u +%s)
+python3 TFT.py   --max_epochs 10   --batch_size 256   --max_encoder_length 64   --check_val_every_n_epoch 1   --log_every_n_steps 50   --num_workers 12   --prefetch_factor 2   --enable_perm_importance false   --perm_len 288   --fi_max_batches 15   --resume false   --gcs_data_prefix gs://river-ml-bucket/Data/CleanedData   --gcs_output_prefix gs://river-ml-bucket/Dissertation/Feature_Ablation/f_$(date -u +%s)
+
 
 This script trains a single TFT model that jointly predicts:
   • realised volatility (quantile regression on an asinh‑transformed target)
@@ -703,6 +691,23 @@ class PerAssetMetrics(pl.Callback):
             brier = ((pt_b - yd_cpu.float()) ** 2).mean().item()
             trainer.callback_metrics["val_brier_overall"] = torch.tensor(float(brier))
 
+        auroc = None
+        if yd_cpu is not None and pd_cpu is not None and yd_cpu.numel() > 0 and pd_cpu.numel() > 0:
+            probs = pd_cpu
+            try:
+                if torch.isfinite(probs).any() and (probs.min() < 0 or probs.max() > 1):
+                    probs = torch.sigmoid(probs)  # logits → probs
+            except Exception:
+                probs = torch.sigmoid(probs)
+            probs = torch.clamp(probs, 0.0, 1.0)
+
+            try:
+                au = BinaryAUROC()
+                auroc = float(au(probs.detach().cpu(), yd_cpu.detach().cpu()).item())
+                trainer.callback_metrics["val_auroc_overall"] = torch.tensor(float(auroc))
+            except Exception as e:
+                print(f"[WARN] AUROC failed: {e}")
+
         # --- Epoch summary ---
         N = int(y_cpu.numel())
         try:
@@ -721,6 +726,7 @@ class PerAssetMetrics(pl.Callback):
             f"QLIKE={overall_qlike:.6f} "
             + (f"| ACC={acc:.3f} " if acc is not None else "")
             + (f"| Brier={brier:.4f} " if brier is not None else "")
+            + (f"| AUROC={auroc:.3f} " if auroc is not None else "")
             + f"| N={N} | VAL_LOSS={val_loss_value:.6f}"
         )
         print(msg)
@@ -734,6 +740,8 @@ class PerAssetMetrics(pl.Callback):
         trainer.callback_metrics["val_loss_decoded"]  = torch.tensor(float(val_loss_value))
         if acc is not None:
             trainer.callback_metrics["val_acc_overall"] = torch.tensor(float(acc))
+        if auroc is not None:  # 👈 ADD HERE
+            trainer.callback_metrics["val_auroc_overall"] = torch.tensor(float(auroc))
         trainer.callback_metrics["val_N_overall"]     = torch.tensor(float(N))
 
         self._last_overall = {
@@ -2007,9 +2015,9 @@ if __name__ == "__main__":
     print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.0017978}")
     
     es_cb = EarlyStopping(
-    monitor="val_qlike_overall",
+    monitor="val_auroc_overall",
     patience=EARLY_STOP_PATIENCE,
-    mode="min"
+    mode="max"
     )
 
     bar_cb = TQDMProgressBar()
@@ -2075,8 +2083,8 @@ if __name__ == "__main__":
     lr_cb = LearningRateMonitor(logging_interval="step")
 
     best_ckpt_cb = ModelCheckpoint(
-        monitor="val_qlike_overall",
-        mode="min",
+        monitor="val_auroc_overall",
+        mode="max",
         save_top_k=1,
         save_last=True,
         filename=f"tft_best_e{MAX_EPOCHS}_{RUN_SUFFIX}",
@@ -2087,7 +2095,7 @@ if __name__ == "__main__":
 
    
     
-    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=15) 
+    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=5) 
 
     # ----------------------------
     # Trainer instance
@@ -2204,3 +2212,29 @@ if __name__ == "__main__":
                 if key in x and x[key] is not None:
                     x[key] = _to_numpy_int64_array(x[key])
         return x
+    
+# After trainer.fit()
+print("✓ Training finished — reloading best checkpoint for test inference")
+best_model_path = checkpoint_callback.best_model_path
+best_model = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
+
+# Run test loop
+test_results = trainer.test(best_model, dataloaders=test_dataloader, verbose=True)
+
+# Save test predictions once
+test_preds = best_model.predict(test_dataloader, mode="prediction", return_x=True)
+# decode as needed, then save
+df_test_preds = pd.DataFrame({
+    "asset": test_x["asset"].tolist(),
+    "time_idx": test_x["time_idx"].tolist(),
+    "y_vol_true": test_y[:, 0].tolist(),
+    "y_vol_pred": test_preds[:, 0].tolist(),
+    "y_dir_true": test_y[:, 1].tolist(),
+    "y_dir_prob": torch.sigmoid(test_preds[:, 1]).tolist(),
+})
+path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_{RUN_SUFFIX}.parquet"
+df_test_preds.to_parquet(path, index=False)
+print(f"✓ Saved test predictions → {path}")
+
+best_model = TemporalFusionTransformer.load_from_checkpoint(checkpoint_callback.best_model_path)
+test_results = trainer.test(best_model, dataloaders=test_dataloader)
