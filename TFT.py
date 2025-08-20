@@ -1997,6 +1997,21 @@ if __name__ == "__main__":
         prefetch_factor=prefetch,
         pin_memory=pin,
     )
+    # --- Test dataset ---
+    test_dataset = TimeSeriesDataSet.from_dataset(
+        training_dataset,
+        test_df,
+        stop_randomization=True,
+    )
+
+    test_dataloader = test_dataset.to_dataloader(
+        train=False,
+        batch_size=ARGS.batch_size,
+        num_workers=ARGS.num_workers,
+        prefetch_factor=ARGS.prefetch_factor,
+        persistent_workers=True if ARGS.num_workers > 0 else False,
+        pin_memory=torch.cuda.is_available(),
+    )
 
     # ---- derive id→asset-name mapping for callbacks ----
     asset_vocab = (
