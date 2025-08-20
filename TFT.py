@@ -3,6 +3,20 @@
 """
 Temporal Fusion Transformer (TFT) pipeline
 ==========================================
+python3 TFT.py \
+  --max_epochs 8 \
+  --batch_size 256 \
+  --max_encoder_length 96 \
+  --check_val_every_n_epoch 1 \
+  --log_every_n_steps 50 \
+  --num_workers 4 \
+  --prefetch_factor 2 \
+  --enable_perm_importance false \
+  --perm_len 288 \
+  --fi_max_batches 15 \
+  --resume false \
+  --gcs_data_prefix gs://river-ml-bucket/Data/CleanedData \
+  --gcs_output_prefix gs://river-ml-bucket/Dissertation/Feature_Ablation/f_$(date -u +%s)
 
 This script trains a single TFT model that jointly predicts:
   • realised volatility (quantile regression on an asinh‑transformed target)
@@ -322,14 +336,14 @@ class AsymmetricQuantileLoss(QuantileLoss):
       • asymmetric underestimation penalty on all quantiles
       • optional mean-bias regulariser on the median (q=0.5)
       • optional tail emphasis (up-weights samples above a quantile threshold)
-      • numerically-stable QLIKE term on a scale-free decoded space via sinh()
+      • numerically-stable QLIKE term on a scale-free decoded space via log1p()
 
     Notes
     -----
-    - Use with GroupNormalizer(transformation="asinh", center=False, scale_by_group=True)
+    - Use with GroupNormalizer(transformation="log1p", center=False, scale_by_group=True)
       so that the y/ŷ ratio is scale-free across assets.
     - QLIKE is stabilized by:
-        * clipping encoded values before sinh (med_clip)
+        * clipping encoded values before log1p (med_clip)
         * working in log-variance space with clamped log-ratio (log_ratio_clip)
         * epsilon floors
     """
@@ -341,7 +355,7 @@ class AsymmetricQuantileLoss(QuantileLoss):
         mean_bias_weight: float = 0.0,
         tail_q: float = 0.90,         # ← was 0.85
         tail_weight: float = 0.0,
-        qlike_weight: float = 0.08,   # ← was 0.2
+        qlike_weight: float = 0.0,   # set to 0.0 because we cannot safely decode inside the loss
         eps: float = 1e-8,
         med_clip: float = 3.0,
         log_ratio_clip: float = 12.0,
@@ -403,32 +417,10 @@ class AsymmetricQuantileLoss(QuantileLoss):
             except Exception:
                 pass
 
-        # ---- QLIKE on scale-free decoded values (sinh), numerically safe ----
-        if self.qlike_weight:
-            try:
-                if isinstance(target, tuple):
-                    target = target[0]
-                med = y_pred[..., self._q50_idx]
-
-                t_enc = torch.clamp(target, -self.med_clip, self.med_clip)
-                m_enc = torch.clamp(med,    -self.med_clip, self.med_clip)
-
-                y_dec = torch.expm1(t_enc)
-                p_dec = torch.expm1(m_enc)
-
-                sigma2_y = (y_dec.abs().clamp_min(self.eps)) ** 2
-                sigma2_p = (p_dec.abs().clamp_min(self.eps)) ** 2
-
-                z = (sigma2_y + self.eps).log() - (sigma2_p + self.eps).log()
-                z = torch.clamp(z, -self.log_ratio_clip, self.log_ratio_clip)
-
-                ql = torch.exp(z) - z - 1.0
-                ql = torch.where(torch.isfinite(ql), ql, torch.zeros_like(ql))
-                qlike = ql.mean()
-
-                base = base + self.qlike_weight * qlike
-            except Exception:
-                pass
+        # ---- QLIKE disabled inside training loss ----
+        # We cannot safely decode here because GroupNormalizer scaling/centering
+        # is not available inside the loss (no access to group_ids).
+        # Decoded QLIKE is computed in the validation callback instead.
 
         return torch.nan_to_num(base, nan=0.0, posinf=1e4, neginf=1e4)
 
@@ -532,12 +524,9 @@ class PerAssetMetrics(pl.Callback):
             pred = pred["prediction"]
 
         def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
-            # Enforce non-decreasing quantiles along the last dim
+            # Enforce non-decreasing quantiles along the last dim and take pure median (q=0.5)
             vol_q = torch.cummax(vol_q, dim=-1).values
-            # Use median (index 3) or your blend
-            q50 = vol_q[..., 3]
-            q75 = vol_q[..., 4] if vol_q.size(-1) > 4 else q50
-            return 0.5 * q50 + 0.5 * q75
+            return vol_q[..., 3]
 
         def _extract_heads(pred):
             """Return (p_vol, p_dir) as 1D tensors [B] on DEVICE.
@@ -726,7 +715,7 @@ class PerAssetMetrics(pl.Callback):
 
         msg = (
             f"[VAL EPOCH {epoch_num}] "
-            f"MAE={overall_mae:.6f} "
+            f"(decoded) MAE={overall_mae:.6f} "
             f"RMSE={overall_rmse:.6f} "
             f"MSE={overall_mse:.6f} "
             f"QLIKE={overall_qlike:.6f} "
@@ -1926,7 +1915,7 @@ if __name__ == "__main__":
                 GroupNormalizer(
                     groups=GROUP_ID,
                     center=False,
-                    scale_by_group= False, #True
+                    scale_by_group= True, #True
                     transformation="log1p",
                 ),
                 TorchNormalizer(method="identity", center=False),   # direction
