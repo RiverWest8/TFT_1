@@ -52,6 +52,7 @@ import pandas as _pd
 pd = _pd  # Ensure pd always refers to pandas module
 import lightning.pytorch as pl
 from lightning.pytorch import Trainer, seed_everything
+from torchmetrics.classification import BinaryAUROC
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -2015,7 +2016,7 @@ if __name__ == "__main__":
     print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.0017978}")
     
     es_cb = EarlyStopping(
-    monitor="val_auroc_overall",
+    monitor="val_qlike_overall",
     patience=EARLY_STOP_PATIENCE,
     mode="max"
     )
