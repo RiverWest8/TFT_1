@@ -2001,16 +2001,18 @@ if __name__ == "__main__":
     test_dataset = TimeSeriesDataSet.from_dataset(
         training_dataset,
         test_df,
+        predict=False,
         stop_randomization=True,
     )
 
+    # use the same loader knobs as train/val to avoid None / tensor-bool pitfalls
     test_dataloader = test_dataset.to_dataloader(
         train=False,
-        batch_size=ARGS.batch_size,
-        num_workers=ARGS.num_workers,
-        prefetch_factor=ARGS.prefetch_factor,
-        persistent_workers=True if ARGS.num_workers > 0 else False,
-        pin_memory=torch.cuda.is_available(),
+        batch_size=batch_size,
+        num_workers=worker_cnt,
+        prefetch_factor=prefetch,
+        persistent_workers=use_persist,
+        pin_memory=pin,
     )
 
     # ---- derive id→asset-name mapping for callbacks ----
@@ -2270,21 +2272,28 @@ if str(best_model_path).startswith("gs://"):
 best_model = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
 best_model.eval()
 
-# --- Run TEST loop with the best checkpoint ---
+# --- Run TEST loop with the best checkpoint & print decoded metrics ---
 try:
     test_results = trainer.test(best_model, dataloaders=test_dataloader, verbose=True)
-    print(f"Test results: {test_results}")
+    print(f"Test results (trainer.test): {test_results}")
 except Exception as e:
     print(f"[WARN] Test evaluation failed: {e}")
 
-# --- Generate & save TEST predictions ONCE (decoded + calibrated) ---
-from torch.utils.data import DataLoader
-import torch
-
+# Helpers
 def _median_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
-    # enforce monotonicity to avoid crossing, then take median (index 3)
     vol_q = torch.cummax(vol_q, dim=-1).values
     return vol_q[..., 3]
+
+def _safe_prob(t: torch.Tensor) -> torch.Tensor:
+    # convert logits or probs to [0,1] probability tensor without boolean context
+    if not torch.is_tensor(t):
+        return t
+    try:
+        if torch.isfinite(t).any() and (torch.min(t) < 0 or torch.max(t) > 1):
+            t = torch.sigmoid(t)
+    except Exception:
+        t = torch.sigmoid(t)
+    return torch.clamp(t, 0.0, 1.0)
 
 @torch.no_grad()
 def _collect_test_predictions(model, dl, id_to_name, vol_norm):
@@ -2300,26 +2309,30 @@ def _collect_test_predictions(model, dl, id_to_name, vol_norm):
         if not isinstance(x, dict):
             continue
 
-        # --- groups and time index ---
+        # groups / time_idx
         g = x.get("groups") or x.get("group_ids")
-        if isinstance(g, (list, tuple)): g = g[0] if g else None
-        if torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1: g = g.squeeze(-1)
-        if not torch.is_tensor(g): continue
+        if isinstance(g, (list, tuple)):
+            g = g[0] if g else None
+        if torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
+            g = g.squeeze(-1)
+        if not torch.is_tensor(g):
+            continue
 
         t_idx = x.get("decoder_time_idx") or x.get("time_idx")
         if torch.is_tensor(t_idx) and t_idx.ndim > 1 and t_idx.size(-1) == 1:
             t_idx = t_idx.squeeze(-1)
 
-        # --- true targets (encoded) ---
-        yv = None; yd = None
+        # true targets (encoded)
+        yv, yd = None, None
         if torch.is_tensor(y):
             t = y
-            if t.ndim == 3 and t.size(1) == 1: t = t[:, 0, :]   # [B,2]
+            if t.ndim == 3 and t.size(1) == 1:
+                t = t[:, 0, :]
             if t.ndim == 2 and t.size(1) >= 1:
                 yv = t[:, 0]
                 yd = (t[:, 1] if t.size(1) > 1 else None)
 
-        # --- forward ---
+        # forward
         x_dev = {k: (v.to(model_device, non_blocking=True) if torch.is_tensor(v)
                      else [vv.to(model_device, non_blocking=True) if torch.is_tensor(vv) else vv for vv in v]
                      if isinstance(v, (list, tuple)) else v)
@@ -2335,67 +2348,113 @@ def _collect_test_predictions(model, dl, id_to_name, vol_norm):
             d_log = pred[1] if len(pred) > 1 else None
         else:
             t = pred
-            if t.ndim >= 4 and t.size(1) == 1: t = t.squeeze(1)
-            if t.ndim == 3 and t.size(1) == 1: t = t[:, 0, :]
+            if t.ndim >= 4 and t.size(1) == 1:
+                t = t.squeeze(1)
+            if t.ndim == 3 and t.size(1) == 1:
+                t = t[:, 0, :]
             vol_q, d_log = t[:, : t.size(-1)-1], t[:, -1]
         p_vol = _median_from_quantiles(vol_q) if torch.is_tensor(vol_q) else vol_q
 
-        # --- decode to physical scale and calibrate ---
-        y_dec = safe_decode_vol(yv.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1) if yv is not None else None
+        # decode to physical scale and calibrate
+        y_dec = None
+        if torch.is_tensor(yv):
+            y_dec = safe_decode_vol(yv.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
         p_dec = safe_decode_vol(p_vol.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
         p_dec = torch.clamp(p_dec, min=1e-8)
-        p_dec = calibrate_vol_predictions(y_dec, p_dec) if y_dec is not None else p_dec
+        if y_dec is not None:
+            p_dec = calibrate_vol_predictions(y_dec, p_dec)
 
-        # --- direction prob ---
+        # direction prob
         p_dir_prob = None
         if torch.is_tensor(d_log):
-            p_dir_prob = torch.sigmoid(d_log.detach())
+            p_dir_prob = _safe_prob(d_log.detach())
 
-        # --- append ---
-        gn = g.detach().cpu().long().tolist()
-        assets_all.extend([id_to_name.get(int(i), str(int(i))) for i in gn])
+        # append
+        gn_list = g.detach().cpu().long().tolist()
+        assets_all.extend([id_to_name.get(int(i), str(int(i))) for i in gn_list])
+
         if torch.is_tensor(t_idx):
             t_idx_all.extend(t_idx.detach().cpu().long().tolist())
         else:
-            t_idx_all.extend([None] * len(gn))
+            t_idx_all.extend([None] * len(gn_list))
 
         if y_dec is not None:
             yv_all.append(y_dec.detach().cpu())
         pv_all.append(p_dec.detach().cpu())
 
-        if yd is not None:
+        if torch.is_tensor(yd):
             yd_all.append(yd.detach().cpu())
         if p_dir_prob is not None:
             pdprob_all.append(p_dir_prob.detach().cpu())
 
-    yv_cpu = torch.cat(yv_all).numpy().tolist() if yv_all else [None] * len(assets_all)
-    pv_cpu = torch.cat(pv_all).numpy().tolist() if pv_all else []
-    yd_cpu = torch.cat(yd_all).numpy().tolist() if yd_all else [None] * len(assets_all)
-    pd_cpu = torch.cat(pdprob_all).numpy().tolist() if pdprob_all else [None] * len(assets_all)
+    # stack
+    yv_list = torch.cat(yv_all).numpy().tolist() if len(yv_all) > 0 else [None] * len(assets_all)
+    pv_list = torch.cat(pv_all).numpy().tolist() if len(pv_all) > 0 else []
+    yd_list = torch.cat(yd_all).numpy().tolist() if len(yd_all) > 0 else [None] * len(assets_all)
+    pd_list = torch.cat(pdprob_all).numpy().tolist() if len(pdprob_all) > 0 else [None] * len(assets_all)
 
-    # align lengths
-    L = min(len(assets_all), len(t_idx_all), len(pv_cpu), len(yv_cpu), len(yd_cpu), len(pd_cpu))
+    L = min(len(assets_all), len(t_idx_all), len(pv_list), len(yv_list), len(yd_list), len(pd_list))
     return pd.DataFrame({
-        "asset":   assets_all[:L],
-        "time_idx": t_idx_all[:L],
-        "realised_vol": yv_cpu[:L],
-        "pred_realised_vol": pv_cpu[:L],
-        "direction": yd_cpu[:L],
-        "pred_direction": pd_cpu[:L],
+        "asset":             assets_all[:L],
+        "time_idx":          t_idx_all[:L],
+        "realised_vol":      yv_list[:L],
+        "pred_realised_vol": pv_list[:L],
+        "direction":         yd_list[:L],
+        "pred_direction":    pd_list[:L],
     })
 
-# Build dataframe of predictions
+# Build dataframe of predictions and compute TEST metrics on decoded scale
 try:
     df_test_preds = _collect_test_predictions(
         best_model, test_dataloader, id_to_name=metrics_cb.id_to_name, vol_norm=metrics_cb.vol_norm
     )
+
+    # Print decoded test metrics
+    _y = torch.tensor([v for v in df_test_preds["realised_vol"].tolist() if v is not None], dtype=torch.float32)
+    _p = torch.tensor(df_test_preds["pred_realised_vol"].tolist(), dtype=torch.float32)[: _y.numel()]
+    eps = 1e-8
+    mae  = torch.mean(torch.abs(_p - _y)).item()
+    mse  = torch.mean((_p - _y) ** 2).item()
+    rmse = (mse ** 0.5)
+    sigma2_p = torch.clamp(torch.abs(_p), min=eps) ** 2
+    sigma2_y = torch.clamp(torch.abs(_y), min=eps) ** 2
+    ratio = sigma2_y / sigma2_p
+    qlike = torch.mean(ratio - torch.log(ratio) - 1.0).item()
+
+    # Direction metrics if available
+    auroc_val, brier_val, acc_val = None, None, None
+    if "direction" in df_test_preds.columns and "pred_direction" in df_test_preds.columns:
+        yd = df_test_preds["direction"].tolist()
+        pd = df_test_preds["pred_direction"].tolist()
+        # filter out None rows
+        pairs = [(a, b) for a, b in zip(yd, pd) if a is not None and b is not None]
+        if len(pairs) > 0:
+            yd_t = torch.tensor([a for a, _ in pairs], dtype=torch.float32)
+            pd_t = torch.tensor([b for _, b in pairs], dtype=torch.float32)
+            pd_t = _safe_prob(pd_t)
+            acc_val   = float(((pd_t >= 0.5).int() == yd_t.int()).float().mean().item())
+            brier_val = float(torch.mean((pd_t - yd_t) ** 2).item())
+            try:
+                from torchmetrics.classification import BinaryAUROC
+                auroc_val = float(BinaryAUROC()(pd_t, yd_t).item())
+            except Exception as e:
+                print(f"[WARN] AUROC (test) failed: {e}")
+
+    print(
+        f"[TEST] (decoded) MAE={mae:.6f} RMSE={rmse:.6f} MSE={mse:.6f} QLIKE={qlike:.6f}"
+        + (f" | ACC={acc_val:.3f}" if acc_val is not None else "")
+        + (f" | Brier={brier_val:.4f}" if brier_val is not None else "")
+        + (f" | AUROC={auroc_val:.3f}" if auroc_val is not None else "")
+    )
+
+    # Save parquet & upload
     pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
     df_test_preds.to_parquet(pred_path, index=False)
     print(f"✓ Saved TEST predictions → {pred_path}")
-    # optional upload to GCS alongside other artifacts
     try:
         upload_file_to_gcs(str(pred_path), f"{GCS_OUTPUT_PREFIX}/{pred_path.name}")
     except Exception as e:
         print(f"[WARN] Could not upload test predictions: {e}")
+
 except Exception as e:
     print(f"[WARN] Failed to save test predictions: {e}")
