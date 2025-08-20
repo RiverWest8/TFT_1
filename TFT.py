@@ -2223,26 +2223,164 @@ if __name__ == "__main__":
     
 # After trainer.fit()
 print("✓ Training finished — reloading best checkpoint for test inference")
-best_model_path = checkpoint_callback.best_model_path
+
+from lightning.pytorch.callbacks import ModelCheckpoint
+from pathlib import Path
+import fsspec
+import pandas as pd
+
+# --- Resolve best checkpoint path from any ModelCheckpoint callback ---
+best_model_path = None
+for cb in trainer.callbacks:
+    if isinstance(cb, ModelCheckpoint):
+        if getattr(cb, "best_model_path", None):
+            best_model_path = cb.best_model_path
+            break
+
+if not best_model_path or not str(best_model_path).endswith(".ckpt"):
+    raise RuntimeError(f"[FATAL] Could not resolve best checkpoint (.ckpt). Got: {best_model_path}")
+
+print(f"Best checkpoint (local or remote): {best_model_path}")
+
+# --- If checkpoint is on GCS, download it locally ---
+if str(best_model_path).startswith("gs://"):
+    fs, _, paths = fsspec.get_fs_token_paths(best_model_path)
+    local_ckpt = Path("/tmp") / Path(paths[0]).name
+    with fs.open(paths[0], "rb") as src, open(local_ckpt, "wb") as dst:
+        dst.write(src.read())
+    best_model_path = str(local_ckpt)
+    print(f"Downloaded checkpoint to: {best_model_path}")
+
+# --- Load model from checkpoint ---
 best_model = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
+best_model.eval()
 
-# Run test loop
-test_results = trainer.test(best_model, dataloaders=test_dataloader, verbose=True)
+# --- Run TEST loop with the best checkpoint ---
+try:
+    test_results = trainer.test(best_model, dataloaders=test_dataloader, verbose=True)
+    print(f"Test results: {test_results}")
+except Exception as e:
+    print(f"[WARN] Test evaluation failed: {e}")
 
-# Save test predictions once
-test_preds = best_model.predict(test_dataloader, mode="prediction", return_x=True)
-# decode as needed, then save
-df_test_preds = pd.DataFrame({
-    "asset": test_x["asset"].tolist(),
-    "time_idx": test_x["time_idx"].tolist(),
-    "y_vol_true": test_y[:, 0].tolist(),
-    "y_vol_pred": test_preds[:, 0].tolist(),
-    "y_dir_true": test_y[:, 1].tolist(),
-    "y_dir_prob": torch.sigmoid(test_preds[:, 1]).tolist(),
-})
-path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_{RUN_SUFFIX}.parquet"
-df_test_preds.to_parquet(path, index=False)
-print(f"✓ Saved test predictions → {path}")
+# --- Generate & save TEST predictions ONCE (decoded + calibrated) ---
+from torch.utils.data import DataLoader
+import torch
 
-best_model = TemporalFusionTransformer.load_from_checkpoint(checkpoint_callback.best_model_path)
-test_results = trainer.test(best_model, dataloaders=test_dataloader)
+def _median_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
+    # enforce monotonicity to avoid crossing, then take median (index 3)
+    vol_q = torch.cummax(vol_q, dim=-1).values
+    return vol_q[..., 3]
+
+@torch.no_grad()
+def _collect_test_predictions(model, dl, id_to_name, vol_norm):
+    model_device = next(model.parameters()).device
+    assets_all, t_idx_all = [], []
+    yv_all, pv_all = [], []
+    yd_all, pdprob_all = [], []
+
+    for batch in dl:
+        if not isinstance(batch, (list, tuple)) or len(batch) < 2:
+            continue
+        x, y = batch[0], batch[1]
+        if not isinstance(x, dict):
+            continue
+
+        # --- groups and time index ---
+        g = x.get("groups") or x.get("group_ids")
+        if isinstance(g, (list, tuple)): g = g[0] if g else None
+        if torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1: g = g.squeeze(-1)
+        if not torch.is_tensor(g): continue
+
+        t_idx = x.get("decoder_time_idx") or x.get("time_idx")
+        if torch.is_tensor(t_idx) and t_idx.ndim > 1 and t_idx.size(-1) == 1:
+            t_idx = t_idx.squeeze(-1)
+
+        # --- true targets (encoded) ---
+        yv = None; yd = None
+        if torch.is_tensor(y):
+            t = y
+            if t.ndim == 3 and t.size(1) == 1: t = t[:, 0, :]   # [B,2]
+            if t.ndim == 2 and t.size(1) >= 1:
+                yv = t[:, 0]
+                yd = (t[:, 1] if t.size(1) > 1 else None)
+
+        # --- forward ---
+        x_dev = {k: (v.to(model_device, non_blocking=True) if torch.is_tensor(v)
+                     else [vv.to(model_device, non_blocking=True) if torch.is_tensor(vv) else vv for vv in v]
+                     if isinstance(v, (list, tuple)) else v)
+                 for k, v in x.items()}
+        out = model(x_dev)
+        pred = getattr(out, "prediction", out)
+        if isinstance(pred, dict) and "prediction" in pred:
+            pred = pred["prediction"]
+
+        # split heads
+        if isinstance(pred, (list, tuple)):
+            vol_q = pred[0]
+            d_log = pred[1] if len(pred) > 1 else None
+        else:
+            t = pred
+            if t.ndim >= 4 and t.size(1) == 1: t = t.squeeze(1)
+            if t.ndim == 3 and t.size(1) == 1: t = t[:, 0, :]
+            vol_q, d_log = t[:, : t.size(-1)-1], t[:, -1]
+        p_vol = _median_from_quantiles(vol_q) if torch.is_tensor(vol_q) else vol_q
+
+        # --- decode to physical scale and calibrate ---
+        y_dec = safe_decode_vol(yv.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1) if yv is not None else None
+        p_dec = safe_decode_vol(p_vol.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+        p_dec = torch.clamp(p_dec, min=1e-8)
+        p_dec = calibrate_vol_predictions(y_dec, p_dec) if y_dec is not None else p_dec
+
+        # --- direction prob ---
+        p_dir_prob = None
+        if torch.is_tensor(d_log):
+            p_dir_prob = torch.sigmoid(d_log.detach())
+
+        # --- append ---
+        gn = g.detach().cpu().long().tolist()
+        assets_all.extend([id_to_name.get(int(i), str(int(i))) for i in gn])
+        if torch.is_tensor(t_idx):
+            t_idx_all.extend(t_idx.detach().cpu().long().tolist())
+        else:
+            t_idx_all.extend([None] * len(gn))
+
+        if y_dec is not None:
+            yv_all.append(y_dec.detach().cpu())
+        pv_all.append(p_dec.detach().cpu())
+
+        if yd is not None:
+            yd_all.append(yd.detach().cpu())
+        if p_dir_prob is not None:
+            pdprob_all.append(p_dir_prob.detach().cpu())
+
+    yv_cpu = torch.cat(yv_all).numpy().tolist() if yv_all else [None] * len(assets_all)
+    pv_cpu = torch.cat(pv_all).numpy().tolist() if pv_all else []
+    yd_cpu = torch.cat(yd_all).numpy().tolist() if yd_all else [None] * len(assets_all)
+    pd_cpu = torch.cat(pdprob_all).numpy().tolist() if pdprob_all else [None] * len(assets_all)
+
+    # align lengths
+    L = min(len(assets_all), len(t_idx_all), len(pv_cpu), len(yv_cpu), len(yd_cpu), len(pd_cpu))
+    return pd.DataFrame({
+        "asset":   assets_all[:L],
+        "time_idx": t_idx_all[:L],
+        "realised_vol": yv_cpu[:L],
+        "pred_realised_vol": pv_cpu[:L],
+        "direction": yd_cpu[:L],
+        "pred_direction": pd_cpu[:L],
+    })
+
+# Build dataframe of predictions
+try:
+    df_test_preds = _collect_test_predictions(
+        best_model, test_dataloader, id_to_name=metrics_cb.id_to_name, vol_norm=metrics_cb.vol_norm
+    )
+    pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+    df_test_preds.to_parquet(pred_path, index=False)
+    print(f"✓ Saved TEST predictions → {pred_path}")
+    # optional upload to GCS alongside other artifacts
+    try:
+        upload_file_to_gcs(str(pred_path), f"{GCS_OUTPUT_PREFIX}/{pred_path.name}")
+    except Exception as e:
+        print(f"[WARN] Could not upload test predictions: {e}")
+except Exception as e:
+    print(f"[WARN] Failed to save test predictions: {e}")
