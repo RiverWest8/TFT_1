@@ -2101,6 +2101,13 @@ if __name__ == "__main__":
     # ----------------------------
     # Trainer instance
     # ----------------------------
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=str(LOCAL_OUTPUT_DIR),
+        filename="tft-{epoch:02d}-{val_loss:.4f}",
+        monitor="val_loss",      # or val_qlike_overall if you want
+        save_top_k=1,            # keep best only
+        mode="min",              # because lower val_loss is better
+    )
     trainer = Trainer(
         accelerator=ACCELERATOR,
         devices=DEVICES,
