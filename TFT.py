@@ -2228,7 +2228,8 @@ if __name__ == "__main__":
     es_cb = EarlyStopping(
     monitor="val_qlike_overall",
     patience=EARLY_STOP_PATIENCE,
-    mode="max"
+    mode="min",
+    min_delta = 1e-4
     )
 
     bar_cb = TQDMProgressBar()
@@ -2265,7 +2266,7 @@ if __name__ == "__main__":
 
 
     FIXED_VOL_WEIGHT = 1.0
-    FIXED_DIR_WEIGHT = 0.15g
+    FIXED_DIR_WEIGHT = 0.15
  
 
     tft = TemporalFusionTransformer.from_dataset(
