@@ -1915,7 +1915,7 @@ def run_permutation_importance(
     """
     ds_base = TimeSeriesDataSet.from_dataset(template_ds, base_df, predict=False, stop_randomization=True)
     train_vol_norm = _extract_norm_from_dataset(template_ds)
-    max_batches = 24
+    max_batches = 1
     try:
         print(f"[FI] Dataset size (samples): {len(ds_base)} | batch_size={batch_size}")
     except Exception:
