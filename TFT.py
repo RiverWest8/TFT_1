@@ -660,7 +660,6 @@ class PerAssetMetrics(pl.Callback):
         )
 
         # --- Regime-dependent calibration (stretches tails) ---
-        pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
 
         # Move to CPU for metric computation
         y_cpu  = yv_dec.detach().cpu()
@@ -1550,12 +1549,10 @@ def assert_and_fix_splits(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df:
     Returns possibly corrected (train_df, val_df, test_df).
     """
     # Sort each split per asset/time
-    train_df = load_split(READ_PATHS[0])
-    val_df   = load_split(READ_PATHS[1])
-    test_df  = load_split(READ_PATHS[2])
+    train_df = train_df.sort_values(["asset", "Time"]).copy()
+    val_df   = val_df.sort_values(["asset", "Time"]).copy()
+    test_df  = test_df.sort_values(["asset", "Time"]).copy()
 
-    # Enforce chronological order and non-overlap across splits; re-split if necessary
-    train_df, val_df, test_df = assert_and_fix_splits(train_df, val_df, test_df)
     def _bounds(df):
         if df.empty:
             return pd.DataFrame(columns=["asset","min","max"]).set_index("asset")
@@ -1592,7 +1589,6 @@ def assert_and_fix_splits(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df:
         train_df, val_df, test_df = _chronological_resplit(union, train_frac=0.8, val_frac=0.1)
     else:
         print("[SPLIT] Splits look chronological and non-overlapping.")
-
     return train_df, val_df, test_df
 
 # -----------------------------------------------------------------------
@@ -2461,19 +2457,6 @@ if not best_model_path or not str(best_model_path).endswith(".ckpt"):
 
 print(f"Best checkpoint (local or remote): {best_model_path}")
 
-# --- If checkpoint is on GCS, download it locally ---
-if str(best_model_path).startswith("gs://"):
-    fs, _, paths = fsspec.get_fs_token_paths(best_model_path)
-    local_ckpt = Path("/tmp") / Path(paths[0]).name
-    with fs.open(paths[0], "rb") as src, open(local_ckpt, "wb") as dst:
-        dst.write(src.read())
-    best_model_path = str(local_ckpt)
-    print(f"Downloaded checkpoint to: {best_model_path}")
-
-# --- Load model from checkpoint ---
-best_model = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
-best_model.eval()
-
 # --- Run TEST loop with the best checkpoint & print decoded metrics ---
 try:
     test_results = trainer.test(best_model, dataloaders=test_dataloader, verbose=True)
@@ -2487,11 +2470,10 @@ def _median_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
     return vol_q[..., 3]
 
 def _safe_prob(t: torch.Tensor) -> torch.Tensor:
-    # convert logits or probs to [0,1] probability tensor without boolean context
     if not torch.is_tensor(t):
         return t
     try:
-        if torch.isfinite(t).any() and (torch.min(t) < 0 or torch.max(t) > 1):
+        if torch.isfinite(t).any() and (t.min() < 0 or t.max() > 1):
             t = torch.sigmoid(t)
     except Exception:
         t = torch.sigmoid(t)
@@ -2501,8 +2483,7 @@ def _safe_prob(t: torch.Tensor) -> torch.Tensor:
 def _collect_test_predictions(model, dl, id_to_name, vol_norm):
     model_device = next(model.parameters()).device
     assets_all, t_idx_all = [], []
-    yv_all, pv_all = [], []
-    yd_all, pdprob_all = [], []
+    yv_all, pv_all, yd_all, pdprob_all = [], [], [], []
 
     for batch in dl:
         if not isinstance(batch, (list, tuple)) or len(batch) < 2:
@@ -2557,19 +2538,15 @@ def _collect_test_predictions(model, dl, id_to_name, vol_norm):
             vol_q, d_log = t[:, : t.size(-1)-1], t[:, -1]
         p_vol = _median_from_quantiles(vol_q) if torch.is_tensor(vol_q) else vol_q
 
-        # decode to physical scale and calibrate
+        # decode to physical scale
         y_dec = None
         if torch.is_tensor(yv):
             y_dec = safe_decode_vol(yv.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
         p_dec = safe_decode_vol(p_vol.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
         p_dec = torch.clamp(p_dec, min=1e-8)
-        if y_dec is not None:
-            p_dec = calibrate_vol_predictions(y_dec, p_dec)
 
         # direction prob
-        p_dir_prob = None
-        if torch.is_tensor(d_log):
-            p_dir_prob = _safe_prob(d_log.detach())
+        p_dir_prob = _safe_prob(d_log) if torch.is_tensor(d_log) else None
 
         # append
         gn_list = g.detach().cpu().long().tolist()
@@ -2589,11 +2566,11 @@ def _collect_test_predictions(model, dl, id_to_name, vol_norm):
         if p_dir_prob is not None:
             pdprob_all.append(p_dir_prob.detach().cpu())
 
-    # stack
-    yv_list = torch.cat(yv_all).numpy().tolist() if len(yv_all) > 0 else [None] * len(assets_all)
-    pv_list = torch.cat(pv_all).numpy().tolist() if len(pv_all) > 0 else []
-    yd_list = torch.cat(yd_all).numpy().tolist() if len(yd_all) > 0 else [None] * len(assets_all)
-    pd_list = torch.cat(pdprob_all).numpy().tolist() if len(pdprob_all) > 0 else [None] * len(assets_all)
+    # stack safely
+    yv_list = torch.cat(yv_all).numpy().tolist() if yv_all else [None] * len(assets_all)
+    pv_list = torch.cat(pv_all).numpy().tolist() if pv_all else []
+    yd_list = torch.cat(yd_all).numpy().tolist() if yd_all else [None] * len(assets_all)
+    pd_list = torch.cat(pdprob_all).numpy().tolist() if pdprob_all else [None] * len(assets_all)
 
     L = min(len(assets_all), len(t_idx_all), len(pv_list), len(yv_list), len(yd_list), len(pd_list))
     return pd.DataFrame({
@@ -2617,7 +2594,7 @@ try:
     eps = 1e-8
     mae  = torch.mean(torch.abs(_p - _y)).item()
     mse  = torch.mean((_p - _y) ** 2).item()
-    rmse = (mse ** 0.5)
+    rmse = mse ** 0.5
     sigma2_p = torch.clamp(torch.abs(_p), min=eps) ** 2
     sigma2_y = torch.clamp(torch.abs(_y), min=eps) ** 2
     ratio = sigma2_y / sigma2_p
@@ -2626,11 +2603,8 @@ try:
     # Direction metrics if available
     auroc_val, brier_val, acc_val = None, None, None
     if "direction" in df_test_preds.columns and "pred_direction" in df_test_preds.columns:
-        yd = df_test_preds["direction"].tolist()
-        pd = df_test_preds["pred_direction"].tolist()
-        # filter out None rows
-        pairs = [(a, b) for a, b in zip(yd, pd) if a is not None and b is not None]
-        if len(pairs) > 0:
+        pairs = [(a, b) for a, b in zip(df_test_preds["direction"], df_test_preds["pred_direction"]) if a is not None and b is not None]
+        if pairs:
             yd_t = torch.tensor([a for a, _ in pairs], dtype=torch.float32)
             pd_t = torch.tensor([b for _, b in pairs], dtype=torch.float32)
             pd_t = _safe_prob(pd_t)
