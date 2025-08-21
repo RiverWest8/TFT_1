@@ -2213,6 +2213,8 @@ if __name__ == "__main__":
         filename="tft-{epoch:02d}-{val_loss:.4f}",
         monitor="val_loss",      # or val_qlike_overall if you want
         save_top_k=1,            # keep best only
+        save_last = True,
+        auto_insert_metric_name=False,
         mode="min",              # because lower val_loss is better
     )
     trainer = Trainer(
@@ -2248,9 +2250,12 @@ if __name__ == "__main__":
         return fig
 
     tft.plot_prediction = MethodType(_blank_plot, tft)
+    resume_ckpt = get_resume_ckpt_path() if RESUME_ENABLED else None
+    if resume_ckpt:
+        print(f"↩️  Resuming from checkpoint: {resume_ckpt}")
 
     # Train the model
-    trainer.fit(tft, train_dataloader, val_dataloader)
+    trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
 
     # Run FI permutation testing if enabled
     if ENABLE_FEATURE_IMPORTANCE:
