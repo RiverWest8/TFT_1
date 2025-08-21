@@ -1801,7 +1801,8 @@ def run_permutation_importance(
             print(f"[WARN] Could not upload FI CSV: {e}")
     except Exception as e:
         print(f"[WARN] Failed to save FI: {e}")
-
+# 
+# 
 # -----------------------------------------------------------------------
 # Standard Variable Importance (SVI) via TFT.interpret_output
 # -----------------------------------------------------------------------
@@ -1890,7 +1891,7 @@ def save_standard_variable_importance(
             print(f"[WARN] Could not upload SVI CSV: {e}")
     except Exception as e:
         print(f"[SVI] Failed to save CSV: {e}")
-# -----------------------------------------------------------------------
+        
 # Data preparation
 # -----------------------------------------------------------------------
 if __name__ == "__main__":
@@ -1926,45 +1927,624 @@ if __name__ == "__main__":
         # If an asset appears only in val/test, fall back to overall median
         df["rv_scale"].fillna(asset_scale_map.median(), inplace=True)
 
-    # Add calendar <truncated__content/>
+    # Add calendar features to all splits
+    train_df = add_calendar_features(train_df)
+    val_df   = add_calendar_features(val_df)
+    test_df  = add_calendar_features(test_df)
 
-    # ... (training code as before) ...
 
-    # --- Permutation Feature Importance (PFI) ---
+    # Optional quick-run subsetting for speed
+    _mode = getattr(ARGS, "subset_mode", "per_asset_tail")
+    if getattr(ARGS, "train_max_rows", None):
+        before = len(train_df)
+        train_df = subset_time_series(train_df, int(ARGS.train_max_rows), mode=_mode)
+        print(f"[SUBSET] TRAIN: {before} -> {len(train_df)} rows using mode='{_mode}'")
+    if getattr(ARGS, "val_max_rows", None):
+        before = len(val_df)
+        val_df = subset_time_series(val_df, int(ARGS.val_max_rows), mode=_mode)
+        print(f"[SUBSET] VAL:   {before} -> {len(val_df)} rows using mode='{_mode}'")
+
+    # Ensure VAL/TEST only contain assets present in TRAIN and have enough history
+    _val_df_raw = val_df.copy()
+    _test_df_raw = test_df.copy()
+    min_required = int(MAX_ENCODER_LENGTH + MAX_PRED_LENGTH)
+    _val_before_rows, _val_before_assets = len(val_df), val_df["asset"].nunique()
+    _test_before_rows, _test_before_assets = len(test_df), test_df["asset"].nunique()
+    train_assets = set(train_df["asset"].unique())
+
+    # Keep only assets seen in TRAIN
+    val_df = val_df[val_df["asset"].isin(train_assets)]
+    test_df = test_df[test_df["asset"].isin(train_assets)]
+
+    # Drop groups with too few timesteps for at least one window
+    val_df = val_df.groupby("asset", observed=True).filter(lambda g: len(g) >= min_required)
+    test_df = test_df.groupby("asset", observed=True).filter(lambda g: len(g) >= min_required)
+
+    print(
+        f"[FILTER] VAL rows {_val_before_rows}→{len(val_df)} | assets {_val_before_assets}→{val_df['asset'].nunique()} (min_len={min_required})"
+    )
+    print(
+        f"[FILTER] TEST rows {_test_before_rows}→{len(test_df)} | assets {_test_before_assets}→{test_df['asset'].nunique()} (min_len={min_required})"
+    )
+
+    # If overly strict and we filtered everything out, relax to overlap-only and let PF handle windows
+    if len(val_df) == 0:
+        val_df = _val_df_raw[_val_df_raw["asset"].isin(train_assets)]
+        print(f"[FILTER] VAL relaxed to overlap-only: {len(val_df)} rows")
+    if len(test_df) == 0:
+        test_df = _test_df_raw[_test_df_raw["asset"].isin(train_assets)]
+        print(f"[FILTER] TEST relaxed to overlap-only: {len(test_df)} rows")
+
+
+    # -----------------------------------------------------------------------
+    # Feature definitions
+    # -----------------------------------------------------------------------
+    static_categoricals = GROUP_ID
+    static_reals: List[str] = []
+
+    base_exclude = set(GROUP_ID + [TIME_COL, "time_idx", "rv_scale"] + TARGETS)
+
+    all_numeric = [c for c, dt in train_df.dtypes.items()
+                   if (c not in base_exclude) and pd.api.types.is_numeric_dtype(dt)]
+
+    # Specify future-known and unknown real features
+    calendar_cols = ["sin_tod", "cos_tod", "sin_dow", "cos_dow"]
+    time_varying_known_reals = calendar_cols + ["Is_Weekend"]
+    time_varying_unknown_reals = [c for c in all_numeric if c not in (calendar_cols + ["Is_Weekend"]) ]
+
+
+
+    # -----------------------------------------------------------------------
+    # TimeSeriesDataSets
+    # -----------------------------------------------------------------------
+    def build_dataset(df: pd.DataFrame, predict: bool) -> TimeSeriesDataSet:
+        return TimeSeriesDataSet(
+            df,
+            time_idx="time_idx",
+            target=TARGETS,
+            group_ids=GROUP_ID,
+            max_encoder_length=MAX_ENCODER_LENGTH,
+            max_prediction_length=MAX_PRED_LENGTH,
+            # ------------------------------------------------------------------
+            # Target normalisation
+            #   • realised_vol → GroupNormalizer(asinh, per‑asset scaling)
+            #   • direction    → identity (classification logits)
+            # ------------------------------------------------------------------
+            target_normalizer = MultiNormalizer([
+                GroupNormalizer(
+                    groups=GROUP_ID,
+                    center=False,
+                    scale_by_group= True, #True
+                    transformation="log1p",
+                ),
+                TorchNormalizer(method="identity", center=False),   # direction
+            ]),
+            static_categoricals=static_categoricals,
+            static_reals=static_reals,
+            time_varying_known_reals=time_varying_known_reals,   # known at prediction time
+            time_varying_unknown_reals=time_varying_unknown_reals # same set, allows learning lagged targets
+            ,
+            add_relative_time_idx=True,
+            add_target_scales=True,
+            add_encoder_length=True,
+            allow_missing_timesteps=True,
+            predict_mode=predict
+        )
+
+    print("▶ Building TimeSeriesDataSets …")
+
+    training_dataset = build_dataset(train_df, predict=False)
+
+    # Build validation/test from TRAIN template so group ID mapping and normalizer stats MATCH
+    validation_dataset = TimeSeriesDataSet.from_dataset(
+        training_dataset, val_df, predict=False, stop_randomization=True
+    )
+    test_dataset = TimeSeriesDataSet.from_dataset(
+        training_dataset, test_df, predict=False, stop_randomization=True
+    )
+    vol_normalizer = _extract_norm_from_dataset(training_dataset)  # must be from TRAIN
+    # make it available to both the model and the metrics callback
+    # (optional) quick alignment check
+    try:
+        train_vocab = training_dataset.get_parameters()["categorical_encoders"]["asset"].classes_
+        val_vocab   = validation_dataset.get_parameters()["categorical_encoders"]["asset"].classes_
+        print(f"[ALIGN] val uses train encoders: {np.array_equal(train_vocab, val_vocab)}; "
+            f"len(train_vocab)={len(train_vocab)} len(val_vocab)={len(val_vocab)}")
+    except Exception:
+        pass
+
+    batch_size = min(BATCH_SIZE, len(training_dataset))
+
+    # DataLoader performance knobs
+    default_workers = max(2, (os.cpu_count() or 4) - 1)
+    worker_cnt = int(ARGS.num_workers) if getattr(ARGS, "num_workers", None) is not None else default_workers
+    prefetch = int(getattr(ARGS, "prefetch_factor", 8))
+    pin = torch.cuda.is_available()
+    use_persist = worker_cnt > 0
+
+    test_loader = test_dataset.to_dataloader(
+        train=False,
+        batch_size=batch_size,
+        num_workers=worker_cnt,
+        pin_memory=pin,
+        persistent_workers=use_persist,
+        prefetch_factor=prefetch,
+    )
+
+    train_dataloader = training_dataset.to_dataloader(
+        train=True,
+        batch_size=batch_size,
+        num_workers=worker_cnt,
+        persistent_workers=use_persist,
+        prefetch_factor=prefetch,
+        pin_memory=pin,
+    )
+    val_dataloader = validation_dataset.to_dataloader(
+        train=False,
+        batch_size=batch_size,
+        num_workers=worker_cnt,
+        persistent_workers=use_persist,
+        prefetch_factor=prefetch,
+        pin_memory=pin,
+    )
+    # --- Test dataset ---
+    test_dataset = TimeSeriesDataSet.from_dataset(
+        training_dataset,
+        test_df,
+        predict=False,
+        stop_randomization=True,
+    )
+
+    # use the same loader knobs as train/val to avoid None / tensor-bool pitfalls
+    test_dataloader = test_dataset.to_dataloader(
+        train=False,
+        batch_size=batch_size,
+        num_workers=worker_cnt,
+        prefetch_factor=prefetch,
+        persistent_workers=use_persist,
+        pin_memory=pin,
+    )
+
+    # ---- derive id→asset-name mapping for callbacks ----
+    asset_vocab = (
+        training_dataset.get_parameters()["categorical_encoders"]["asset"].classes_
+    )
+    rev_asset = {i: lbl for i, lbl in enumerate(asset_vocab)}
+
+    vol_normalizer = _extract_norm_from_dataset(training_dataset)
+
+
+    # -----------------------------------------------------------------------
+    # Model
+    # -----------------------------------------------------------------------
+    seed_everything(SEED, workers=True)
+    # Loss and output_size for multi-target: realised_vol (quantile regression), direction (classification)
+    print("▶ Building model …")
+    print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.0017978}")
+    
+    es_cb = EarlyStopping(
+    monitor="val_qlike_overall",
+    patience=EARLY_STOP_PATIENCE,
+    mode="max"
+    )
+
+    bar_cb = TQDMProgressBar()
+
+    metrics_cb = PerAssetMetrics(
+        id_to_name=rev_asset,
+        vol_normalizer= vol_normalizer
+    )
+
+    # If you have a custom checkpoint mirroring callback
+    mirror_cb = MirrorCheckpoints()
+
+    red_cb = ReduceLROnPlateauCallback(monitor="val_loss_decoded", factor=0.5, patience=3, min_lr=1e-5)
+
+
+    VOL_LOSS = AsymmetricQuantileLoss(
+        quantiles=VOL_QUANTILES,
+        underestimation_factor=1.0, #1.1115   # you can keep your scheduler on this
+        mean_bias_weight=0.0,          # or small value if you want median centering
+        tail_q=0.85,
+        tail_weight=1.0,               # set >0 if you want extra tail emphasis
+        qlike_weight=0.20,             # << QLIKE back in (tune 0.1–0.3)
+        reduction="mean",
+    )
+    from pytorch_forecasting.metrics import MultiLoss
+    # one-off in your data prep (TRAIN split)
+    counts = train_df["direction"].value_counts()
+    n_pos = counts.get(1, 1)
+    n_neg = counts.get(0, 1)
+    pos_weight = float(n_neg / n_pos)
+
+    # then build the loss with:
+    DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.03, pos_weight=pos_weight)
+
+
+    FIXED_VOL_WEIGHT = 1.0
+    FIXED_DIR_WEIGHT = 0.25
+ 
+
+    tft = TemporalFusionTransformer.from_dataset(
+        training_dataset,
+        hidden_size=96,
+        attention_head_size=4,
+        dropout=0.13, #0.0833704625250354,
+        hidden_continuous_size=24,
+        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.00035), #0.0019 0017978
+        optimizer="AdamW",
+        optimizer_params={"weight_decay": WEIGHT_DECAY},
+        output_size=[7, 1],  # 7 quantiles + 1 logit
+        loss=MultiLoss([VOL_LOSS, DIR_LOSS], weights=[FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT]),
+        logging_metrics=[],
+        log_interval=50,
+        log_val_interval=10,
+    )
+    vol_normalizer = _extract_norm_from_dataset(training_dataset)
+    tft.vol_norm = vol_normalizer          # if your LightningModule is 'tft'
+    metrics_cb = PerAssetMetrics(
+        id_to_name=rev_asset,
+        vol_normalizer=vol_normalizer,
+        max_print=10
+    )
+
+    lr_cb = LearningRateMonitor(logging_interval="step")
+
+    best_ckpt_cb = ModelCheckpoint(
+        monitor="val_auroc_overall",
+        mode="max",
+        save_top_k=1,
+        save_last=True,
+        filename=f"tft_best_e{MAX_EPOCHS}_{RUN_SUFFIX}",
+        dirpath=str(LOCAL_CKPT_DIR),
+    )
+
+  
+
+   
+    
+    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=5) 
+
+    # ----------------------------
+    # Trainer instance
+    # ----------------------------
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=str(LOCAL_OUTPUT_DIR),
+        filename="tft-{epoch:02d}-{val_loss:.4f}",
+        monitor="val_loss",      # or val_qlike_overall if you want
+        save_top_k=1,            # keep best only
+        mode="min",              # because lower val_loss is better
+    )
+    trainer = Trainer(
+        accelerator=ACCELERATOR,
+        devices=DEVICES,
+        precision=PRECISION,
+        max_epochs=MAX_EPOCHS,
+        gradient_clip_val=GRADIENT_CLIP_VAL,
+        num_sanity_val_steps = 0,
+        logger=logger,
+        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, red_cb],
+        check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
+        log_every_n_steps=int(ARGS.log_every_n_steps),
+    )
+
+
+    from types import MethodType
+
+    # Completely skip PF's internal figure creation & TensorBoard logging during validation.
+    def _no_log_prediction(self, *args, **kwargs):
+        # Intentionally do nothing so BaseModel.create_log won't attempt to log a Matplotlib figure.
+        return
+
+    tft.log_prediction = MethodType(_no_log_prediction, tft)
+
+    # (Optional, extra safety) If any PF path calls plot_prediction directly, hand back a blank figure
+    # so nothing touches your tensors or bf16 -> NumPy conversion.
+    def _blank_plot(self, *args, **kwargs):
+        import matplotlib
+        matplotlib.use("Agg", force=True)  # headless-safe backend
+        import matplotlib.pyplot as plt
+        fig = plt.figure()
+        return fig
+
+    tft.plot_prediction = MethodType(_blank_plot, tft)
+
+    # Train the model
+    trainer.fit(tft, train_dataloader, val_dataloader)
+
+    # Run FI permutation testing if enabled
     if ENABLE_FEATURE_IMPORTANCE:
-        # (existing code that calls run_permutation_importance(...))
-        # ...
-        pass  # Replace with actual PFI code as already present
+        fi_csv = str(LOCAL_OUTPUT_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")
+        feats = time_varying_unknown_reals.copy()
+        # (optional) drop calendar features from FI to focus on learned signals
+        feats = [f for f in feats if f not in ("sin_tod", "cos_tod", "sin_dow", "cos_dow", "Is_Weekend")]
+        run_permutation_importance(
+            model=tft,
+            template_ds = training_dataset,            # << use train template
+            base_df=val_df,
+            features=feats,
+            block_size=int(PERM_BLOCK_SIZE) if PERM_BLOCK_SIZE else 1,
+            batch_size=2048,
+            max_batches=int(FI_MAX_BATCHES) if FI_MAX_BATCHES else 20,
+            num_workers=4,
+            prefetch=2,
+            pin_memory=pin,
+            out_csv_path=fi_csv,
+            uploader=upload_file_to_gcs,
+        )
+    # --- Safe plotting/logging: deep-cast any nested tensors to CPU float32 ---
+    # --- Safe plotting/logging: class-level patch to handle bf16 + integer lengths robustly ---
 
-        # --- Standard Variable Importance (TFT attention-based) ---
-        try:
-            svi_csv = str(LOCAL_OUTPUT_DIR / f"tft_standard_vi_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")
-            # Try to assemble feature names from the dataset if available (best effort)
-            feat_names = None
+    from pytorch_forecasting.models.base._base_model import BaseModel # type: ignore
+
+    def _deep_cpu_float(x):
+        if torch.is_tensor(x):
+            # keep integer tensors as int64; cast others to float32 for matplotlib
+            if x.dtype in (
+                torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8,
+                getattr(torch, "long", torch.int64)
+            ):
+                return x.detach().to(device="cpu", dtype=torch.int64)
+            return x.detach().to(device="cpu", dtype=torch.float32)
+        if isinstance(x, list):
+            return [_deep_cpu_float(v) for v in x]
+        if isinstance(x, tuple):
+            casted = tuple(_deep_cpu_float(v) for v in x)
             try:
-                feat_names = []
-                # Pull names from the training TimeSeriesDataSet (if present)
-                if 'training_dataset' in globals():
-                    ds0 = training_dataset
-                    # Prefer explicit lists if available
-                    for key in ("time_varying_known_reals", "time_varying_unknown_reals", "static_reals"):
-                        vals = getattr(ds0, key, None)
-                        if vals:
-                            feat_names.extend(list(vals))
-                    # Fallback to all reals if exposed
-                    if not feat_names and hasattr(ds0, "reals"):
-                        feat_names = list(getattr(ds0, "reals"))
-                if not feat_names:
-                    feat_names = None
+                # preserve namedtuple types
+                return x.__class__(*casted)
             except Exception:
-                feat_names = None
+                return casted
+        if isinstance(x, dict):
+            return {k: _deep_cpu_float(v) for k, v in x.items()}
+        if isinstance(x, np.ndarray) and np.issubdtype(x.dtype, np.number):
+            if np.issubdtype(x.dtype, np.integer):
+                return x.astype(np.int64, copy=False)
+            return x.astype(np.float32, copy=False)
+        return x
 
-            save_standard_variable_importance(
-                tft,
-                val_dataloader,
-                out_csv_path=svi_csv,
-                uploader=upload_file_to_gcs,
-                feature_names=feat_names,
-            )
-        except Exception as e:
-            print(f"[SVI] Skipped standard variable importance: {e}")
+    def _to_numpy_int64_array(v):
+        if torch.is_tensor(v):
+            return v.detach().cpu().long().numpy()
+        if isinstance(v, np.ndarray):
+            return v.astype(np.int64, copy=False)
+        if isinstance(v, (list, tuple)):
+            out = []
+            for el in v:
+                if torch.is_tensor(el):
+                    out.append(int(el.detach().cpu().item()))
+                else:
+                    out.append(int(el))
+            return np.asarray(out, dtype=np.int64)
+        if isinstance(v, (int, np.integer)):
+            return np.asarray([int(v)], dtype=np.int64)
+        return v  # leave unknowns as-is
+
+    def _fix_lengths_in_x(x):
+        # PF expects max() & python slicing with these; make them numpy int64 arrays
+        if isinstance(x, dict):
+            for key in ("encoder_lengths", "decoder_lengths"):
+                if key in x and x[key] is not None:
+                    x[key] = _to_numpy_int64_array(x[key])
+        return x
+    
+# After trainer.fit()
+print("✓ Training finished — reloading best checkpoint for test inference")
+
+from lightning.pytorch.callbacks import ModelCheckpoint
+from pathlib import Path
+import fsspec
+import pandas as pd
+
+# --- Resolve best checkpoint path from any ModelCheckpoint callback ---
+best_model_path = None
+for cb in trainer.callbacks:
+    if isinstance(cb, ModelCheckpoint):
+        if getattr(cb, "best_model_path", None):
+            best_model_path = cb.best_model_path
+            break
+
+if not best_model_path or not str(best_model_path).endswith(".ckpt"):
+    raise RuntimeError(f"[FATAL] Could not resolve best checkpoint (.ckpt). Got: {best_model_path}")
+
+print(f"Best checkpoint (local or remote): {best_model_path}")
+
+# --- If checkpoint is on GCS, download it locally ---
+if str(best_model_path).startswith("gs://"):
+    fs, _, paths = fsspec.get_fs_token_paths(best_model_path)
+    local_ckpt = Path("/tmp") / Path(paths[0]).name
+    with fs.open(paths[0], "rb") as src, open(local_ckpt, "wb") as dst:
+        dst.write(src.read())
+    best_model_path = str(local_ckpt)
+    print(f"Downloaded checkpoint to: {best_model_path}")
+
+# --- Load model from checkpoint ---
+best_model = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
+best_model.eval()
+
+# --- Run TEST loop with the best checkpoint & print decoded metrics ---
+try:
+    test_results = trainer.test(best_model, dataloaders=test_dataloader, verbose=True)
+    print(f"Test results (trainer.test): {test_results}")
+except Exception as e:
+    print(f"[WARN] Test evaluation failed: {e}")
+
+# Helpers
+def _median_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
+    vol_q = torch.cummax(vol_q, dim=-1).values
+    return vol_q[..., 3]
+
+def _safe_prob(t: torch.Tensor) -> torch.Tensor:
+    # convert logits or probs to [0,1] probability tensor without boolean context
+    if not torch.is_tensor(t):
+        return t
+    try:
+        if torch.isfinite(t).any() and (torch.min(t) < 0 or torch.max(t) > 1):
+            t = torch.sigmoid(t)
+    except Exception:
+        t = torch.sigmoid(t)
+    return torch.clamp(t, 0.0, 1.0)
+
+@torch.no_grad()
+def _collect_test_predictions(model, dl, id_to_name, vol_norm):
+    model_device = next(model.parameters()).device
+    assets_all, t_idx_all = [], []
+    yv_all, pv_all = [], []
+    yd_all, pdprob_all = [], []
+
+    for batch in dl:
+        if not isinstance(batch, (list, tuple)) or len(batch) < 2:
+            continue
+        x, y = batch[0], batch[1]
+        if not isinstance(x, dict):
+            continue
+
+        # groups / time_idx
+        g = x.get("groups") or x.get("group_ids")
+        if isinstance(g, (list, tuple)):
+            g = g[0] if g else None
+        if torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
+            g = g.squeeze(-1)
+        if not torch.is_tensor(g):
+            continue
+
+        t_idx = x.get("decoder_time_idx") or x.get("time_idx")
+        if torch.is_tensor(t_idx) and t_idx.ndim > 1 and t_idx.size(-1) == 1:
+            t_idx = t_idx.squeeze(-1)
+
+        # true targets (encoded)
+        yv, yd = None, None
+        if torch.is_tensor(y):
+            t = y
+            if t.ndim == 3 and t.size(1) == 1:
+                t = t[:, 0, :]
+            if t.ndim == 2 and t.size(1) >= 1:
+                yv = t[:, 0]
+                yd = (t[:, 1] if t.size(1) > 1 else None)
+
+        # forward
+        x_dev = {k: (v.to(model_device, non_blocking=True) if torch.is_tensor(v)
+                     else [vv.to(model_device, non_blocking=True) if torch.is_tensor(vv) else vv for vv in v]
+                     if isinstance(v, (list, tuple)) else v)
+                 for k, v in x.items()}
+        out = model(x_dev)
+        pred = getattr(out, "prediction", out)
+        if isinstance(pred, dict) and "prediction" in pred:
+            pred = pred["prediction"]
+
+        # split heads
+        if isinstance(pred, (list, tuple)):
+            vol_q = pred[0]
+            d_log = pred[1] if len(pred) > 1 else None
+        else:
+            t = pred
+            if t.ndim >= 4 and t.size(1) == 1:
+                t = t.squeeze(1)
+            if t.ndim == 3 and t.size(1) == 1:
+                t = t[:, 0, :]
+            vol_q, d_log = t[:, : t.size(-1)-1], t[:, -1]
+        p_vol = _median_from_quantiles(vol_q) if torch.is_tensor(vol_q) else vol_q
+
+        # decode to physical scale and calibrate
+        y_dec = None
+        if torch.is_tensor(yv):
+            y_dec = safe_decode_vol(yv.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+        p_dec = safe_decode_vol(p_vol.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+        p_dec = torch.clamp(p_dec, min=1e-8)
+        if y_dec is not None:
+            p_dec = calibrate_vol_predictions(y_dec, p_dec)
+
+        # direction prob
+        p_dir_prob = None
+        if torch.is_tensor(d_log):
+            p_dir_prob = _safe_prob(d_log.detach())
+
+        # append
+        gn_list = g.detach().cpu().long().tolist()
+        assets_all.extend([id_to_name.get(int(i), str(int(i))) for i in gn_list])
+
+        if torch.is_tensor(t_idx):
+            t_idx_all.extend(t_idx.detach().cpu().long().tolist())
+        else:
+            t_idx_all.extend([None] * len(gn_list))
+
+        if y_dec is not None:
+            yv_all.append(y_dec.detach().cpu())
+        pv_all.append(p_dec.detach().cpu())
+
+        if torch.is_tensor(yd):
+            yd_all.append(yd.detach().cpu())
+        if p_dir_prob is not None:
+            pdprob_all.append(p_dir_prob.detach().cpu())
+
+    # stack
+    yv_list = torch.cat(yv_all).numpy().tolist() if len(yv_all) > 0 else [None] * len(assets_all)
+    pv_list = torch.cat(pv_all).numpy().tolist() if len(pv_all) > 0 else []
+    yd_list = torch.cat(yd_all).numpy().tolist() if len(yd_all) > 0 else [None] * len(assets_all)
+    pd_list = torch.cat(pdprob_all).numpy().tolist() if len(pdprob_all) > 0 else [None] * len(assets_all)
+
+    L = min(len(assets_all), len(t_idx_all), len(pv_list), len(yv_list), len(yd_list), len(pd_list))
+    return pd.DataFrame({
+        "asset":             assets_all[:L],
+        "time_idx":          t_idx_all[:L],
+        "realised_vol":      yv_list[:L],
+        "pred_realised_vol": pv_list[:L],
+        "direction":         yd_list[:L],
+        "pred_direction":    pd_list[:L],
+    })
+
+# Build dataframe of predictions and compute TEST metrics on decoded scale
+try:
+    df_test_preds = _collect_test_predictions(
+        best_model, test_dataloader, id_to_name=metrics_cb.id_to_name, vol_norm=metrics_cb.vol_norm
+    )
+
+    # Print decoded test metrics
+    _y = torch.tensor([v for v in df_test_preds["realised_vol"].tolist() if v is not None], dtype=torch.float32)
+    _p = torch.tensor(df_test_preds["pred_realised_vol"].tolist(), dtype=torch.float32)[: _y.numel()]
+    eps = 1e-8
+    mae  = torch.mean(torch.abs(_p - _y)).item()
+    mse  = torch.mean((_p - _y) ** 2).item()
+    rmse = (mse ** 0.5)
+    sigma2_p = torch.clamp(torch.abs(_p), min=eps) ** 2
+    sigma2_y = torch.clamp(torch.abs(_y), min=eps) ** 2
+    ratio = sigma2_y / sigma2_p
+    qlike = torch.mean(ratio - torch.log(ratio) - 1.0).item()
+
+    # Direction metrics if available
+    auroc_val, brier_val, acc_val = None, None, None
+    if "direction" in df_test_preds.columns and "pred_direction" in df_test_preds.columns:
+        yd = df_test_preds["direction"].tolist()
+        pd = df_test_preds["pred_direction"].tolist()
+        # filter out None rows
+        pairs = [(a, b) for a, b in zip(yd, pd) if a is not None and b is not None]
+        if len(pairs) > 0:
+            yd_t = torch.tensor([a for a, _ in pairs], dtype=torch.float32)
+            pd_t = torch.tensor([b for _, b in pairs], dtype=torch.float32)
+            pd_t = _safe_prob(pd_t)
+            acc_val   = float(((pd_t >= 0.5).int() == yd_t.int()).float().mean().item())
+            brier_val = float(torch.mean((pd_t - yd_t) ** 2).item())
+            try:
+                from torchmetrics.classification import BinaryAUROC
+                auroc_val = float(BinaryAUROC()(pd_t, yd_t).item())
+            except Exception as e:
+                print(f"[WARN] AUROC (test) failed: {e}")
+
+    print(
+        f"[TEST] (decoded) MAE={mae:.6f} RMSE={rmse:.6f} MSE={mse:.6f} QLIKE={qlike:.6f}"
+        + (f" | ACC={acc_val:.3f}" if acc_val is not None else "")
+        + (f" | Brier={brier_val:.4f}" if brier_val is not None else "")
+        + (f" | AUROC={auroc_val:.3f}" if auroc_val is not None else "")
+    )
+
+    # Save parquet & upload
+    pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+    df_test_preds.to_parquet(pred_path, index=False)
+    print(f"✓ Saved TEST predictions → {pred_path}")
+    try:
+        upload_file_to_gcs(str(pred_path), f"{GCS_OUTPUT_PREFIX}/{pred_path.name}")
+    except Exception as e:
+        print(f"[WARN] Could not upload test predictions: {e}")
+
+except Exception as e:
+    print(f"[WARN] Failed to save test predictions: {e}")
