@@ -1883,7 +1883,6 @@ def run_permutation_importance(
     model,
     template_ds : TimeSeriesDataSet,
     base_df: pd.DataFrame,
-    build_ds_fn = lambda: val_dataset,
     features: List[str],
     block_size: int,
     batch_size: int,
@@ -1893,6 +1892,7 @@ def run_permutation_importance(
     pin_memory: bool,
     out_csv_path: str,
     uploader,
+    build_ds_fn = lambda: validation_dataset,
 ) -> None:
     """
     Compute FI by permuting each feature and measuring Δ(val_loss) where
