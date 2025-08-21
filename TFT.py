@@ -2072,7 +2072,7 @@ if __name__ == "__main__":
 
 
     FIXED_VOL_WEIGHT = 1.0
-    FIXED_DIR_WEIGHT = 0.1
+    FIXED_DIR_WEIGHT = 0.25
  
 
     tft = TemporalFusionTransformer.from_dataset(
