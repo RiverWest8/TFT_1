@@ -74,7 +74,16 @@ def _permute_series_inplace(df: pd.DataFrame, col: str, block: int, group_col: s
             np.random.shuffle(vals)
             df.loc[idx, col] = vals
 
-# ------------------ Added imports for new FI block ------------------
+
+# helper (put once near the top of the file, or inline if you prefer)
+def _first_not_none(d, keys):
+    for k in keys:
+        v = d.get(k, None)
+        if v is not None:
+            return v
+    return None
+
+# ------------------ Imports ------------------
 
 from pytorch_forecasting import (
     BaseModel,
@@ -1688,6 +1697,7 @@ def subset_time_series(df: pd.DataFrame, max_rows: int | None, mode: str = "per_
 # Permutation Importance helpers at module scope (decoded metric = MAE + RMSE + 0.05 * DirBCE)
 # -----------------------------------------------------------------------
 
+
 def _extract_norm_from_dataset(ds: TimeSeriesDataSet):
     """Return the GroupNormalizer used for realised_vol in our MultiNormalizer."""
     try:
@@ -1757,7 +1767,9 @@ def _evaluate_decoded_metrics(
                 continue
 
             # groups
-            g = x.get("groups") or x.get("group_ids")
+            g = x.get("groups")
+            if g is None:
+                g = x.get("group_ids")
             if isinstance(g, (list, tuple)):
                 g = g[0] if g else None
             if torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
@@ -1791,7 +1803,9 @@ def _evaluate_decoded_metrics(
                     return (yv if torch.is_tensor(yv) else None, yd if torch.is_tensor(yd) else None)
                 return None, None
 
-            dec_t = x.get("decoder_target") or x.get("target")
+            dec_t = x.get("decoder_target")
+            if dec_t is None:
+                dec_t = x.get("target")
             y_vol, y_dir = _extract(dec_t)
             if (y_vol is None or (y_dir is None and y is not None)) and y is not None:
                 yv2, yd2 = _extract(y)
@@ -2589,7 +2603,9 @@ def _collect_test_predictions(model, dl, id_to_name, vol_norm):
             continue
 
         # groups / time_idx
-        g = x.get("groups") or x.get("group_ids")
+        g = x.get("groups")
+        if g is None:
+            g = x.get("group_ids")
         if isinstance(g, (list, tuple)):
             g = g[0] if g else None
         if torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
@@ -2597,7 +2613,9 @@ def _collect_test_predictions(model, dl, id_to_name, vol_norm):
         if not torch.is_tensor(g):
             continue
 
-        t_idx = x.get("decoder_time_idx") or x.get("time_idx")
+        t_idx = x.get("decoder_time_idx")
+        if t_idx is None:
+            t_idx = x.get("time_idx")
         if torch.is_tensor(t_idx) and t_idx.ndim > 1 and t_idx.size(-1) == 1:
             t_idx = t_idx.squeeze(-1)
 
