@@ -1462,7 +1462,7 @@ MAX_PRED_LENGTH    = 1
 
 EMBEDDING_CARDINALITY = {}
 
-BATCH_SIZE   = 2048
+BATCH_SIZE   = 256
 MAX_EPOCHS   = 5
 EARLY_STOP_PATIENCE = 12
 PERM_BLOCK_SIZE = 288
@@ -1477,7 +1477,7 @@ WEIGHT_DECAY = 0.0001 #0.00578350719515325     # weight decay for AdamW
 GRADIENT_CLIP_VAL = 0.78 #0.78    # gradient clipping value for Trainer
 # Feature-importance controls
 ENABLE_FEATURE_IMPORTANCE = True   # gate FI so you can toggle it
-FI_MAX_BATCHES = 1       # number of val batches to sample for FI
+FI_MAX_BATCHES = 40       # number of val batches to sample for FI
 
 # ---- Apply CLI overrides (only when provided) ----
 if ARGS.batch_size is not None:
@@ -1915,7 +1915,7 @@ def run_permutation_importance(
     """
     ds_base = TimeSeriesDataSet.from_dataset(template_ds, base_df, predict=False, stop_randomization=True)
     train_vol_norm = _extract_norm_from_dataset(template_ds)
-    max_batches = 1
+    max_batches = 50
     try:
         print(f"[FI] Dataset size (samples): {len(ds_base)} | batch_size={batch_size}")
     except Exception:
