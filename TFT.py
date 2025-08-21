@@ -1883,7 +1883,7 @@ def run_permutation_importance(
     model,
     template_ds : TimeSeriesDataSet,
     base_df: pd.DataFrame,
-    build_ds_fn,
+    build_ds_fn = lambda: val_dataset,
     features: List[str],
     block_size: int,
     batch_size: int,
@@ -2545,6 +2545,13 @@ if best_model is None:
     raise RuntimeError("No model available for testing (checkpoint and in-memory both unavailable).")
 
 print(f"Best checkpoint (local or remote): {best_model_path}")
+
+# Compute variable importance from TFT gating
+interpret = best_model.interpret_output(val_dataloader, reduction="mean")
+
+# Save to CSV for later analysis
+pd.DataFrame(interpret["encoder_variables"]).to_csv("encoder_importance.csv")
+pd.DataFrame(interpret["decoder_variables"]).to_csv("decoder_importance.csv")
 
 # --- Run TEST loop with the best checkpoint & print decoded metrics ---
 try:
