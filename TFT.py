@@ -2241,7 +2241,7 @@ if __name__ == "__main__":
     # If you have a custom checkpoint mirroring callback
     mirror_cb = MirrorCheckpoints()
 
-    red_cb = ReduceLROnPlateauCallback(monitor="val_loss_decoded", factor=0.5, patience=3, min_lr=1e-5)
+
 
 
     VOL_LOSS = AsymmetricQuantileLoss(
@@ -2306,7 +2306,7 @@ if __name__ == "__main__":
 
    
     
-    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=5) 
+    lr_decay_cb = EpochLRDecay(gamma=0.985, start_epoch=5) 
 
     # ----------------------------
     # Trainer instance
@@ -2328,7 +2328,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, red_cb],
+        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb],
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
     )
