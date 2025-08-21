@@ -340,7 +340,7 @@ class AsymmetricQuantileLoss(QuantileLoss):
     def __init__(
         self,
         quantiles,
-        underestimation_factor: float = 1.1115, #1.1115
+        underestimation_factor: float = 1.0, #1.1115
         mean_bias_weight: float = 0.0,
         tail_q: float = 0.90,         # ← was 0.85
         tail_weight: float = 0.0,
@@ -1402,6 +1402,48 @@ class ReduceLROnPlateauCallback(pl.Callback):
                 print(f"[LR Plateau] ↓ lr → {new_lr:.6g}")
                 self.bad, self.cool = 0, self.cooldown
 
+class ValLossHistory(pl.Callback):
+    """
+    Records per-epoch validation metrics to a CSV so you can plot later.
+    """
+    def __init__(self, out_csv: Path):
+        super().__init__()
+        self.out_csv = Path(out_csv)
+        self.rows = []
+
+    def _as_float(self, x):
+        try:
+            return float(x.item() if hasattr(x, "item") else x)
+        except Exception:
+            return float("nan")
+
+    def _current_lr(self, trainer):
+        try:
+            return float(trainer.optimizers[0].param_groups[0]["lr"])
+        except Exception:
+            return float("nan")
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        m = trainer.callback_metrics
+        row = {
+            "epoch": int(getattr(trainer, "current_epoch", -1)) + 1,
+            "val_loss":            self._as_float(m.get("val_loss", float("nan"))),
+            "val_qlike_overall":   self._as_float(m.get("val_qlike_overall", float("nan"))),
+            "val_mae_overall":     self._as_float(m.get("val_mae_overall", float("nan"))),
+            "val_rmse_overall":    self._as_float(m.get("val_rmse_overall", float("nan"))),
+            "val_acc_overall":     self._as_float(m.get("val_acc_overall", float("nan"))),
+            "val_brier_overall":   self._as_float(m.get("val_brier_overall", float("nan"))),
+            "val_auroc_overall":   self._as_float(m.get("val_auroc_overall", float("nan"))),
+            "lr":                  self._current_lr(trainer),
+        }
+        self.rows.append(row)
+        try:
+            import pandas as _pd
+            _pd.DataFrame(self.rows).to_csv(self.out_csv, index=False)
+            print(f"[VAL-HIST] wrote {self.out_csv}")
+        except Exception as e:
+            print(f"[VAL-HIST] write failed: {e}")
+
 GROUP_ID: List[str] = ["asset"]
 TIME_COL = "Time"
 TARGETS  = ["realised_vol", "direction"]
@@ -2247,7 +2289,7 @@ if __name__ == "__main__":
 
     VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=VOL_QUANTILES,
-        underestimation_factor=1.1115, #1.1115   # you can keep your scheduler on this
+        underestimation_factor=1.05, #1.1115   # you can keep your scheduler on this
         mean_bias_weight=0.0,          # or small value if you want median centering
         tail_q=0.85,
         tail_weight=1.0,               # set >0 if you want extra tail emphasis
@@ -2305,7 +2347,8 @@ if __name__ == "__main__":
 
   
 
-   
+    val_hist_csv = LOCAL_RUN_DIR / f"tft_val_history_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv"
+    val_hist_cb  = ValLossHistory(val_hist_csv)
     
     lr_decay_cb = EpochLRDecay(gamma=0.985, start_epoch=5) 
 
@@ -2329,7 +2372,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb],
+        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, val_hist_cb],
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
     )
@@ -2437,24 +2480,69 @@ if __name__ == "__main__":
                     x[key] = _to_numpy_int64_array(x[key])
         return x
     
-# After trainer.fit()
-print("✓ Training finished — reloading best checkpoint for test inference")
-
 from lightning.pytorch.callbacks import ModelCheckpoint
 from pathlib import Path
 import fsspec
 import pandas as pd
 
-# --- Resolve best checkpoint path from any ModelCheckpoint callback ---
-best_model_path = None
-for cb in trainer.callbacks:
-    if isinstance(cb, ModelCheckpoint):
-        if getattr(cb, "best_model_path", None):
-            best_model_path = cb.best_model_path
-            break
+print("✓ Training finished — reloading best checkpoint for test inference")
 
-if not best_model_path or not str(best_model_path).endswith(".ckpt"):
-    raise RuntimeError(f"[FATAL] Could not resolve best checkpoint (.ckpt). Got: {best_model_path}")
+# --- Resolve best checkpoint path and load ---
+best_model_path = None
+
+# Try the explicit callback you created
+try:
+    if "checkpoint_callback" in globals() and getattr(checkpoint_callback, "best_model_path", ""):
+        best_model_path = checkpoint_callback.best_model_path
+except Exception:
+    pass
+
+# Try any ModelCheckpoint callbacks attached to the trainer
+if not best_model_path:
+    try:
+        from lightning.pytorch.callbacks import ModelCheckpoint
+        for cb in getattr(trainer, "callbacks", []):
+            if isinstance(cb, ModelCheckpoint) and getattr(cb, "best_model_path", ""):
+                best_model_path = cb.best_model_path
+                break
+    except Exception:
+        pass
+
+# Fall back to newest local ckpt
+if not best_model_path:
+    try:
+        ckpts = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if ckpts:
+            best_model_path = str(ckpts[0])
+    except Exception:
+        pass
+
+# Fall back to GCS (optional)
+if not best_model_path and fs is not None:
+    try:
+        last_uri = f"{CKPT_GCS_PREFIX}/last.ckpt"
+        if fs.exists(last_uri):
+            dst = LOCAL_CKPT_DIR / "last.ckpt"
+            with fsspec.open(last_uri, "rb") as f_in, open(dst, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            best_model_path = str(dst)
+    except Exception as e:
+        print(f"[WARN] Could not fetch checkpoint from GCS: {e}")
+
+# Load the best checkpoint, or fall back to the in-memory model
+if best_model_path:
+    print(f"Best checkpoint (local or remote): {best_model_path}")
+    try:
+        best_model = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
+    except Exception as e:
+        print(f"[WARN] Loading best checkpoint failed ({e}); using in-memory model.")
+        best_model = globals().get("tft") or globals().get("model")
+else:
+    print("[WARN] No checkpoint found; using in-memory model.")
+    best_model = globals().get("tft") or globals().get("model")
+
+if best_model is None:
+    raise RuntimeError("No model available for testing (checkpoint and in-memory both unavailable).")
 
 print(f"Best checkpoint (local or remote): {best_model_path}")
 
