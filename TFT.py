@@ -340,7 +340,7 @@ class AsymmetricQuantileLoss(QuantileLoss):
     def __init__(
         self,
         quantiles,
-        underestimation_factor: float = 1.0, #1.1115
+        underestimation_factor: float = 1.1115, #1.1115
         mean_bias_weight: float = 0.0,
         tail_q: float = 0.90,         # ← was 0.85
         tail_weight: float = 0.0,
@@ -406,12 +406,35 @@ class AsymmetricQuantileLoss(QuantileLoss):
             except Exception:
                 pass
 
-        # ---- QLIKE disabled inside training loss ----
-        # We cannot safely decode here because GroupNormalizer scaling/centering
-        # is not available inside the loss (no access to group_ids).
-        # Decoded QLIKE is computed in the validation callback instead.
+            # ---- Optional surrogate QLIKE (encoded scale; no decode) ----
+            # If qlike_weight > 0, add a stable proxy using encoded magnitudes.
+            # We approximate sigma by |·| of the encoded target/median prediction.
+        if self.qlike_weight and self.qlike_weight > 0:
+            try:
+                if isinstance(target, tuple):
+                    target = target[0]
+                # median (q=0.5) prediction on encoded scale
+                med = y_pred[..., self._q50_idx]
+
+                # positive "scale" proxies from encoded values
+                # clamp to avoid extreme gradients, then floor by eps
+                sigma_y = torch.clamp(target.abs(), min=self.eps)
+                sigma_p = torch.clamp(med.abs(),    min=self.eps)
+
+                # QLIKE core on scale ratio
+                ratio = (sigma_y ** 2) / (sigma_p ** 2)
+                # clip log-ratio for numerical stability
+                log_ratio = torch.log(torch.clamp(ratio, min=torch.exp(-self.log_ratio_clip), max=torch.exp(self.log_ratio_clip)))
+                qlike = ratio - log_ratio - 1.0
+
+                base = base + float(self.qlike_weight) * qlike.mean()
+            except Exception:
+                # if anything goes sideways, just fall back to quantile-only
+                pass
 
         return torch.nan_to_num(base, nan=0.0, posinf=1e4, neginf=1e4)
+
+
 
 class PerAssetMetrics(pl.Callback):
     """Collects per-asset predictions during validation and prints/saves metrics.
@@ -862,7 +885,7 @@ class PerAssetMetrics(pl.Callback):
                 # --- Attach real timestamps from a source DataFrame, if available ---
                 try:
                     # Look for a likely source dataframe that contains ['asset','time_idx','Time']
-                    candidate_names = ["raw_df", "raw_data", "full_df", "df", "val_df", "train_df", "test_df"]
+                    candidate_names = ["val_df"]
                     src_df = None
                     for _name in candidate_names:
                         obj = globals().get(_name)
@@ -1487,6 +1510,90 @@ def add_time_idx(df: pd.DataFrame) -> pd.DataFrame:
           .astype("int64")
     )
     return df
+
+# -----------------------------------------------------------------------
+# Split sanity: enforce chronological, non-overlapping 80/10/10 per asset
+# -----------------------------------------------------------------------
+def _chronological_resplit(df: pd.DataFrame, train_frac: float = 0.8, val_frac: float = 0.1):
+    """
+    Deterministically re-split a combined dataframe into train/val/test by time,
+    per asset, using the provided fractions (train, val, test = rest).
+    Assumes columns: 'asset', 'Time'.
+    Returns: (train_df, val_df, test_df)
+    """
+    assert 0 < train_frac < 1 and 0 < val_frac < 1 and train_frac + val_frac < 1
+    df = df.sort_values(["asset", "Time"]).reset_index(drop=True)
+    parts = []
+    for asset, g in df.groupby("asset", observed=True, sort=False):
+        n = len(g)
+        if n == 0:
+            continue
+        tr_end = int(n * train_frac)
+        va_end = int(n * (train_frac + val_frac))
+        g = g.copy()
+        g.loc[g.index[:tr_end], "split"] = "train"
+        g.loc[g.index[tr_end:va_end], "split"] = "val"
+        g.loc[g.index[va_end:], "split"] = "test"
+        parts.append(g)
+    out = pd.concat(parts, axis=0, ignore_index=False)
+    train_df = out[out["split"] == "train"].drop(columns=["split"]).copy()
+    val_df   = out[out["split"] == "val"].drop(columns=["split"]).copy()
+    test_df  = out[out["split"] == "test"].drop(columns=["split"]).copy()
+    return train_df, val_df, test_df
+
+
+def assert_and_fix_splits(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame):
+    """
+    Ensure each split is chronologically sorted per asset and there is no time overlap:
+      max(train) < min(val) and max(val) < min(test), per asset.
+    If violated for any asset, re-split deterministically (80/10/10) from the union.
+    Returns possibly corrected (train_df, val_df, test_df).
+    """
+    # Sort each split per asset/time
+    train_df = load_split(READ_PATHS[0])
+    val_df   = load_split(READ_PATHS[1])
+    test_df  = load_split(READ_PATHS[2])
+
+    # Enforce chronological order and non-overlap across splits; re-split if necessary
+    train_df, val_df, test_df = assert_and_fix_splits(train_df, val_df, test_df)
+    def _bounds(df):
+        if df.empty:
+            return pd.DataFrame(columns=["asset","min","max"]).set_index("asset")
+        return df.groupby("asset", observed=True)["Time"].agg(["min","max"])
+
+    tb = _bounds(train_df).rename(columns={"min":"tr_min","max":"tr_max"})
+    vb = _bounds(val_df).rename(columns={"min":"va_min","max":"va_max"})
+    sb = _bounds(test_df).rename(columns={"min":"te_min","max":"te_max"})
+
+    bounds = tb.join(vb, how="outer").join(sb, how="outer")
+
+    bad_assets = []
+    for a, r in bounds.iterrows():
+        tr_max = r.get("tr_max", pd.NaT)
+        va_min = r.get("va_min", pd.NaT)
+        va_max = r.get("va_max", pd.NaT)
+        te_min = r.get("te_min", pd.NaT)
+        ok = True
+        if pd.notna(tr_max) and pd.notna(va_min):
+            ok = ok and (tr_max < va_min)
+        if pd.notna(va_max) and pd.notna(te_min):
+            ok = ok and (va_max < te_min)
+        if not ok:
+            bad_assets.append(a)
+
+    if bad_assets:
+        print(f"[SPLIT] Detected chronological overlap for assets: {bad_assets} — re-splitting 80/10/10 by time.")
+        union = pd.concat([
+            train_df.assign(_orig_split="train"),
+            val_df.assign(_orig_split="val"),
+            test_df.assign(_orig_split="test"),
+        ], axis=0, ignore_index=False).drop_duplicates().copy()
+        union = union.sort_values(["asset","Time"]).drop_duplicates(subset=["asset","Time"], keep="first")
+        train_df, val_df, test_df = _chronological_resplit(union, train_frac=0.8, val_frac=0.1)
+    else:
+        print("[SPLIT] Splits look chronological and non-overlapping.")
+
+    return train_df, val_df, test_df
 
 # -----------------------------------------------------------------------
 # Calendar features (help the model learn intraday/weekly seasonality)
@@ -2143,11 +2250,11 @@ if __name__ == "__main__":
 
     VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=VOL_QUANTILES,
-        underestimation_factor=1.0, #1.1115   # you can keep your scheduler on this
+        underestimation_factor=1.1115, #1.1115   # you can keep your scheduler on this
         mean_bias_weight=0.0,          # or small value if you want median centering
         tail_q=0.85,
         tail_weight=1.0,               # set >0 if you want extra tail emphasis
-        qlike_weight=0.20,             # << QLIKE back in (tune 0.1–0.3)
+        qlike_weight=0.25,             # << QLIKE back in (tune 0.1–0.3)
         reduction="mean",
     )
     from pytorch_forecasting.metrics import MultiLoss
@@ -2162,7 +2269,7 @@ if __name__ == "__main__":
 
 
     FIXED_VOL_WEIGHT = 1.0
-    FIXED_DIR_WEIGHT = 0.25
+    FIXED_DIR_WEIGHT = 0.15g
  
 
     tft = TemporalFusionTransformer.from_dataset(
