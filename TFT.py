@@ -1831,7 +1831,6 @@ def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
     # Take median (index 3 in VOL_QUANTILES)
     return vol_q[..., 3]
 
-
 def _evaluate_decoded_metrics(
     model,
     ds: TimeSeriesDataSet,
@@ -1846,7 +1845,7 @@ def _evaluate_decoded_metrics(
     Compute decoded MAE, RMSE, DirBCE and QLIKE on up to `max_batches`.
     Returns: (mae, rmse, dir_bce, val_loss, n) with `val_loss == QLIKE`.
     """
-    # Robustly resolve the SAME GroupNormalizer used in training
+    # --- Resolve the same GroupNormalizer used in training ---
     if vol_norm is None:
         try:
             ds_model = getattr(model, "dataset", None)
@@ -1868,13 +1867,6 @@ def _evaluate_decoded_metrics(
         pin_memory=pin_memory,
     )
 
-    # Resolve the correct GroupNormalizer to decode with (prefer the dataset's own)
-    if vol_norm is None:
-        try:
-            vol_norm = _extract_norm_from_dataset(ds)
-        except Exception as _e:
-            print(f"[FI DEBUG] could not extract normalizer from dataset: {_e}")
-
     try:
         model_device = next(model.parameters()).device
     except Exception:
@@ -1892,14 +1884,11 @@ def _evaluate_decoded_metrics(
                 x, y = batch[0], batch[1]
             else:
                 x, y = batch, None
-
             if not isinstance(x, dict):
                 continue
 
             # groups
-            g = x.get("groups")
-            if g is None:
-                g = x.get("group_ids")
+            g = x.get("groups") or x.get("group_ids")
             if isinstance(g, (list, tuple)):
                 g = g[0] if g else None
             if torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
@@ -1930,12 +1919,11 @@ def _evaluate_decoded_metrics(
                             if v.ndim == 2 and v.size(-1) == 1:
                                 v = v[:, 0]
                             locals()[ref] = v
-                    return (yv if torch.is_tensor(yv) else None, yd if torch.is_tensor(yd) else None)
+                    return (yv if torch.is_tensor(yv) else None,
+                            yd if torch.is_tensor(yd) else None)
                 return None, None
 
-            dec_t = x.get("decoder_target")
-            if dec_t is None:
-                dec_t = x.get("target")
+            dec_t = x.get("decoder_target") or x.get("target")
             y_vol, y_dir = _extract(dec_t)
             if (y_vol is None or (y_dir is None and y is not None)) and y is not None:
                 yv2, yd2 = _extract(y)
@@ -1945,30 +1933,26 @@ def _evaluate_decoded_metrics(
                 continue
 
             # forward
-            x_dev = {k: (v.to(model_device, non_blocking=True) if torch.is_tensor(v)
-                         else [vv.to(model_device, non_blocking=True) if torch.is_tensor(vv) else vv for vv in v]
-                         if isinstance(v, (list, tuple)) else v)
-                     for k, v in x.items()}
-
+            x_dev = {
+                k: (v.to(model_device, non_blocking=True) if torch.is_tensor(v)
+                    else [vv.to(model_device, non_blocking=True) if torch.is_tensor(vv) else vv for vv in v]
+                    if isinstance(v, (list, tuple)) else v)
+                for k, v in x.items()
+            }
             y_hat = model(x_dev)
-
-            # after:
-            # y_hat = model(x_dev)
             pred = getattr(y_hat, "prediction", y_hat)
             if isinstance(pred, dict) and "prediction" in pred:
                 pred = pred["prediction"]
 
-            # Use shared head extractor (consistent with PerAssetMetrics)
+            # heads
             p_vol, p_dir = _extract_heads(pred)
             if p_vol is None:
-                continue  # skip batch if no usable vol head
+                continue
 
-            # ---- decode (force manual inverse to guarantee we get off the encoded scale) ----
+            # ---- decode (manual inverse to avoid silent no-op) ----
             vg   = g.to(model_device).unsqueeze(-1)
             y_enc = y_vol.to(model_device).unsqueeze(-1)
             p_enc = p_vol.to(model_device).unsqueeze(-1)
-
-            # Prefer manual inverse; PF decode signatures vary and can silently no-op
             try:
                 y_dec = manual_inverse_transform_groupnorm(vol_norm, y_enc, vg).squeeze(-1)
                 p_dec = manual_inverse_transform_groupnorm(vol_norm, p_enc, vg).squeeze(-1)
@@ -1977,20 +1961,21 @@ def _evaluate_decoded_metrics(
                 y_dec = safe_decode_vol(y_enc, vol_norm, vg).squeeze(-1)
                 p_dec = safe_decode_vol(p_enc, vol_norm, vg).squeeze(-1)
 
-            # One-time scale sanity print
+            # one-time sanity print
             if b_idx == 0:
                 try:
                     tfm = getattr(vol_norm, "transformation", None)
-                    print(f"[FI DEBUG] using transformation='{tfm}' | y_enc_mean={y_enc.mean().item():.6f} | y_dec_mean={y_dec.mean().item():.6f}")
+                    print(f"[FI DEBUG] using transformation='{tfm}' | "
+                          f"y_enc_mean={y_enc.mean().item():.6f} | "
+                          f"y_dec_mean={y_dec.mean().item():.6f}")
                 except Exception:
                     pass
 
-            # clamp floor; NO calibration in PI
+            # clamp
             floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
             y_dec = torch.clamp(y_dec, min=floor_val)
             p_dec = torch.clamp(p_dec, min=floor_val)
 
-            # collect for metrics exactly as you already do
             y_all.append(y_dec.detach().cpu())
             p_all.append(p_dec.detach().cpu())
             if torch.is_tensor(y_dir) and torch.is_tensor(p_dir):
@@ -2013,28 +1998,24 @@ def _evaluate_decoded_metrics(
     ratio = sigma2_y / sigma2_p
     qlike = (ratio - torch.log(ratio) - 1.0).mean().item()
 
-    dir_bce = float("nan")  # actually Brier score
+    dir_bce = float("nan")
     if yd_all and pd_all:
         yd, pd = torch.cat(yd_all).float(), torch.cat(pd_all)
         try:
             if torch.isfinite(pd).any() and (pd.min() < 0 or pd.max() > 1):
-                pd = torch.sigmoid(pd)  # logits → probs
+                pd = torch.sigmoid(pd)
             pd = torch.clamp(pd, 0.0, 1.0)
-            # same smoothing used in training, for stability
             y_smooth = yd * 0.9 + 0.05
             dir_bce_t = ((pd - y_smooth) ** 2).mean()
             dir_bce = float(dir_bce_t.item())
         except Exception:
             pass
-    
-    # Scale guard: if decoded MAE still looks encoded (~0.03–0.06), warn once
-    try:
-        if mae > 0.01:
-            print(f"[FI DEBUG] WARNING: decoded MAE={mae:.6f} still large; check group-ids alignment and that the normalizer matches the FI dataset.")
-    except Exception:
-        pass
 
-    # return QLIKE as val_loss
+    # scale guard
+    if mae > 0.01:
+        print(f"[FI DEBUG] WARNING: decoded MAE={mae:.6f} still large; "
+              "check group-ids alignment and that the normalizer matches the FI dataset.")
+
     return float(mae), float(rmse), float(dir_bce), float(qlike), int(y.numel())
 
 # --- after trainer.fit(...), before running FI ---
@@ -2069,8 +2050,6 @@ def _resolve_best_model(trainer, fallback):
             print(f"[WARN] load_from_checkpoint failed: {e}")
     return fallback
 
-
-
 def run_permutation_importance(
     model,
     template_ds,
@@ -2082,24 +2061,26 @@ def run_permutation_importance(
     num_workers: int,
     prefetch: int,
     pin_memory: bool,
-    vol_norm,                       # 👈 NEW: pass the train/val vol normalizer explicitly
+    vol_norm,                       # 👈 pass explicit normalizer
     out_csv_path: str,
     uploader,
-    build_ds_fn=lambda: None,       # kept for compatibility; unused now
+    build_ds_fn=lambda: None,       # compatibility; unused
 ) -> None:
     """
     Compute permutation importance by **decoded** validation loss:
         val_loss = QLIKE (on decoded realised_vol).
-    We also report decoded MAE/RMSE and Brier (direction), all computed consistently
-    with `_evaluate_decoded_metrics`.
+    Reports decoded MAE, RMSE, Brier for direction.
     """
 
-    # Build the baseline dataset once off the provided template
+    # --- Baseline dataset ---
     ds_base = TimeSeriesDataSet.from_dataset(
-        template_ds, base_df, predict=False, stop_randomization=True
+        template_ds,
+        base_df,
+        predict=False,
+        stop_randomization=True,
     )
 
-    # ---- Baseline (decoded) ----
+    # --- Baseline metrics ---
     b_mae, b_rmse, b_dir, b_val, n_base = _evaluate_decoded_metrics(
         model=model,
         ds=ds_base,
@@ -2108,24 +2089,28 @@ def run_permutation_importance(
         num_workers=num_workers,
         prefetch=prefetch,
         pin_memory=pin_memory,
-        vol_norm=vol_norm,   # 👈 ensure decoded
+        vol_norm=vol_norm,  # 👈 ensure decoded
     )
 
     print(f"[FI] Dataset size (samples): {len(base_df)} | batch_size={batch_size}")
-    print(f"[FI] Baseline val_loss = {b_val:.6f} (MAE={b_mae:.6f}, RMSE={b_rmse:.6f}, Brier={b_dir:.6f}) | N={n_base}")
-    print("[FI DEBUG] scale check: expecting decoded MAE similar to validation callback "
-          f"(e.g., ~0.001–0.003). Got MAE={b_mae:.6f}, QLIKE={b_val:.6f}")
+    print(f"[FI] Baseline val_loss = {b_val:.6f} "
+          f"(MAE={b_mae:.6f}, RMSE={b_rmse:.6f}, Brier={b_dir:.6f}) | N={n_base}")
+    print(f"[FI DEBUG] scale check: expecting decoded MAE ≈ validation (~0.001–0.003). "
+          f"Got MAE={b_mae:.6f}, QLIKE={b_val:.6f}")
 
     rows = []
     work_df = base_df.copy()
 
+    # --- Permutation loop ---
     for feat in features:
         df_perm = work_df.copy()
         _permute_series_inplace(df_perm, feat, block=block_size, group_col="asset")
 
-        # Rebuild dataset for the permuted feature column
         ds_perm = TimeSeriesDataSet.from_dataset(
-            template_ds, df_perm, predict=False, stop_randomization=True
+            template_ds,
+            df_perm,
+            predict=False,
+            stop_randomization=True,
         )
 
         p_mae, p_rmse, p_dir, p_val, n_p = _evaluate_decoded_metrics(
@@ -2136,14 +2121,12 @@ def run_permutation_importance(
             num_workers=num_workers,
             prefetch=prefetch,
             pin_memory=pin_memory,
-            vol_norm=vol_norm,   # 👈 ensure decoded
+            vol_norm=vol_norm,  # 👈 ensure decoded
         )
 
         delta = p_val - b_val
-        print(
-            f"[FI] {feat:>20s} | val_p={p_val:.6f} | Δ={delta:+.6f} | "
-            f"(MAE={p_mae:.6f}, RMSE={p_rmse:.6f}, Brier={p_dir:.6f})"
-        )
+        print(f"[FI] {feat:>20s} | val_p={p_val:.6f} | Δ={delta:+.6f} | "
+              f"(MAE={p_mae:.6f}, RMSE={p_rmse:.6f}, Brier={p_dir:.6f})")
 
         rows.append({
             "feature": feat,
@@ -2156,7 +2139,7 @@ def run_permutation_importance(
             "n": int(n_p),
         })
 
-    # Save CSV locally and (optionally) upload
+    # --- Save CSV and upload ---
     try:
         out_df = pd.DataFrame(rows)
         out_df.to_csv(out_csv_path, index=False)
@@ -2626,19 +2609,16 @@ if __name__ == "__main__":
 
     # Train the model
     trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
+
+    # Resolve the best checkpoint
     model_for_fi = _resolve_best_model(trainer, fallback=tft)
-    # --- Extract the training-time volatility normalizer ---
-    train_vol_norm = None
+
+    # Extract the same normalizer used for volatility during training
     try:
-        tn = training_dataset.get_parameters().get("target_normalizer", None)
-        if tn is not None:
-            # handle GroupNormalizer or direct normalizer
-            train_vol_norm = tn.normalizers[0] if hasattr(tn, "normalizers") else tn
-    except Exception:
-        pass
-    if train_vol_norm is None:
-        train_vol_norm = _extract_norm_from_dataset(training_dataset)
-    # Run FI permutation testing if enabled
+        train_vol_norm = _extract_norm_from_dataset(train_dataset)
+    except Exception as e:
+        print(f"[WARN] could not extract vol_norm from training dataset: {e}")
+        train_vol_norm = None
     # ---- Permutation Importance (decoded) ----
 if ENABLE_FEATURE_IMPORTANCE:
     fi_csv = str(LOCAL_OUTPUT_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")
