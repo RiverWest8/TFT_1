@@ -1903,9 +1903,43 @@ def _evaluate_decoded_metrics(
     # return QLIKE as val_loss
     return float(mae), float(rmse), float(dir_bce), float(qlike), int(y.numel())
 
+# --- after trainer.fit(...), before running FI ---
+def _resolve_best_model(trainer, fallback):
+    # try any ModelCheckpoint attached to the trainer
+    best_path = None
+    try:
+        for cb in getattr(trainer, "callbacks", []):
+            if isinstance(cb, ModelCheckpoint) and getattr(cb, "best_model_path", ""):
+                best_path = cb.best_model_path
+                if best_path:
+                    break
+    except Exception:
+        pass
+
+    # fallback to newest local ckpt
+    if not best_path:
+        try:
+            ckpts = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
+            if ckpts:
+                best_path = str(ckpts[0])
+        except Exception:
+            pass
+
+    # load or return the in-memory model
+    if best_path:
+        try:
+            print(f"Best checkpoint: {best_path}")
+            return TemporalFusionTransformer.load_from_checkpoint(best_path)
+        except Exception as e:
+            print(f"[WARN] load_from_checkpoint failed: {e}")
+    return fallback
+
+
+
 
 def run_permutation_importance(
-    model,
+    model = fi_model,
     template_ds : TimeSeriesDataSet,
     base_df: pd.DataFrame,
     features: List[str],
@@ -1926,7 +1960,6 @@ def run_permutation_importance(
     """
     ds_base = TimeSeriesDataSet.from_dataset(template_ds, base_df, predict=False, stop_randomization=True)
     train_vol_norm = _extract_norm_from_dataset(template_ds)
-    max_batches = 50
     try:
         print(f"[FI] Dataset size (samples): {len(ds_base)} | batch_size={batch_size}")
     except Exception:
@@ -2429,7 +2462,7 @@ if __name__ == "__main__":
 
     # Train the model
     trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
-
+    model_for_fi = _resolve_best_model(trainer, fallback=tft)
     # Run FI permutation testing if enabled
     if ENABLE_FEATURE_IMPORTANCE:
         fi_csv = str(LOCAL_OUTPUT_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")
@@ -2437,13 +2470,13 @@ if __name__ == "__main__":
         # (optional) drop calendar features from FI to focus on learned signals
         feats = [f for f in feats if f not in ("sin_tod", "cos_tod", "sin_dow", "cos_dow", "Is_Weekend")]
         run_permutation_importance(
-            model=tft,
+            model= model_for_fi,
             template_ds = training_dataset,            # << use train template
             base_df=val_df,
             features=feats,
             block_size=int(PERM_BLOCK_SIZE) if PERM_BLOCK_SIZE else 1,
             batch_size=256,
-            max_batches=int(FI_MAX_BATCHES) if FI_MAX_BATCHES else 20,
+            max_batches=int(FI_MAX_BATCHES) if FI_MAX_BATCHES else 40,
             num_workers=4,
             prefetch=2,
             pin_memory=pin,
