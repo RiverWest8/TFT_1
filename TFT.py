@@ -1911,11 +1911,17 @@ def _evaluate_decoded_metrics(
 
     def _cand_median_from_pred(pred_t):
         """
-        Generate candidate encoded medians from different plausible layouts.
-        Returns list of (name, p_med_B_encoded)
+        Generate candidate medians from plausible layouts.
+        Returns list of (name, p_med_B, is_encoded)
+        • p_med_B is the median series
+        • is_encoded tells caller if it still needs decoding
         """
         K = 7
         cands = []
+
+        def _add(name, tensor, encoded=True):
+            if torch.is_tensor(tensor):
+                cands.append((name, _point_from_quantiles(tensor), encoded))
 
         if isinstance(pred_t, (list, tuple)):
             vol = pred_t[0] if len(pred_t) > 0 else None
@@ -1926,37 +1932,35 @@ def _evaluate_decoded_metrics(
                 if v.ndim == 3 and v.size(1) == 1: v = v[:, 0, :]       # [B, D]
                 if v.ndim == 3 and v.size(-1) == 1: v = v.squeeze(-1)   # [B, ?]
                 if v.ndim == 2 and v.size(-1) >= K:
-                    cands.append(("list_vol_BK", _point_from_quantiles(v[:, :K])))
+                    _add("list_vol_BK", v[:, :K], True)
                 elif v.ndim == 2 and v.size(-1) == 1:
-                    # unlikely to be vol; skip
-                    pass
+                    # could be already decoded median
+                    _add("list_vol_single", v[:, 0:1], False)
 
         if torch.is_tensor(pred_t):
             t = pred_t
             # try to peel a singleton pred_len dim
             if t.ndim == 4 and t.size(1) == 1:
-                t = t.squeeze(1)  # [B, C, D]
+                t = t.squeeze(1)
             if t.ndim == 3 and t.size(1) == 1:
-                t = t[:, 0, :]    # [B, D]
+                t = t[:, 0, :]
 
-            # [B, 2, K] → first is vol quantiles
             if t.ndim == 3 and t.size(1) == 2 and t.size(-1) >= K:
-                vol_q = t[:, 0, :K]
-                cands.append(("B2K_vol_first", _point_from_quantiles(vol_q)))
+                _add("B2K_vol_first", t[:, 0, :K], True)
 
-            # [B, K+1] → first K vol, last 1 dir
             if t.ndim == 2 and t.size(-1) >= K + 1:
-                vol_q = t[:, :K]
-                cands.append(("BK_plus1", _point_from_quantiles(vol_q)))
+                _add("BK_plus1", t[:, :K], True)
 
-            # [B, K] → pure vol quantiles
             if t.ndim == 2 and t.size(-1) == K:
-                cands.append(("BK_exact", _point_from_quantiles(t)))
+                _add("BK_exact", t, True)
 
-            # fallback: flatten and try first K as quantiles
+            if t.ndim == 2 and t.size(-1) == 1:
+                # direct decoded median?
+                _add("B1_decoded", t, False)
+
             if t.ndim >= 2 and t.reshape(t.size(0), -1).size(-1) >= K:
                 flat = t.reshape(t.size(0), -1)
-                cands.append(("flat_firstK", _point_from_quantiles(flat[:, :K])))
+                _add("flat_firstK", flat[:, :K], True)
 
         return cands
 
@@ -2041,13 +2045,13 @@ def _evaluate_decoded_metrics(
                 candidates = _cand_median_from_pred(pred)
                 best = None
                 best_name, best_p_dec = None, None
-                for name, p_med_enc in candidates:
-                    p_dec_try = _decode(p_med_enc, g_B)
-                    mae_try = (p_dec_try - y_dec).abs().mean().item()
-                    if (best is None) or (mae_try < best):
-                        best = mae_try
-                        best_name = name
-                        best_p_dec = p_dec_try
+            for name, p_med_enc, encoded in candidates:
+                p_dec_try = _decode(p_med_enc, g_B) if encoded else p_med_enc
+                mae_try = (p_dec_try - y_dec).abs().mean().item()
+                if (best is None) or (mae_try < best):
+                    best = mae_try
+                    best_name = name
+                    best_p_dec = p_dec_try
                 if best_name is None:
                     # fall back to original extractor as last resort
                     p_med_enc_fallback, _ = _extract_heads(pred)
@@ -2070,9 +2074,10 @@ def _evaluate_decoded_metrics(
                 p_dec = best_p_dec
             else:
                 # re-create the chosen candidate
-                cands = dict(_cand_median_from_pred(pred))
+                cands = {n: (t, e) for n, t, e in _cand_median_from_pred(pred)}
                 if chosen_case in cands:
-                    p_dec = _decode(cands[chosen_case], g_B)
+                    t, encoded = cands[chosen_case]
+                    p_dec = _decode(t, g_B) if encoded else t
                 else:
                     # layout changed? fall back
                     p_med_enc_fallback, _ = _extract_heads(pred)
@@ -2900,14 +2905,21 @@ print(f"Best checkpoint (local or remote): {best_model_path}")
 # -----------------------------------------------------------------------
 # Save Standard Variable Importance
 # -----------------------------------------------------------------------
+try:
+    feature_names = (
+        training_dataset.encoder_variables
+        + training_dataset.decoder_variables
+        + training_dataset.static_categoricals
+    )
+except Exception:
+    feature_names = None
+
 save_standard_variable_importance(
     best_model,
     val_dataloader,
     out_csv_path="standard_variable_importance.csv",
     uploader=upload_file_to_gcs,
-    feature_names=best_model.dataset.encoder_variables
-                  + best_model.dataset.decoder_variables
-                  + best_model.dataset.static_categoricals
+    feature_names=feature_names,
 )
 
 
