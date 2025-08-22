@@ -2323,36 +2323,219 @@ def run_permutation_importance(
 # Standard Variable Importance (SVI) via TFT.interpret_output
 # -----------------------------------------------------------------------
 
+@torch.no_grad()
 def save_standard_variable_importance(
     model,
-    val_dataloader,
-    out_csv_path: str,
-    uploader,
-    feature_names: list[str] | None = None,
+    dataloader,
+    ds,                                # pass your validation_dataset here
+    out_csv_path="standard_variable_importance.csv",
+    uploader=None,
+    min_samples: int = 10_000,         # target number of samples to aggregate
+    max_batches: int | None = None     # optional hard cap on batches
 ):
     """
-    Computes TFT's built-in standard variable importance (encoder/decoder/static)
-    using `interpret_output` and saves a tidy CSV with columns:
-      variable, encoder_importance, decoder_importance, static_importance, total
-    Also uploads to GCS via `uploader`.
+    Compute Standard Variable Importance (SVI) by averaging PF's interpret_output
+    across many batches until we have at least `min_samples` examples (or the
+    dataloader is exhausted). Works across PF versions that return dicts/tuples.
+
+    We gather three groups (if available):
+      - encoder variable importance
+      - decoder variable importance
+      - static variable importance
     """
-    try:
-        # Run prediction in raw mode to get interpretable outputs
-        raw_predictions, x = model.predict(val_dataloader, mode="raw", return_x=True)
-        interp = model.interpret_output(raw_predictions, reduction="mean")
-    except Exception as e:
-        print(f"[SVI] Failed to compute interpret_output: {e}")
+    import numpy as np
+    import pandas as pd
+    import torch
+
+    model.eval()
+
+    # ---- utils ----
+    def _move_to_device(x, device):
+        if isinstance(x, dict):
+            out = {}
+            for k, v in x.items():
+                if torch.is_tensor(v):
+                    out[k] = v.to(device, non_blocking=True)
+                elif isinstance(v, (list, tuple)):
+                    out[k] = [vv.to(device, non_blocking=True) if torch.is_tensor(vv) else vv for vv in v]
+                else:
+                    out[k] = v
+            return out
+        return x
+
+    def _get_any(d, keys, default=None):
+        for k in keys:
+            if k in d and d[k] is not None:
+                return d[k]
+        return default
+
+    def _norm_out(out_obj):
+        # normalise PF interpret_output return to a dict
+        if isinstance(out_obj, dict):
+            return out_obj
+        if isinstance(out_obj, (list, tuple)):
+            for o in out_obj:
+                if isinstance(o, dict):
+                    return o
+            # fallback: wrap positional outputs (rare)
+            return {"attention": out_obj}
+        return {}
+
+    def _to_numpy_1d(a):
+        if a is None:
+            return None
+        if isinstance(a, torch.Tensor):
+            a = a.detach().cpu()
+        a = np.asarray(a)
+        # PF often returns [B, n_vars] for reduction='none' → average over B
+        if a.ndim == 2:
+            a = a.mean(axis=0)
+        elif a.ndim > 2:
+            # collapse batch-ish dims
+            new = a.reshape(-1, a.shape[-1]).mean(axis=0)
+            a = new
+        return a.astype(float).ravel()
+
+    # names from the dataset (never rely on model.dataset)
+    enc_names = list(getattr(ds, "encoder_variables", []) or [])
+    dec_names = list(getattr(ds, "decoder_variables", []) or [])
+    stat_names = list(
+        getattr(ds, "static_categoricals", []) or
+        getattr(ds, "static_variables", []) or []
+    )
+
+    device = next(model.parameters()).device
+    n_seen = 0
+
+    # running sums (so we can average at the end)
+    enc_sum = None
+    dec_sum = None
+    stat_sum = None
+
+    it = iter(dataloader)
+    b = 0
+    while True:
+        if max_batches is not None and b >= int(max_batches):
+            break
+        try:
+            batch = next(it)
+        except StopIteration:
+            break
+        b += 1
+
+        # x only; interpret_output will run forward internally
+        x = batch[0] if isinstance(batch, (list, tuple)) else batch
+        if not isinstance(x, dict):
+            continue
+
+        x_dev = _move_to_device(x, device)
+
+        # Prefer reduction='none' so we can average across many batches ourselves.
+        # If PF version errors on that, fall back to 'mean'.
+        try:
+            out = model.interpret_output(x_dev, reduction="none")
+        except Exception:
+            out = model.interpret_output(x_dev, reduction="mean")
+        res = _norm_out(out)
+
+        enc_imp = _get_any(res, ["encoder_variables", "encoder_variable_importance", "encoder_importance"])
+        dec_imp = _get_any(res, ["decoder_variables", "decoder_variable_importance", "decoder_importance"])
+        stat_imp = _get_any(res, ["static_variables", "static_variable_importance", "static_importance"])
+
+        enc_vec = _to_numpy_1d(enc_imp)
+        dec_vec = _to_numpy_1d(dec_imp)
+        stat_vec = _to_numpy_1d(stat_imp)
+
+        # Determine how many samples this batch contributed. With reduction='none'
+        # encoder/decoder often come back as [B, n_vars]; otherwise assume batch size.
+        try:
+            # pick a representative tensor to infer B
+            rep = None
+            for cand in (enc_imp, dec_imp, stat_imp):
+                if isinstance(cand, torch.Tensor) and cand.ndim >= 2:
+                    rep = cand
+                    break
+            if rep is None and isinstance(enc_imp, torch.Tensor):
+                rep = enc_imp
+            if rep is None and isinstance(dec_imp, torch.Tensor):
+                rep = dec_imp
+            if rep is None and isinstance(stat_imp, torch.Tensor):
+                rep = stat_imp
+            if isinstance(rep, torch.Tensor) and rep.ndim >= 2:
+                contrib = rep.shape[0]
+            else:
+                # fallback to batch size if we can find it in x
+                contrib = None
+                for k, v in x.items():
+                    if torch.is_tensor(v) and v.shape[0] > 0:
+                        contrib = v.shape[0]
+                        break
+                if contrib is None:
+                    contrib = 0
+        except Exception:
+            contrib = 0
+
+        # accumulate
+        if enc_vec is not None:
+            if enc_sum is None:
+                enc_sum = np.zeros_like(enc_vec, dtype=float)
+            # align length to names if needed
+            if len(enc_vec) == len(enc_sum):
+                enc_sum += enc_vec
+        if dec_vec is not None:
+            if dec_sum is None:
+                dec_sum = np.zeros_like(dec_vec, dtype=float)
+            if len(dec_vec) == len(dec_sum):
+                dec_sum += dec_vec
+        if stat_vec is not None:
+            if stat_sum is None:
+                stat_sum = np.zeros_like(stat_vec, dtype=float)
+            if len(stat_vec) == len(stat_sum):
+                stat_sum += stat_vec
+
+        n_seen += int(contrib)
+
+        # stop once we hit min_samples
+        if n_seen >= int(min_samples):
+            break
+
+    if n_seen == 0:
+        print("[SVI] No samples aggregated; cannot compute variable importance.")
         return
 
-    # PyTorch Forecasting sometimes nests under "variable_importance", other times top-level
-    vi = interp.get("variable_importance", interp)
+    # average the sums
+    def _avg(vec):
+        return None if vec is None else (vec / max(1, b))
 
-    try:
-        import numpy as np
-        import pandas as pd
-    except Exception as e:
-        print(f"[SVI] pandas/numpy import error: {e}")
+    enc_avg = _avg(enc_sum)
+    dec_avg = _avg(dec_sum)
+    stat_avg = _avg(stat_sum)
+
+    rows = []
+    if enc_avg is not None and len(enc_names) == enc_avg.shape[0]:
+        rows += [{"group": "encoder", "feature": n, "importance": float(v)}
+                 for n, v in zip(enc_names, enc_avg)]
+    if dec_avg is not None and len(dec_names) == dec_avg.shape[0]:
+        rows += [{"group": "decoder", "feature": n, "importance": float(v)}
+                 for n, v in zip(dec_names, dec_avg)]
+    if stat_avg is not None and len(stat_names) == stat_avg.shape[0]:
+        rows += [{"group": "static", "feature": n, "importance": float(v)}
+                 for n, v in zip(stat_names, stat_avg)]
+
+    if not rows:
+        print("[SVI] Parsed no variable importances (shape/name mismatch?).")
         return
+
+    df = pd.DataFrame(rows).sort_values(["group", "importance"], ascending=[True, False])
+    df.to_csv(out_csv_path, index=False)
+    print(f"[SVI] wrote {out_csv_path} | batches={b} | aggregated_samples≈{n_seen}")
+
+    if uploader is not None:
+        try:
+            uploader(out_csv_path, f"{GCS_OUTPUT_PREFIX}/{Path(out_csv_path).name}")
+        except Exception as e:
+            print(f"[SVI] upload failed: {e}")
+
 
     # Get names from model dataset if available
     names = getattr(model.dataset, "encoder_variables", None)
@@ -2952,9 +3135,11 @@ except Exception:
 save_standard_variable_importance(
     best_model,
     val_dataloader,
-    out_csv_path="standard_variable_importance.csv",
+    ds=validation_dataset,                                # names come from dataset
+    out_csv_path=str(LOCAL_OUTPUT_DIR / "standard_variable_importance.csv"),
     uploader=upload_file_to_gcs,
-    feature_names=feature_names,
+    min_samples=10_000,                                   # ← your requirement
+    max_batches=None                                      # or set e.g. 60 as a guard
 )
 
 
