@@ -871,7 +871,7 @@ class PerAssetMetrics(pl.Callback):
                 yv_dec = self.vol_norm.decode(yv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
                 pv_dec = self.vol_norm.decode(pv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
                 # Apply the same calibration used in metrics so saved preds match the plots
-                pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
+                #pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
                 # map group id -> name
                 assets = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
                 # time index (may be missing)
@@ -1862,7 +1862,7 @@ def _evaluate_decoded_metrics(
             p_dec = torch.clamp(p_dec, min=floor_val)
 
             # Optional: light calibration to correct residual scale bias
-            p_dec = calibrate_vol_predictions(y_dec, p_dec)
+            #p_dec = calibrate_vol_predictions(y_dec, p_dec)
 
             y_all.append(y_dec.detach().cpu())
             p_all.append(p_dec.detach().cpu())
