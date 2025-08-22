@@ -2095,20 +2095,22 @@ def _evaluate_decoded_metrics(
                 if chosen_case == "extract_heads":
                     p_enc_extr, _ = _extract_heads(pred)
                     if p_enc_extr is None:
+                        # skip this batch
                         continue
                     p_dec = _decode(p_enc_extr, g_B)
                 else:
-                    cand_map = dict(_cand_median_from_pred(pred))
+                    cand_map = {n: t for n, t, _ in _cand_median_from_pred(pred)}
                     if chosen_case in cand_map:
                         p_dec = _decode(cand_map[chosen_case], g_B)
                     else:
                         # layout changed? fall back to extractor
                         p_enc_extr, _ = _extract_heads(pred)
                         if p_enc_extr is None:
+                            # skip this batch
                             continue
                         p_dec = _decode(p_enc_extr, g_B)
-        else:
-            # re-create the chosen candidate
+
+            # re-create the chosen candidate if needed
             cands = {n: (t, e) for n, t, e in _cand_median_from_pred(pred)}
             if chosen_case in cands:
                 t, encoded = cands[chosen_case]
@@ -2117,8 +2119,10 @@ def _evaluate_decoded_metrics(
                 # layout changed? fall back
                 p_med_enc_fallback, _ = _extract_heads(pred)
                 if p_med_enc_fallback is None:
-                    pass
+                    # skip this batch
+                    continue
                 p_dec = _decode(p_med_enc_fallback, g_B)
+
 
             # clamp tiny values to global floor; no calibration inside FI
             floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
