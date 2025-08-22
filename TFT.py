@@ -187,6 +187,7 @@ def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
     return vol_q[..., 3]  # Q50_IDX
 
 #EXTRACT HEADSSSSS
+
 def _extract_heads(pred):
     """
     Return (p_vol, p_dir) as 1D tensors [B] on DEVICE.
@@ -307,7 +308,34 @@ def _extract_heads(pred):
     return None, None
 
 
-    
+@torch.no_grad()
+def _extract_heads_with_dump(pred, dump: bool = True, max_items: int = 5):
+    """
+    Same as _extract_heads but optionally dumps the full 7 quantiles + direction
+    for the first few samples to debug parsing.
+    """
+    p_vol, p_dir = _extract_heads(pred)
+
+    if dump and p_vol is not None and torch.is_tensor(pred):
+        try:
+            t = pred
+            if isinstance(t, (list, tuple)):
+                t = t[0]  # just grab vol part
+            flat = t.reshape(t.size(0), -1)
+            K = min(flat.size(-1), 7)
+            qvals = flat[:max_items, :K].detach().cpu().numpy()
+            print(f"[HEAD DUMP] first {max_items} samples, 7 quantiles:")
+            for i, row in enumerate(qvals):
+                print(f"  sample {i}: " + " ".join(f"{v:.6f}" for v in row))
+            if flat.size(-1) > 7:
+                extra = flat[:max_items, 7:].detach().cpu().numpy()
+                print(f"[HEAD DUMP] extra columns (possible dir head):")
+                for i, row in enumerate(extra):
+                    print(f"  sample {i}: " + " ".join(f"{v:.6f}" for v in row))
+        except Exception as e:
+            print(f"[HEAD DUMP] failed: {e}")
+
+    return p_vol, p_dir
 
 
 # -----------------------------------------------------------------------
@@ -1929,10 +1957,10 @@ def _fi_decode_diagnostic(
     mae_A, yA, pA = _stats(y_dec_A, p_dec_A)
     mae_B, yB, pB = _stats(y_dec_B, p_dec_B)
     mae_C, yC, pC = _stats(y_dec_C, p_dec_C)
-
+    '''
     print(f"[DIAG {tag}] A: TRAIN norm  → MAE={mae_A:.6f} | mean(y)={yA:.6f} | mean(p)={pA:.6f}")
     print(f"[DIAG {tag}] B: DATASET norm→ MAE={mae_B:.6f} | mean(y)={yB:.6f} | mean(p)={pB:.6f}")
-    print(f"[DIAG {tag}] C: INV-ONLY    → MAE={mae_C:.6f} | mean(y)={yC:.6f} | mean(p)={pC:.6f}")
+    print(f"[DIAG {tag}] C: INV-ONLY    → MAE={mae_C:.6f} | mean(y)={yC:.6f} | mean(p)={pC:.6f}")'''
 
     # Peek a few per-group params for both norms
     peek_A = _peek_norm_params(vol_norm_train, g_B)
@@ -2152,11 +2180,26 @@ def _evaluate_decoded_metrics(
                 )
                 for k, v in x.items()
             }
+            '''
             y_hat = model(x_dev)
             pred = getattr(y_hat, "prediction", y_hat)
             if isinstance(pred, dict) and "prediction" in pred:
-                pred = pred["prediction"]
-        
+                pred = pred["prediction"]'''
+
+            #Troubleshoot can be deleted after
+            for b_idx, (x, y) in enumerate(val_dl):
+                # move inputs to device
+                x_dev = {k: v.to(model_device, non_blocking=True) if torch.is_tensor(v) else v
+                        for k, v in x.items()}
+
+                y_hat = model(x_dev)
+                pred = getattr(y_hat, "prediction", y_hat)
+                if isinstance(pred, dict) and "prediction" in pred:
+                    pred = pred["prediction"]
+
+                # only dump for the first batch
+                p_vol, p_dir = _extract_heads_with_dump(pred, dump=(b_idx == 0))
+                    
 
             # decode target for this batch once
             g_B = g  # [B]
