@@ -1939,7 +1939,7 @@ def _resolve_best_model(trainer, fallback):
 
 
 def run_permutation_importance(
-    model = fi_model,
+    model,
     template_ds : TimeSeriesDataSet,
     base_df: pd.DataFrame,
     features: List[str],
