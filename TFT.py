@@ -2057,8 +2057,8 @@ def _evaluate_decoded_metrics(
 
                 # 3) pick the one that minimises decoded MAE on this batch
                 best_name, best_p_dec, best_mae = None, None, float("inf")
-                for name, p_med_enc in candidates:
-                    p_try = _decode(p_med_enc, g_B)  # candidates are encoded medians
+                for name, p_med_enc, encoded in candidates:
+                    p_try = _decode(p_med_enc, g_B) if encoded else p_med_enc
                     mae_try = (p_try - y_dec).abs().mean().item()
                     if mae_try < best_mae:
                         best_mae = mae_try
