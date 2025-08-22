@@ -654,7 +654,12 @@ class PerAssetMetrics(pl.Callback):
         # --- Decode realised_vol to physical scale (robust to PF version)
         yv_dec = safe_decode_vol(yv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
         pv_dec = safe_decode_vol(pv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
-        pv_dec = torch.clamp(pv_dec, min=2e-7)  # avoid zero in QLIKE
+
+        # Guard against near-zero decoded vols (use global floor if defined)
+        floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
+        yv_dec = torch.clamp(yv_dec, min=floor_val)
+        pv_dec = torch.clamp(pv_dec, min=floor_val)
+
 
         # Debug prints
         print("DEBUG transformation:", getattr(self.vol_norm, "transformation", None))
@@ -1850,7 +1855,13 @@ def _evaluate_decoded_metrics(
 
             y_dec = safe_decode_vol(y_vol.to(model_device).unsqueeze(-1), vol_norm, g.to(model_device).unsqueeze(-1)).squeeze(-1)
             p_dec = safe_decode_vol(p_vol.to(model_device).unsqueeze(-1), vol_norm, g.to(model_device).unsqueeze(-1)).squeeze(-1)
-            p_dec = torch.clamp(p_dec, min=1e-8)
+
+            # Guard against near-zero decoded vols that can explode QLIKE
+            floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
+            y_dec = torch.clamp(y_dec, min=floor_val)
+            p_dec = torch.clamp(p_dec, min=floor_val)
+
+            # Optional: light calibration to correct residual scale bias
             p_dec = calibrate_vol_predictions(y_dec, p_dec)
 
             y_all.append(y_dec.detach().cpu())
@@ -1980,64 +1991,59 @@ def save_standard_variable_importance(
     Also uploads to GCS via `uploader`.
     """
     try:
-        # Get raw predictions for interpretation
+        # Run prediction in raw mode to get interpretable outputs
         raw_predictions, x = model.predict(val_dataloader, mode="raw", return_x=True)
         interp = model.interpret_output(raw_predictions, reduction="mean")
     except Exception as e:
         print(f"[SVI] Failed to compute interpret_output: {e}")
         return
 
-    # PyTorch Forecasting usually returns a dict with these keys either in the
-    # top-level or under "variable_importance" depending on version.
+    # PyTorch Forecasting sometimes nests under "variable_importance", other times top-level
     vi = interp.get("variable_importance", interp)
 
     try:
-        import numpy as _np
-        import pandas as _p
+        import numpy as np
+        import pandas as pd
     except Exception as e:
         print(f"[SVI] pandas/numpy import error: {e}")
         return
 
-    # Try to get variable names from the interpretation. If not present, fall back
-    # to provided `feature_names`.
-    names = vi.get("variable_names") if isinstance(vi, dict) else None
+    # Get names from model dataset if available
+    names = getattr(model.dataset, "encoder_variables", None)
+    if names is None and isinstance(vi, dict) and "variable_names" in vi:
+        names = vi["variable_names"]
     if names is None and feature_names is not None:
-        names = list(feature_names)
+        names = feature_names
 
-    enc = _np.array(vi.get("encoder_variable_importance", [])) if isinstance(vi, dict) else _np.array([])
-    dec = _np.array(vi.get("decoder_variable_importance", [])) if isinstance(vi, dict) else _np.array([])
-    sta = _np.array(vi.get("static_variable_importance",  [])) if isinstance(vi, dict) else _np.array([])
+    enc = np.array(vi.get("encoder_variable_importance", [])) if isinstance(vi, dict) else np.array([])
+    dec = np.array(vi.get("decoder_variable_importance", [])) if isinstance(vi, dict) else np.array([])
+    sta = np.array(vi.get("static_variable_importance", [])) if isinstance(vi, dict) else np.array([])
 
-    # Normalise shapes and lengths
-    max_len = max(len(enc) if enc.ndim else 0, len(dec) if dec.ndim else 0, len(sta) if sta.ndim else 0)
+    # Align arrays
+    max_len = max(len(enc), len(dec), len(sta))
     if names is None:
         names = [f"var_{i}" for i in range(max_len)]
-    else:
-        # pad/truncate importance arrays to match names
-        max_len = max(max_len, len(names))
+
     def _fix(arr, L):
-        if arr.ndim == 0:
-            arr = _np.zeros((0,), dtype=float)
+        arr = np.array(arr, dtype=float).flatten()
         if len(arr) < L:
-            arr = _np.pad(arr, (0, L - len(arr)), mode='constant')
+            arr = np.pad(arr, (0, L - len(arr)), mode="constant")
         elif len(arr) > L:
             arr = arr[:L]
         return arr
 
-    L = max(len(names), max_len)
-    enc = _fix(enc, L)
-    dec = _fix(dec, L)
-    sta = _fix(sta, L)
+    L = max(max_len, len(names))
+    enc, dec, sta = (_fix(enc, L), _fix(dec, L), _fix(sta, L))
     if len(names) < L:
         names = names + [f"var_{i}" for i in range(len(names), L)]
 
     total = enc + dec + sta
 
-    df_vi = _p.DataFrame({
+    df_vi = pd.DataFrame({
         "variable": names,
         "encoder_importance": enc,
         "decoder_importance": dec,
-        "static_importance":  sta,
+        "static_importance": sta,
         "total": total,
     }).sort_values("total", ascending=False)
 
@@ -2085,6 +2091,12 @@ if __name__ == "__main__":
         df["rv_scale"] = df["asset"].map(asset_scale_map)
         # If an asset appears only in val/test, fall back to overall median
         df["rv_scale"].fillna(asset_scale_map.median(), inplace=True)
+    # Global decoded-scale floor for vol (prevents QLIKE blow-ups on near-zero preds)
+    try:
+        EVAL_VOL_FLOOR = max(1e-8, float(asset_scales["rv_scale"].median() * 0.02))
+    except Exception:
+        EVAL_VOL_FLOOR = 1e-8
+    print(f"[EVAL] Global vol floor (decoded) set to {EVAL_VOL_FLOOR:.6g}")
 
     # Add calendar features to all splits
     train_df = add_calendar_features(train_df)
@@ -2303,7 +2315,7 @@ if __name__ == "__main__":
 
     VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=VOL_QUANTILES,
-        underestimation_factor=1.05, #1.1115   # you can keep your scheduler on this
+        underestimation_factor=1.00, #1.1115   # you can keep your scheduler on this
         mean_bias_weight=0.0,          # or small value if you want median centering
         tail_q=0.85,
         tail_weight=1.0,               # set >0 if you want extra tail emphasis
@@ -2561,11 +2573,19 @@ if best_model is None:
 print(f"Best checkpoint (local or remote): {best_model_path}")
 
 # Compute variable importance from TFT gating
-interpret = best_model.interpret_output(val_dataloader, reduction="mean")
+# -----------------------------------------------------------------------
+# Save Standard Variable Importance
+# -----------------------------------------------------------------------
+save_standard_variable_importance(
+    best_model,
+    val_dataloader,
+    out_csv_path="standard_variable_importance.csv",
+    uploader=upload_file_to_gcs,
+    feature_names=best_model.dataset.encoder_variables
+                  + best_model.dataset.decoder_variables
+                  + best_model.dataset.static_categoricals
+)
 
-# Save to CSV for later analysis
-pd.DataFrame(interpret["encoder_variables"]).to_csv("encoder_importance.csv")
-pd.DataFrame(interpret["decoder_variables"]).to_csv("decoder_importance.csv")
 
 # --- Run TEST loop with the best checkpoint & print decoded metrics ---
 try:
