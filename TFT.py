@@ -2107,18 +2107,18 @@ def _evaluate_decoded_metrics(
                         if p_enc_extr is None:
                             continue
                         p_dec = _decode(p_enc_extr, g_B)
+        else:
+            # re-create the chosen candidate
+            cands = {n: (t, e) for n, t, e in _cand_median_from_pred(pred)}
+            if chosen_case in cands:
+                t, encoded = cands[chosen_case]
+                p_dec = _decode(t, g_B) if encoded else t
             else:
-                # re-create the chosen candidate
-                cands = {n: (t, e) for n, t, e in _cand_median_from_pred(pred)}
-                if chosen_case in cands:
-                    t, encoded = cands[chosen_case]
-                    p_dec = _decode(t, g_B) if encoded else t
-                else:
-                    # layout changed? fall back
-                    p_med_enc_fallback, _ = _extract_heads(pred)
-                    if p_med_enc_fallback is None:
-                        continue
-                    p_dec = _decode(p_med_enc_fallback, g_B)
+                # layout changed? fall back
+                p_med_enc_fallback, _ = _extract_heads(pred)
+                if p_med_enc_fallback is None:
+                    pass
+                p_dec = _decode(p_med_enc_fallback, g_B)
 
             # clamp tiny values to global floor; no calibration inside FI
             floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
