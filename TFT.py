@@ -1868,6 +1868,13 @@ def _evaluate_decoded_metrics(
         pin_memory=pin_memory,
     )
 
+    # Resolve the correct GroupNormalizer to decode with (prefer the dataset's own)
+    if vol_norm is None:
+        try:
+            vol_norm = _extract_norm_from_dataset(ds)
+        except Exception as _e:
+            print(f"[FI DEBUG] could not extract normalizer from dataset: {_e}")
+
     try:
         model_device = next(model.parameters()).device
     except Exception:
@@ -1956,9 +1963,27 @@ def _evaluate_decoded_metrics(
             if p_vol is None:
                 continue  # skip batch if no usable vol head
 
-            # ---- decode  ----
-            y_dec = safe_decode_vol(y_vol.to(model_device).unsqueeze(-1), vol_norm, g.to(model_device).unsqueeze(-1)).squeeze(-1)
-            p_dec = safe_decode_vol(p_vol.to(model_device).unsqueeze(-1),  vol_norm, g.to(model_device).unsqueeze(-1)).squeeze(-1)
+            # ---- decode (force manual inverse to guarantee we get off the encoded scale) ----
+            vg   = g.to(model_device).unsqueeze(-1)
+            y_enc = y_vol.to(model_device).unsqueeze(-1)
+            p_enc = p_vol.to(model_device).unsqueeze(-1)
+
+            # Prefer manual inverse; PF decode signatures vary and can silently no-op
+            try:
+                y_dec = manual_inverse_transform_groupnorm(vol_norm, y_enc, vg).squeeze(-1)
+                p_dec = manual_inverse_transform_groupnorm(vol_norm, p_enc, vg).squeeze(-1)
+            except Exception as _e:
+                print(f"[FI DEBUG] manual inverse failed ({_e}); falling back to safe_decode_vol()")
+                y_dec = safe_decode_vol(y_enc, vol_norm, vg).squeeze(-1)
+                p_dec = safe_decode_vol(p_enc, vol_norm, vg).squeeze(-1)
+
+            # One-time scale sanity print
+            if b_idx == 0:
+                try:
+                    tfm = getattr(vol_norm, "transformation", None)
+                    print(f"[FI DEBUG] using transformation='{tfm}' | y_enc_mean={y_enc.mean().item():.6f} | y_dec_mean={y_dec.mean().item():.6f}")
+                except Exception:
+                    pass
 
             # clamp floor; NO calibration in PI
             floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
@@ -2001,6 +2026,13 @@ def _evaluate_decoded_metrics(
             dir_bce = float(dir_bce_t.item())
         except Exception:
             pass
+    
+    # Scale guard: if decoded MAE still looks encoded (~0.03–0.06), warn once
+    try:
+        if mae > 0.01:
+            print(f"[FI DEBUG] WARNING: decoded MAE={mae:.6f} still large; check group-ids alignment and that the normalizer matches the FI dataset.")
+    except Exception:
+        pass
 
     # return QLIKE as val_loss
     return float(mae), float(rmse), float(dir_bce), float(qlike), int(y.numel())
