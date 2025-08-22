@@ -1808,6 +1808,16 @@ def _evaluate_decoded_metrics(
     Compute decoded MAE, RMSE, DirBCE and QLIKE on up to `max_batches`.
     Returns: (mae, rmse, dir_bce, val_loss, n) with `val_loss == QLIKE`.
     """
+    # Robustly resolve the SAME GroupNormalizer used in training
+    if vol_norm is None:
+        try:
+            ds_model = getattr(model, "dataset", None)
+            if ds_model is not None:
+                tn = ds_model.get_parameters().get("target_normalizer", None)
+                if tn is not None:
+                    vol_norm = tn.normalizers[0] if hasattr(tn, "normalizers") else tn
+        except Exception:
+            vol_norm = None
     if vol_norm is None:
         vol_norm = _extract_norm_from_dataset(ds)
 
@@ -2013,7 +2023,16 @@ def run_permutation_importance(
     Saves CSV with: feature, baseline_val_loss, permuted_val_loss, delta, mae, rmse, dir_bce, n.
     """
     ds_base = TimeSeriesDataSet.from_dataset(template_ds, base_df, predict=False, stop_randomization=True)
-    train_vol_norm = _extract_norm_from_dataset(template_ds)
+    # Always prefer the training dataset’s normalizer if available
+    train_vol_norm = None
+    try:
+        tn = template_ds.get_parameters().get("target_normalizer", None)
+        if tn is not None:
+            train_vol_norm = tn.normalizers[0] if hasattr(tn, "normalizers") else tn
+    except Exception:
+        pass
+    if train_vol_norm is None:
+        train_vol_norm = _extract_norm_from_dataset(template_ds)
     try:
         print(f"[FI] Dataset size (samples): {len(ds_base)} | batch_size={batch_size}")
     except Exception:
@@ -2517,6 +2536,17 @@ if __name__ == "__main__":
     # Train the model
     trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
     model_for_fi = _resolve_best_model(trainer, fallback=tft)
+    # --- Extract the training-time volatility normalizer ---
+    train_vol_norm = None
+    try:
+        tn = training_dataset.get_parameters().get("target_normalizer", None)
+        if tn is not None:
+            # handle GroupNormalizer or direct normalizer
+            train_vol_norm = tn.normalizers[0] if hasattr(tn, "normalizers") else tn
+    except Exception:
+        pass
+    if train_vol_norm is None:
+        train_vol_norm = _extract_norm_from_dataset(training_dataset)
     # Run FI permutation testing if enabled
     if ENABLE_FEATURE_IMPORTANCE:
         fi_csv = str(LOCAL_OUTPUT_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")
@@ -2534,6 +2564,7 @@ if __name__ == "__main__":
             num_workers=4,
             prefetch=2,
             pin_memory=pin,
+            vol_norm = train_vol_norm,
             out_csv_path=fi_csv,
             uploader=upload_file_to_gcs,
         )
