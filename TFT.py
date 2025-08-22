@@ -1897,6 +1897,9 @@ def _fi_decode_diagnostic(
     g_B: torch.Tensor,           # group ids [B]
     tag: str = "FI"
 ):
+    y_enc_B = y_enc_B.detach().cpu()
+    p_enc_B = p_enc_B.detach().cpu()
+    g_B     = g_B.detach().cpu()
     """
     Print A/B/C decode comparisons on the same batch:
       A) training normalizer + groups
