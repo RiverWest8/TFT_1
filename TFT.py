@@ -2045,38 +2045,68 @@ def _evaluate_decoded_metrics(
             g_B = g  # [B]
             y_dec = _decode(y_vol, g_B)
 
-            # choose a head on the first batch; reuse thereafter
+            # --- choose a head on the first batch; reuse thereafter ---
             if chosen_case is None:
+                # 1) gather candidates from shapes
                 candidates = _cand_median_from_pred(pred)
-                best = None
-                best_name, best_p_dec = None, None
-            for name, p_med_enc, encoded in candidates:
-                p_dec_try = _decode(p_med_enc, g_B) if encoded else p_med_enc
-                mae_try = (p_dec_try - y_dec).abs().mean().item()
-                if (best is None) or (mae_try < best):
-                    best = mae_try
-                    best_name = name
-                    best_p_dec = p_dec_try
-                if best_name is None:
-                    # fall back to original extractor as last resort
-                    p_med_enc_fallback, _ = _extract_heads(pred)
-                    if p_med_enc_fallback is None:
-                        continue
-                    best_p_dec = _decode(p_med_enc_fallback, g_B)
-                    best_name = "fallback__extract_heads"
+
+                # 2) ALWAYS add the same extractor used in validation
+                p_enc_extr, _pdir_dummy = _extract_heads(pred)
+                if torch.is_tensor(p_enc_extr):
+                    candidates.append(("extract_heads", p_enc_extr))
+
+                # 3) pick the one that minimises decoded MAE on this batch
+                best_name, best_p_dec, best_mae = None, None, float("inf")
+                for name, p_med_enc in candidates:
+                    p_try = _decode(p_med_enc, g_B)  # candidates are encoded medians
+                    mae_try = (p_try - y_dec).abs().mean().item()
+                    if mae_try < best_mae:
+                        best_mae = mae_try
+                        best_name = name
+                        best_p_dec = p_try
+
+                # 4) sanity check mean scale; if off, fall back to extractor
+                def _mean_ratio(a, b):
+                    return float((a.mean() / (b.mean() + 1e-12)).item())
+
+                if best_name is None and torch.is_tensor(p_enc_extr):
+                    best_name = "extract_heads"
+                    best_p_dec = _decode(p_enc_extr, g_B)
+                    best_mae = (best_p_dec - y_dec).abs().mean().item()
+                else:
+                    ratio = _mean_ratio(best_p_dec, y_dec) if best_p_dec is not None else float("inf")
+                    if not (0.4 <= ratio <= 2.5) and torch.is_tensor(p_enc_extr):
+                        p_try = _decode(p_enc_extr, g_B)
+                        mae_try = (p_try - y_dec).abs().mean().item()
+                        print(f"[FI DEBUG] sanity fallback: best='{best_name}' mean ratio={ratio:.3f} → using 'extract_heads' (MAE={mae_try:.6f})")
+                        best_name, best_p_dec, best_mae = "extract_heads", p_try, mae_try
 
                 chosen_case = best_name
-                # sanity print (once)
+                p_dec = best_p_dec
+                # one-time debug
                 try:
-                    print(
-                        f"[FI DEBUG] chose head='{chosen_case}': "
-                        f"mean(y_dec)={float(y_dec.mean()):.6f} | "
-                        f"mean(p_dec)={float(best_p_dec.mean()):.6f} | "
-                        f"sample_MAE={float((best_p_dec - y_dec).abs().mean()):.6f}"
-                    )
+                    print(f"[FI DEBUG] chose head='{chosen_case}': mean(y_dec)={float(y_dec.mean()):.6f} | "
+                          f"mean(p_dec)={float(p_dec.mean()):.6f} | sample_MAE={best_mae:.6f}")
                 except Exception:
                     pass
-                p_dec = best_p_dec
+
+            else:
+                # reuse the chosen layout
+                if chosen_case == "extract_heads":
+                    p_enc_extr, _ = _extract_heads(pred)
+                    if p_enc_extr is None:
+                        continue
+                    p_dec = _decode(p_enc_extr, g_B)
+                else:
+                    cand_map = dict(_cand_median_from_pred(pred))
+                    if chosen_case in cand_map:
+                        p_dec = _decode(cand_map[chosen_case], g_B)
+                    else:
+                        # layout changed? fall back to extractor
+                        p_enc_extr, _ = _extract_heads(pred)
+                        if p_enc_extr is None:
+                            continue
+                        p_dec = _decode(p_enc_extr, g_B)
             else:
                 # re-create the chosen candidate
                 cands = {n: (t, e) for n, t, e in _cand_median_from_pred(pred)}
