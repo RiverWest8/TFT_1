@@ -2430,7 +2430,7 @@ if __name__ == "__main__":
             base_df=val_df,
             features=feats,
             block_size=int(PERM_BLOCK_SIZE) if PERM_BLOCK_SIZE else 1,
-            batch_size=2048,
+            batch_size=256,
             max_batches=int(FI_MAX_BATCHES) if FI_MAX_BATCHES else 20,
             num_workers=4,
             prefetch=2,
