@@ -1865,6 +1865,12 @@ def _peek_norm_params(normalizer, gids: torch.Tensor, max_items: int = 6):
         center = getattr(normalizer, "center", None)
         scale  = getattr(normalizer, "scale",  None)
         tfm    = getattr(normalizer, "transformation", None)
+        # Align center and scale to gids' device if tensor
+        device = gids.device
+        if isinstance(center, torch.Tensor):
+            center = center.to(device)
+        if isinstance(scale, torch.Tensor):
+            scale = scale.to(device)
         uniq = torch.unique(gids.cpu())[:max_items].tolist()
         for u in uniq:
             c_i = None
