@@ -1965,7 +1965,6 @@ def run_permutation_importance(
         model, ds_base, batch_size, max_batches, num_workers, prefetch, pin_memory, vol_norm = train_vol_norm
     )
     print(f"[FI] Baseline val_loss = {b_val:.6f} (MAE={b_mae:.6f}, RMSE={b_rmse:.6f}, Brier={b_dir:.6f}) | N={n}")
-    print(f"[FI DEBUG] mean(y)={y.mean().item():.6g}, mean(p)={p.mean().item():.6g}")
 
     rows = []
     for feat in features:
