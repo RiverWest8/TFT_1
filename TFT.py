@@ -110,7 +110,7 @@ import pytorch_forecasting as pf
 import inspect
 
 VOL_QUANTILES = [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95]
-Q50_IDX = VOL_QUANTILES.index(0.50)  # -> 3
+Q50_IDX = VOL_QUANTILES.index(0.50)  
 
 # -----------------------------------------------------------------------
 # Ensure a robust "identity" transformation for GroupNormalizer
@@ -1826,44 +1826,66 @@ def _evaluate_decoded_metrics(
                      for k, v in x.items()}
 
             y_hat = model(x_dev)
+
+            # after:
+            # y_hat = model(x_dev)
             pred = getattr(y_hat, "prediction", y_hat)
             if isinstance(pred, dict) and "prediction" in pred:
                 pred = pred["prediction"]
 
-            def _q50(t):
-                if torch.is_tensor(t):
-                    if t.ndim >= 4 and t.size(1) == 1: t = t.squeeze(1)
-                    if t.ndim == 3 and t.size(1) == 1: t = t.squeeze(1)
-                    if t.ndim == 2 and t.size(-1) >= 4: return t[:, 3]
-                return t
-            def _dir_logit(t):
-                if torch.is_tensor(t):
-                    if t.ndim >= 4 and t.size(1) == 1: t = t.squeeze(1)
-                    if t.ndim == 3 and t.size(1) == 1: t = t.squeeze(1)
-                    if t.ndim == 2: return t[:, t.size(-1)//2] if t.size(-1) > 1 else t.squeeze(-1)
-                return t
+            K = len(VOL_QUANTILES)  # uses your global list
+            Q50_IDX = VOL_QUANTILES.index(0.50)  # -> 3
 
-            if isinstance(pred, (list, tuple)):
-                p_vol = _q50(pred[0])
-                p_dir = _dir_logit(pred[1] if len(pred) > 1 else None)
-            else:
-                t = pred
-                if t.ndim >= 4 and t.size(1) == 1: t = t.squeeze(1)
-                if t.ndim == 3 and t.size(1) == 1: t = t[:, 0, :]
-                vol_q, p_dir = t[:, : t.size(-1)-1], t[:, -1]
-                p_vol = vol_q[:, 3] if vol_q.size(-1) >= 4 else vol_q.mean(dim=-1)
+            def _split_heads(pred):
+                """
+                Return (vol_q, dir_logit).
+                vol_q: [B, K]   dir_logit: [B] or None
+                Handles tuple/list outputs and concatenated tensor outputs.
+                """
+                import torch
+                if isinstance(pred, (list, tuple)):
+                    vol_q = pred[0]
+                    if torch.is_tensor(vol_q) and vol_q.ndim == 3 and vol_q.size(1) == 1:
+                        vol_q = vol_q[:, 0, :]                 # [B, K]
+                    d = pred[1] if len(pred) > 1 else None
+                    if torch.is_tensor(d):
+                        if d.ndim == 3 and d.size(1) == 1:
+                            d = d[:, 0, :]
+                        if d.ndim == 2:                        # [B, Ddir]
+                            d = d[:, -1]                       # last logit/prob
+                        else:
+                            d = d.squeeze(-1)
+                    return vol_q, d
+                else:
+                    t = pred
+                    if torch.is_tensor(t):
+                        if t.ndim == 4 and t.size(1) == 1:
+                            t = t.squeeze(1)                   # [B, 1, D] -> [B, D]
+                        if t.ndim == 3 and t.size(1) == 1:
+                            t = t[:, 0, :]                     # [B, D]
+                        D = t.size(-1)
+                        vol_q = t[:, :K]                       # first K = vol quantiles
+                        d = t[:, K] if D >= K + 1 else None    # next = direction (if present)
+                        return vol_q, d
+                    return pred, None
 
+            # ---- split heads & get median quantile (enforce monotone first) ----
+            vol_q, p_dir = _split_heads(pred)
+            if not torch.is_tensor(vol_q):
+                continue
+            vol_q = torch.cummax(vol_q, dim=-1).values        # enforce non-decreasing quantiles
+            p_vol = vol_q[:, Q50_IDX]                         # median q=0.5
+
+            # ---- decode (same as you do below) ----
             y_dec = safe_decode_vol(y_vol.to(model_device).unsqueeze(-1), vol_norm, g.to(model_device).unsqueeze(-1)).squeeze(-1)
-            p_dec = safe_decode_vol(p_vol.to(model_device).unsqueeze(-1), vol_norm, g.to(model_device).unsqueeze(-1)).squeeze(-1)
+            p_dec = safe_decode_vol(p_vol.to(model_device).unsqueeze(-1),  vol_norm, g.to(model_device).unsqueeze(-1)).squeeze(-1)
 
-            # Guard against near-zero decoded vols that can explode QLIKE
+            # clamp floor; NO calibration in PI
             floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
             y_dec = torch.clamp(y_dec, min=floor_val)
             p_dec = torch.clamp(p_dec, min=floor_val)
 
-            # Optional: light calibration to correct residual scale bias
-            #p_dec = calibrate_vol_predictions(y_dec, p_dec)
-
+            # collect for metrics exactly as you already do
             y_all.append(y_dec.detach().cpu())
             p_all.append(p_dec.detach().cpu())
             if torch.is_tensor(y_dir) and torch.is_tensor(p_dir):
