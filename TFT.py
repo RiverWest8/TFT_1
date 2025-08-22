@@ -1913,7 +1913,7 @@ def _evaluate_decoded_metrics(
         """
         Generate candidate medians from plausible layouts.
         Returns list of (name, p_med_B, is_encoded)
-        • p_med_B is the median series
+        • p_med_B is the candidate median series
         • is_encoded tells caller if it still needs decoding
         """
         K = 7
@@ -1921,25 +1921,31 @@ def _evaluate_decoded_metrics(
 
         def _add(name, tensor, encoded=True):
             if torch.is_tensor(tensor):
-                cands.append((name, _point_from_quantiles(tensor), encoded))
+                # for quantile layouts, enforce monotone then take median
+                if encoded:
+                    cands.append((name, _point_from_quantiles(tensor), True))
+                else:
+                    # if already a median (shape [B,1] or [B]), just flatten to [B]
+                    if tensor.ndim == 2 and tensor.size(-1) == 1:
+                        tensor = tensor[:, 0]
+                    cands.append((name, tensor, False))
 
+        # -------- list/tuple layout --------
         if isinstance(pred_t, (list, tuple)):
             vol = pred_t[0] if len(pred_t) > 0 else None
             if torch.is_tensor(vol):
                 v = vol
-                # squeeze common singletons
-                if v.ndim == 4 and v.size(1) == 1: v = v.squeeze(1)    # [B, C, D]
-                if v.ndim == 3 and v.size(1) == 1: v = v[:, 0, :]       # [B, D]
-                if v.ndim == 3 and v.size(-1) == 1: v = v.squeeze(-1)   # [B, ?]
+                if v.ndim == 4 and v.size(1) == 1: v = v.squeeze(1)
+                if v.ndim == 3 and v.size(1) == 1: v = v[:, 0, :]
+                if v.ndim == 3 and v.size(-1) == 1: v = v.squeeze(-1)
                 if v.ndim == 2 and v.size(-1) >= K:
                     _add("list_vol_BK", v[:, :K], True)
                 elif v.ndim == 2 and v.size(-1) == 1:
-                    # could be already decoded median
-                    _add("list_vol_single", v[:, 0:1], False)
+                    _add("list_vol_single", v, False)
 
+        # -------- tensor layout --------
         if torch.is_tensor(pred_t):
             t = pred_t
-            # try to peel a singleton pred_len dim
             if t.ndim == 4 and t.size(1) == 1:
                 t = t.squeeze(1)
             if t.ndim == 3 and t.size(1) == 1:
@@ -1955,7 +1961,6 @@ def _evaluate_decoded_metrics(
                 _add("BK_exact", t, True)
 
             if t.ndim == 2 and t.size(-1) == 1:
-                # direct decoded median?
                 _add("B1_decoded", t, False)
 
             if t.ndim >= 2 and t.reshape(t.size(0), -1).size(-1) >= K:
