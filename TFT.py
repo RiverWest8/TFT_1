@@ -2013,6 +2013,7 @@ def run_permutation_importance(
     num_workers: int,
     prefetch: int,
     pin_memory: bool,
+    vol_norm,
     out_csv_path: str,
     uploader,
     build_ds_fn = lambda: validation_dataset,
