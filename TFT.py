@@ -139,6 +139,44 @@ if hasattr(GroupNormalizer, "INVERSE_TRANSFORMATIONS"):
         lambda x: torch.expm1(x) if torch.is_tensor(x) else np.expm1(x),
     )
 
+def _extract_norm_from_dataset(ds):
+    """
+    Return the *volatility* GroupNormalizer used for the first target (realised_vol).
+    Works across PF versions where target_normalizer may be:
+      - a GroupNormalizer,
+      - a MultiNormalizer holding a list in .normalizers / .normalization,
+      - a dict mapping target name -> normalizer.
+    Preference order: GroupNormalizer for realised_vol, else first normalizer.
+    """
+    tn = getattr(ds, "target_normalizer", None)
+    if tn is None:
+        raise ValueError("TimeSeriesDataSet has no target_normalizer")
+
+    # dict mapping target name -> normalizer
+    if isinstance(tn, dict):
+        for v in tn.values():
+            if isinstance(v, GroupNormalizer):
+                return v
+        return next(iter(tn.values()))
+
+    # MultiNormalizer (PF)
+    try:
+        from pytorch_forecasting.data import MultiNormalizer as _PFMulti
+    except Exception:
+        _PFMulti = MultiNormalizer
+
+    if isinstance(tn, _PFMulti):
+        norms = getattr(tn, "normalizers", None) or getattr(tn, "normalization", None) or getattr(tn, "_normalizers", None)
+        if isinstance(norms, (list, tuple)) and norms:
+            for n in norms:
+                if isinstance(n, GroupNormalizer):
+                    return n
+            return norms[0]
+        return tn  # unknown container
+
+    # already a single normalizer
+    return tn
+
 
 def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
     """
@@ -2001,10 +2039,9 @@ def _resolve_best_model(trainer, fallback):
 
 
 
-
 def run_permutation_importance(
     model,
-    template_ds : TimeSeriesDataSet,
+    template_ds,
     base_df: pd.DataFrame,
     features: List[str],
     block_size: int,
@@ -2013,71 +2050,92 @@ def run_permutation_importance(
     num_workers: int,
     prefetch: int,
     pin_memory: bool,
-    vol_norm,
+    vol_norm,                       # 👈 NEW: pass the train/val vol normalizer explicitly
     out_csv_path: str,
     uploader,
-    build_ds_fn = lambda: validation_dataset,
+    build_ds_fn=lambda: None,       # kept for compatibility; unused now
 ) -> None:
     """
-    Compute FI by permuting each feature and measuring Δ(val_loss) where
-    val_loss = MAE + RMSE + 0.05 * DirBCE (decoded scale).
-    Saves CSV with: feature, baseline_val_loss, permuted_val_loss, delta, mae, rmse, dir_bce, n.
+    Compute permutation importance by **decoded** validation loss:
+        val_loss = QLIKE (on decoded realised_vol).
+    We also report decoded MAE/RMSE and Brier (direction), all computed consistently
+    with `_evaluate_decoded_metrics`.
     """
-    ds_base = TimeSeriesDataSet.from_dataset(template_ds, base_df, predict=False, stop_randomization=True)
-    # Always prefer the training dataset’s normalizer if available
-    train_vol_norm = None
-    try:
-        tn = template_ds.get_parameters().get("target_normalizer", None)
-        if tn is not None:
-            train_vol_norm = tn.normalizers[0] if hasattr(tn, "normalizers") else tn
-    except Exception:
-        pass
-    if train_vol_norm is None:
-        train_vol_norm = _extract_norm_from_dataset(template_ds)
-    try:
-        print(f"[FI] Dataset size (samples): {len(ds_base)} | batch_size={batch_size}")
-    except Exception:
-        pass
-    b_mae, b_rmse, b_dir, b_val, n = _evaluate_decoded_metrics(
-        model, ds_base, batch_size, max_batches, num_workers, prefetch, pin_memory, vol_norm = train_vol_norm
+
+    # Build the baseline dataset once off the provided template
+    ds_base = TimeSeriesDataSet.from_dataset(
+        template_ds, base_df, predict=False, stop_randomization=True
     )
-    print(f"[FI] Baseline val_loss = {b_val:.6f} (MAE={b_mae:.6f}, RMSE={b_rmse:.6f}, Brier={b_dir:.6f}) | N={n}")
+
+    # ---- Baseline (decoded) ----
+    b_mae, b_rmse, b_dir, b_val, n_base = _evaluate_decoded_metrics(
+        model=model,
+        ds=ds_base,
+        batch_size=batch_size,
+        max_batches=max_batches,
+        num_workers=num_workers,
+        prefetch=prefetch,
+        pin_memory=pin_memory,
+        vol_norm=vol_norm,   # 👈 ensure decoded
+    )
+
+    print(f"[FI] Dataset size (samples): {len(base_df)} | batch_size={batch_size}")
+    print(f"[FI] Baseline val_loss = {b_val:.6f} (MAE={b_mae:.6f}, RMSE={b_rmse:.6f}, Brier={b_dir:.6f}) | N={n_base}")
+    print("[FI DEBUG] scale check: expecting decoded MAE similar to validation callback "
+          f"(e.g., ~0.001–0.003). Got MAE={b_mae:.6f}, QLIKE={b_val:.6f}")
 
     rows = []
+    work_df = base_df.copy()
+
     for feat in features:
-        if feat not in base_df.columns:
-            print(f"[FI] Skipping missing feature: {feat}")
-            continue
-        df_p = base_df.copy()
-        _permute_series_inplace(df_p, feat, block=block_size, group_col=GROUP_ID[0] if GROUP_ID else "asset")
-        ds_p = TimeSeriesDataSet.from_dataset(template_ds, df_p, predict=False, stop_randomization=True)
-        p_mae, p_rmse, p_dir, p_val, n_p = _evaluate_decoded_metrics(
-            model, ds_p, batch_size, max_batches, num_workers, prefetch, pin_memory, vol_norm = train_vol_norm
+        df_perm = work_df.copy()
+        _permute_series_inplace(df_perm, feat, block=block_size, group_col="asset")
+
+        # Rebuild dataset for the permuted feature column
+        ds_perm = TimeSeriesDataSet.from_dataset(
+            template_ds, df_perm, predict=False, stop_randomization=True
         )
-        delta = (p_val - b_val) if (np.isfinite(p_val) and np.isfinite(b_val)) else float("nan")
-        print(f"[FI] {feat:>20} | val_p={p_val:.6f} | Δ={delta:.6f} | (MAE={p_mae:.6f}, RMSE={p_rmse:.6f}, Brier={p_dir:.6f})")
+
+        p_mae, p_rmse, p_dir, p_val, n_p = _evaluate_decoded_metrics(
+            model=model,
+            ds=ds_perm,
+            batch_size=batch_size,
+            max_batches=max_batches,
+            num_workers=num_workers,
+            prefetch=prefetch,
+            pin_memory=pin_memory,
+            vol_norm=vol_norm,   # 👈 ensure decoded
+        )
+
+        delta = p_val - b_val
+        print(
+            f"[FI] {feat:>20s} | val_p={p_val:.6f} | Δ={delta:+.6f} | "
+            f"(MAE={p_mae:.6f}, RMSE={p_rmse:.6f}, Brier={p_dir:.6f})"
+        )
+
         rows.append({
             "feature": feat,
-            "baseline_val_loss": b_val,
-            "permuted_val_loss": p_val,
-            "delta": delta,
-            "mae": p_mae,
-            "rmse": p_rmse,
-            "dir_bce": p_dir,
-            "brier" : p_dir,
-            "n": n_p,
+            "baseline_val_loss": float(b_val),
+            "permuted_val_loss": float(p_val),
+            "delta": float(delta),
+            "mae": float(p_mae),
+            "rmse": float(p_rmse),
+            "brier": float(p_dir),
+            "n": int(n_p),
         })
 
+    # Save CSV locally and (optionally) upload
     try:
-        _df = pd.DataFrame(rows).sort_values("delta", ascending=False)
-        _df.to_csv(out_csv_path, index=False)
-        print(f"✓ Saved FI → {out_csv_path}")
+        out_df = pd.DataFrame(rows)
+        out_df.to_csv(out_csv_path, index=False)
+        print(f"[FI] wrote {out_csv_path}")
         try:
-            uploader(out_csv_path, f"{GCS_OUTPUT_PREFIX}/" + os.path.basename(out_csv_path))
+            if uploader is not None:
+                uploader(out_csv_path, f"{GCS_OUTPUT_PREFIX}/{Path(out_csv_path).name}")
         except Exception as e:
-            print(f"[WARN] Could not upload FI CSV: {e}")
+            print(f"[FI WARN] upload failed: {e}")
     except Exception as e:
-        print(f"[WARN] Failed to save FI: {e}")
+        print(f"[FI WARN] could not save FI CSV: {e}")
 # 
 # 
 # -----------------------------------------------------------------------
@@ -2549,26 +2607,35 @@ if __name__ == "__main__":
     if train_vol_norm is None:
         train_vol_norm = _extract_norm_from_dataset(training_dataset)
     # Run FI permutation testing if enabled
-    if ENABLE_FEATURE_IMPORTANCE:
-        fi_csv = str(LOCAL_OUTPUT_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")
-        feats = time_varying_unknown_reals.copy()
-        # (optional) drop calendar features from FI to focus on learned signals
-        feats = [f for f in feats if f not in ("sin_tod", "cos_tod", "sin_dow", "cos_dow", "Is_Weekend")]
-        run_permutation_importance(
-            model= model_for_fi,
-            template_ds = validation_dataset,            # << use train template
-            base_df=val_df,
-            features=feats,
-            block_size=int(PERM_BLOCK_SIZE) if PERM_BLOCK_SIZE else 1,
-            batch_size=256,
-            max_batches=int(FI_MAX_BATCHES) if FI_MAX_BATCHES else 40,
-            num_workers=4,
-            prefetch=2,
-            pin_memory=pin,
-            vol_norm = train_vol_norm,
-            out_csv_path=fi_csv,
-            uploader=upload_file_to_gcs,
-        )
+    # ---- Permutation Importance (decoded) ----
+if ENABLE_FEATURE_IMPORTANCE:
+    fi_csv = str(LOCAL_OUTPUT_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")
+    feats = time_varying_unknown_reals.copy()
+    # optional: drop calendar features from FI
+    feats = [f for f in feats if f not in ("sin_tod", "cos_tod", "sin_dow", "cos_dow", "Is_Weekend")]
+
+    # Prefer TRAIN dataset as template → guarantees same encoders & normalizers
+    try:
+        train_vol_norm = _extract_norm_from_dataset(training_dataset)
+    except Exception:
+        # fallback to validation dataset if needed
+        train_vol_norm = _extract_norm_from_dataset(validation_dataset)
+
+    run_permutation_importance(
+        model=model_for_fi,
+        template_ds=training_dataset,          # 👈 use TRAIN template
+        base_df=val_df,
+        features=feats,
+        block_size=int(PERM_BLOCK_SIZE) if PERM_BLOCK_SIZE else 1,
+        batch_size=256,
+        max_batches=int(FI_MAX_BATCHES) if FI_MAX_BATCHES else 40,
+        num_workers=4,
+        prefetch=2,
+        pin_memory=pin,
+        vol_norm=train_vol_norm,               # 👈 ensure decoded metrics
+        out_csv_path=fi_csv,
+        uploader=upload_file_to_gcs,
+    )
     # --- Safe plotting/logging: deep-cast any nested tensors to CPU float32 ---
     # --- Safe plotting/logging: class-level patch to handle bf16 + integer lengths robustly ---
 
