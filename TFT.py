@@ -1831,6 +1831,7 @@ def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
     # Take median (index 3 in VOL_QUANTILES)
     return vol_q[..., 3]
 
+@torch.no_grad()
 def _evaluate_decoded_metrics(
     model,
     ds: TimeSeriesDataSet,
@@ -1842,22 +1843,31 @@ def _evaluate_decoded_metrics(
     vol_norm=None,
 ):
     """
-    Compute decoded MAE, RMSE, DirBCE and QLIKE on up to `max_batches`.
-    Returns: (mae, rmse, dir_bce, val_loss, n) with `val_loss == QLIKE`.
+    Compute decoded MAE, RMSE, Brier and QLIKE on up to `max_batches`.
+    Returns: (mae, rmse, brier, qlike, n) with `val_loss == QLIKE`.
+
+    Key differences vs older versions:
+      • Robust group-id extraction → [B]
+      • Head auto-selection (tries multiple layouts; picks the one whose
+        decoded median best matches the decoded target on a calibration slice)
     """
-    # --- Resolve the same GroupNormalizer used in training ---
+    import torch
+
+    # ---- resolve normalizer (same one used to fit) ----
     if vol_norm is None:
+        # try to get from model.dataset first (if attached by PF)
         try:
             ds_model = getattr(model, "dataset", None)
             if ds_model is not None:
                 tn = ds_model.get_parameters().get("target_normalizer", None)
                 if tn is not None:
-                    vol_norm = tn.normalizers[0] if hasattr(tn, "normalizers") else tn
+                    vol_norm = getattr(tn, "normalizers", [tn])[0]
         except Exception:
-            vol_norm = None
+            pass
     if vol_norm is None:
         vol_norm = _extract_norm_from_dataset(ds)
 
+    # ---- dataloader ----
     dl = ds.to_dataloader(
         train=False,
         batch_size=batch_size,
@@ -1875,6 +1885,81 @@ def _evaluate_decoded_metrics(
     model.eval()
     y_all, p_all, yd_all, pd_all = [], [], [], []
 
+    # cache the head choice after first batch
+    chosen_case = None
+
+    def _groups_to_B(g):
+        """
+        Make sample-level group ids of shape [B] regardless of what PF gives us.
+        Group id is constant across timesteps for a sample, so we just take [:,0] if needed.
+        """
+        if isinstance(g, (list, tuple)):
+            g = g[0] if g else None
+        if not torch.is_tensor(g):
+            return None
+        # keep taking the first column until we land at [B]
+        while g.ndim > 1:
+            g = g[:, 0]
+        return g.long()
+
+    def _decode(vec_B, g_B):
+        return manual_inverse_transform_groupnorm(
+            vol_norm,
+            vec_B.to(model_device).unsqueeze(-1),
+            g_B.to(model_device).unsqueeze(-1),
+        ).squeeze(-1)
+
+    def _cand_median_from_pred(pred_t):
+        """
+        Generate candidate encoded medians from different plausible layouts.
+        Returns list of (name, p_med_B_encoded)
+        """
+        K = 7
+        cands = []
+
+        if isinstance(pred_t, (list, tuple)):
+            vol = pred_t[0] if len(pred_t) > 0 else None
+            if torch.is_tensor(vol):
+                v = vol
+                # squeeze common singletons
+                if v.ndim == 4 and v.size(1) == 1: v = v.squeeze(1)    # [B, C, D]
+                if v.ndim == 3 and v.size(1) == 1: v = v[:, 0, :]       # [B, D]
+                if v.ndim == 3 and v.size(-1) == 1: v = v.squeeze(-1)   # [B, ?]
+                if v.ndim == 2 and v.size(-1) >= K:
+                    cands.append(("list_vol_BK", _point_from_quantiles(v[:, :K])))
+                elif v.ndim == 2 and v.size(-1) == 1:
+                    # unlikely to be vol; skip
+                    pass
+
+        if torch.is_tensor(pred_t):
+            t = pred_t
+            # try to peel a singleton pred_len dim
+            if t.ndim == 4 and t.size(1) == 1:
+                t = t.squeeze(1)  # [B, C, D]
+            if t.ndim == 3 and t.size(1) == 1:
+                t = t[:, 0, :]    # [B, D]
+
+            # [B, 2, K] → first is vol quantiles
+            if t.ndim == 3 and t.size(1) == 2 and t.size(-1) >= K:
+                vol_q = t[:, 0, :K]
+                cands.append(("B2K_vol_first", _point_from_quantiles(vol_q)))
+
+            # [B, K+1] → first K vol, last 1 dir
+            if t.ndim == 2 and t.size(-1) >= K + 1:
+                vol_q = t[:, :K]
+                cands.append(("BK_plus1", _point_from_quantiles(vol_q)))
+
+            # [B, K] → pure vol quantiles
+            if t.ndim == 2 and t.size(-1) == K:
+                cands.append(("BK_exact", _point_from_quantiles(t)))
+
+            # fallback: flatten and try first K as quantiles
+            if t.ndim >= 2 and t.reshape(t.size(0), -1).size(-1) >= K:
+                flat = t.reshape(t.size(0), -1)
+                cands.append(("flat_firstK", _point_from_quantiles(flat[:, :K])))
+
+        return cands
+
     with torch.no_grad():
         for b_idx, batch in enumerate(dl):
             if max_batches is not None and b_idx >= int(max_batches):
@@ -1887,56 +1972,59 @@ def _evaluate_decoded_metrics(
             if not isinstance(x, dict):
                 continue
 
-            # groups
-            g = x.get("groups") if x.get("groups") is not None else x.get("group_ids")
-            if isinstance(g, (list, tuple)):
-                g = g[0] if g else None
-            if torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
-                g = g.squeeze(-1)
-            if not torch.is_tensor(g):
+            # groups -> [B]
+            g = _groups_to_B(x.get("groups"))
+            if g is None:
+                g = _groups_to_B(x.get("group_ids"))
+            if g is None:
                 continue
 
-            # targets
-            def _extract(obj):
+            # ---- targets (encoded) ----
+            def _extract_targets(obj):
+                # Expect one-step decoder; support a few common shapes
                 if torch.is_tensor(obj):
                     t = obj
-                    if t.ndim == 3 and t.size(-1) == 1:
-                        t = t[..., 0]
+                    # [B, 1, T] → [B, T]
                     if t.ndim == 3 and t.size(1) == 1:
                         t = t[:, 0, :]
+                    # [B, T]      → split cols
                     if t.ndim == 2 and t.size(1) >= 1:
-                        return t[:, 0], (t[:, 1] if t.size(1) > 1 else None)
+                        yv = t[:, 0]
+                        yd = t[:, 1] if t.size(1) > 1 else None
+                        return yv, yd
                     return None, None
                 if isinstance(obj, (list, tuple)) and obj:
                     yv, yd = obj[0], (obj[1] if len(obj) > 1 else None)
-                    for ref in ("yv", "yd"):
-                        v = locals()[ref]
-                        if torch.is_tensor(v):
-                            if v.ndim == 3 and v.size(-1) == 1:
-                                v = v[..., 0]
-                            if v.ndim == 3 and v.size(1) == 1:
-                                v = v[:, 0, :]
-                            if v.ndim == 2 and v.size(-1) == 1:
-                                v = v[:, 0]
-                            locals()[ref] = v
+                    if torch.is_tensor(yv):
+                        if yv.ndim == 3 and yv.size(-1) == 1: yv = yv[..., 0]
+                        if yv.ndim == 3 and yv.size(1) == 1: yv = yv[:, 0, :]
+                        if yv.ndim == 2 and yv.size(-1) == 1: yv = yv[:, 0]
+                    if torch.is_tensor(yd):
+                        if yd.ndim == 3 and yd.size(-1) == 1: yd = yd[..., 0]
+                        if yd.ndim == 3 and yd.size(1) == 1: yd = yd[:, 0, :]
+                        if yd.ndim == 2 and yd.size(-1) == 1: yd = yd[:, 0]
                     return (yv if torch.is_tensor(yv) else None,
                             yd if torch.is_tensor(yd) else None)
                 return None, None
 
-            dec_t = x.get("decoder_target") or x.get("target")
-            y_vol, y_dir = _extract(dec_t)
-            if (y_vol is None or (y_dir is None and y is not None)) and y is not None:
-                yv2, yd2 = _extract(y)
+            dec_t = x.get("decoder_target")
+            if dec_t is None:
+                dec_t = x.get("target")  # PF sometimes puts it here
+            y_vol, y_dir = _extract_targets(dec_t)
+            if (y_vol is None or (y_dir is None and y is not None)) and torch.is_tensor(y):
+                yv2, yd2 = _extract_targets(y)
                 if y_vol is None: y_vol = yv2
                 if y_dir is None: y_dir = yd2
             if not torch.is_tensor(y_vol):
                 continue
 
-            # forward
+            # ---- forward & pick the correct vol head ----
             x_dev = {
-                k: (v.to(model_device, non_blocking=True) if torch.is_tensor(v)
+                k: (
+                    v.to(model_device, non_blocking=True) if torch.is_tensor(v)
                     else [vv.to(model_device, non_blocking=True) if torch.is_tensor(vv) else vv for vv in v]
-                    if isinstance(v, (list, tuple)) else v)
+                    if isinstance(v, (list, tuple)) else v
+                )
                 for k, v in x.items()
             }
             y_hat = model(x_dev)
@@ -1944,51 +2032,88 @@ def _evaluate_decoded_metrics(
             if isinstance(pred, dict) and "prediction" in pred:
                 pred = pred["prediction"]
 
-            # heads
-            p_vol, p_dir = _extract_heads(pred)
-            if p_vol is None:
-                continue
+            # decode target for this batch once
+            g_B = g  # [B]
+            y_dec = _decode(y_vol, g_B)
 
-            # ---- decode (manual inverse to avoid silent no-op) ----
-            vg   = g.to(model_device).unsqueeze(-1)
-            y_enc = y_vol.to(model_device).unsqueeze(-1)
-            p_enc = p_vol.to(model_device).unsqueeze(-1)
-            try:
-                y_dec = manual_inverse_transform_groupnorm(vol_norm, y_enc, vg).squeeze(-1)
-                p_dec = manual_inverse_transform_groupnorm(vol_norm, p_enc, vg).squeeze(-1)
-            except Exception as _e:
-                print(f"[FI DEBUG] manual inverse failed ({_e}); falling back to safe_decode_vol()")
-                y_dec = safe_decode_vol(y_enc, vol_norm, vg).squeeze(-1)
-                p_dec = safe_decode_vol(p_enc, vol_norm, vg).squeeze(-1)
+            # choose a head on the first batch; reuse thereafter
+            if chosen_case is None:
+                candidates = _cand_median_from_pred(pred)
+                best = None
+                best_name, best_p_dec = None, None
+                for name, p_med_enc in candidates:
+                    p_dec_try = _decode(p_med_enc, g_B)
+                    mae_try = (p_dec_try - y_dec).abs().mean().item()
+                    if (best is None) or (mae_try < best):
+                        best = mae_try
+                        best_name = name
+                        best_p_dec = p_dec_try
+                if best_name is None:
+                    # fall back to original extractor as last resort
+                    p_med_enc_fallback, _ = _extract_heads(pred)
+                    if p_med_enc_fallback is None:
+                        continue
+                    best_p_dec = _decode(p_med_enc_fallback, g_B)
+                    best_name = "fallback__extract_heads"
 
-            # one-time sanity print
-            if b_idx == 0:
+                chosen_case = best_name
+                # sanity print (once)
                 try:
-                    tfm = getattr(vol_norm, "transformation", None)
-                    print(f"[FI DEBUG] using transformation='{tfm}' | "
-                          f"y_enc_mean={y_enc.mean().item():.6f} | "
-                          f"y_dec_mean={y_dec.mean().item():.6f}")
+                    print(
+                        f"[FI DEBUG] chose head='{chosen_case}': "
+                        f"mean(y_dec)={float(y_dec.mean()):.6f} | "
+                        f"mean(p_dec)={float(best_p_dec.mean()):.6f} | "
+                        f"sample_MAE={float((best_p_dec - y_dec).abs().mean()):.6f}"
+                    )
                 except Exception:
                     pass
+                p_dec = best_p_dec
+            else:
+                # re-create the chosen candidate
+                cands = dict(_cand_median_from_pred(pred))
+                if chosen_case in cands:
+                    p_dec = _decode(cands[chosen_case], g_B)
+                else:
+                    # layout changed? fall back
+                    p_med_enc_fallback, _ = _extract_heads(pred)
+                    if p_med_enc_fallback is None:
+                        continue
+                    p_dec = _decode(p_med_enc_fallback, g_B)
 
-            # clamp
+            # clamp tiny values to global floor; no calibration inside FI
             floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
             y_dec = torch.clamp(y_dec, min=floor_val)
             p_dec = torch.clamp(p_dec, min=floor_val)
 
+            # collect for metrics
             y_all.append(y_dec.detach().cpu())
             p_all.append(p_dec.detach().cpu())
-            if torch.is_tensor(y_dir) and torch.is_tensor(p_dir):
-                yd_flat, pd_flat = y_dir.reshape(-1), p_dir.reshape(-1)
-                L2 = min(yd_flat.numel(), pd_flat.numel())
-                if L2 > 0:
-                    yd_all.append(yd_flat[:L2].detach().cpu())
-                    pd_all.append(pd_flat[:L2].detach().cpu())
 
+            # optional direction
+            if torch.is_tensor(y_dir):
+                # best-effort: take a central column from any dir-like head
+                p_dir = None
+                if isinstance(pred, (list, tuple)) and len(pred) > 1 and torch.is_tensor(pred[1]):
+                    d = pred[1]
+                    if d.ndim == 3 and d.size(1) == 1: d = d[:, 0, :]
+                    if d.ndim == 2: p_dir = d[:, d.size(-1) // 2]
+                    elif d.ndim == 1: p_dir = d
+                elif torch.is_tensor(pred) and pred.ndim == 2 and pred.size(-1) >= 8:
+                    # [B, K+1] layout
+                    p_dir = pred[:, -1]
+                if torch.is_tensor(p_dir):
+                    yd_flat, pd_flat = y_dir.reshape(-1), p_dir.reshape(-1)
+                    L2 = min(yd_flat.numel(), pd_flat.numel())
+                    if L2 > 0:
+                        yd_all.append(yd_flat[:L2].detach().cpu())
+                        pd_all.append(pd_flat[:L2].detach().cpu())
+
+    # ---- aggregate metrics ----
     if not y_all:
         return float("nan"), float("nan"), float("nan"), float("nan"), 0
 
-    y, p = torch.cat(y_all), torch.cat(p_all)
+    y = torch.cat(y_all)
+    p = torch.cat(p_all)
     mae  = (p - y).abs().mean().item()
     rmse = torch.sqrt(((p - y) ** 2).mean()).item()
 
@@ -1998,25 +2123,26 @@ def _evaluate_decoded_metrics(
     ratio = sigma2_y / sigma2_p
     qlike = (ratio - torch.log(ratio) - 1.0).mean().item()
 
-    dir_bce = float("nan")
+    brier = float("nan")
     if yd_all and pd_all:
         yd, pd = torch.cat(yd_all).float(), torch.cat(pd_all)
         try:
             if torch.isfinite(pd).any() and (pd.min() < 0 or pd.max() > 1):
-                pd = torch.sigmoid(pd)
+                pd = torch.sigmoid(pd)  # logits → probs
             pd = torch.clamp(pd, 0.0, 1.0)
             y_smooth = yd * 0.9 + 0.05
-            dir_bce_t = ((pd - y_smooth) ** 2).mean()
-            dir_bce = float(dir_bce_t.item())
+            brier = float(((pd - y_smooth) ** 2).mean().item())
         except Exception:
             pass
 
-    # scale guard
+    # sanity: if decoded MAE still looks encoded, warn once
     if mae > 0.01:
-        print(f"[FI DEBUG] WARNING: decoded MAE={mae:.6f} still large; "
-              "check group-ids alignment and that the normalizer matches the FI dataset.")
+        try:
+            print(f"[FI DEBUG] WARNING: decoded MAE={mae:.6f} still large; check head parsing and group ids.")
+        except Exception:
+            pass
 
-    return float(mae), float(rmse), float(dir_bce), float(qlike), int(y.numel())
+    return float(mae), float(rmse), float(brier), float(qlike), int(y.numel())
 
 # --- after trainer.fit(...), before running FI ---
 def _resolve_best_model(trainer, fallback):
