@@ -2187,7 +2187,7 @@ def _evaluate_decoded_metrics(
                 pred = pred["prediction"]'''
 
             #Troubleshoot can be deleted after
-            for b_idx, (x, y) in enumerate(val_dl):
+            for b_idx, (x, y) in enumerate(dl):
                 # move inputs to device
                 x_dev = {k: v.to(model_device, non_blocking=True) if torch.is_tensor(v) else v
                         for k, v in x.items()}
