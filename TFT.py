@@ -2050,10 +2050,10 @@ def _evaluate_decoded_metrics(
                 # 1) gather candidates from shapes
                 candidates = _cand_median_from_pred(pred)
 
-                # 2) ALWAYS add the same extractor used in validation
-                p_enc_extr, _pdir_dummy = _extract_heads(pred)
+                # when adding extract_heads
+                p_enc_extr, _ = _extract_heads(pred)
                 if torch.is_tensor(p_enc_extr):
-                    candidates.append(("extract_heads", p_enc_extr))
+                    candidates.append(("extract_heads", p_enc_extr, True))
 
                 # 3) pick the one that minimises decoded MAE on this batch
                 best_name, best_p_dec, best_mae = None, None, float("inf")
