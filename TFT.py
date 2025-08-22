@@ -1832,6 +1832,113 @@ def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
     return vol_q[..., 3]
 
 @torch.no_grad()
+def _inverse_only_transform(normalizer, y: torch.Tensor) -> torch.Tensor:
+    """
+    Apply ONLY the inverse of the elementwise transformation (e.g., expm1 for log1p),
+    ignoring any centering/scaling. y can be [B] or [B,1].
+    """
+    x = y
+    if x.ndim == 1:
+        x = x.unsqueeze(-1)
+    tfm = getattr(normalizer, "transformation", None)
+    if tfm == "log1p":
+        x = torch.expm1(x)
+    elif tfm in (None, "identity"):
+        pass
+    else:
+        try:
+            inv = type(normalizer).TRANSFORMATIONS[tfm]["inverse"]
+            x = inv(x)
+        except Exception:
+            # last resort: return unchanged
+            pass
+    return x.squeeze(-1)
+
+@torch.no_grad()
+def _peek_norm_params(normalizer, gids: torch.Tensor, max_items: int = 6):
+    """
+    Inspect per-group center/scale for a handful of group ids.
+    Returns list of tuples: (gid, center_i, scale_i)
+    """
+    out = []
+    try:
+        center = getattr(normalizer, "center", None)
+        scale  = getattr(normalizer, "scale",  None)
+        tfm    = getattr(normalizer, "transformation", None)
+        uniq = torch.unique(gids.cpu())[:max_items].tolist()
+        for u in uniq:
+            c_i = None
+            s_i = None
+            if isinstance(center, torch.Tensor) and center.ndim >= 1:
+                try: c_i = float(center[int(u)].cpu())
+                except Exception: pass
+            elif isinstance(center, (float, int)): c_i = float(center)
+            if isinstance(scale, torch.Tensor) and scale.ndim >= 1:
+                try: s_i = float(scale[int(u)].cpu())
+                except Exception: pass
+            elif isinstance(scale, (float, int)): s_i = float(scale)
+            out.append((int(u), c_i, s_i, tfm))
+    except Exception:
+        pass
+    return out
+
+@torch.no_grad()
+def _fi_decode_diagnostic(
+    vol_norm_train,              # the normalizer you pass into FI
+    vol_norm_ds,                 # the normalizer extracted from the FI dataset
+    y_enc_B: torch.Tensor,       # encoded target [B]
+    p_enc_B: torch.Tensor,       # encoded pred median [B]
+    g_B: torch.Tensor,           # group ids [B]
+    tag: str = "FI"
+):
+    """
+    Print A/B/C decode comparisons on the same batch:
+      A) training normalizer + groups
+      B) dataset normalizer + groups
+      C) inverse transform only (no center/scale)
+    Also dumps a few (gid, center, scale) pairs for both normalizers.
+    """
+    def _dec(nrm, vec):
+        # use the robust decoder you already have
+        return safe_decode_vol(vec.unsqueeze(-1), nrm, g_B.unsqueeze(-1)).squeeze(-1)
+
+    # Decode target with each normalizer as well (so MAE is apples-to-apples)
+    y_dec_A = _dec(vol_norm_train, y_enc_B)
+    y_dec_B = _dec(vol_norm_ds,    y_enc_B)
+    y_dec_C = _inverse_only_transform(vol_norm_ds, y_enc_B)  # transform-only baseline
+
+    p_dec_A = _dec(vol_norm_train, p_enc_B)
+    p_dec_B = _dec(vol_norm_ds,    p_enc_B)
+    p_dec_C = _inverse_only_transform(vol_norm_ds, p_enc_B)
+
+    def _stats(y_dec, p_dec):
+        mae  = float((p_dec - y_dec).abs().mean().item())
+        m_y  = float(y_dec.mean().item())
+        m_p  = float(p_dec.mean().item())
+        return mae, m_y, m_p
+
+    mae_A, yA, pA = _stats(y_dec_A, p_dec_A)
+    mae_B, yB, pB = _stats(y_dec_B, p_dec_B)
+    mae_C, yC, pC = _stats(y_dec_C, p_dec_C)
+
+    print(f"[DIAG {tag}] A: TRAIN norm  → MAE={mae_A:.6f} | mean(y)={yA:.6f} | mean(p)={pA:.6f}")
+    print(f"[DIAG {tag}] B: DATASET norm→ MAE={mae_B:.6f} | mean(y)={yB:.6f} | mean(p)={pB:.6f}")
+    print(f"[DIAG {tag}] C: INV-ONLY    → MAE={mae_C:.6f} | mean(y)={yC:.6f} | mean(p)={pC:.6f}")
+
+    # Peek a few per-group params for both norms
+    peek_A = _peek_norm_params(vol_norm_train, g_B)
+    peek_B = _peek_norm_params(vol_norm_ds,    g_B)
+
+    def _fmt(peek):
+        parts = []
+        for gid, c, s, tfm in peek:
+            parts.append(f"(gid={gid}, center={None if c is None else f'{c:.4g}'}, scale={None if s is None else f'{s:.4g}'}, tfm={tfm})")
+        return "; ".join(parts) if parts else "(no per-group params visible)"
+
+    print(f"[DIAG {tag}] TRAIN norm params:  {_fmt(peek_A)}")
+    print(f"[DIAG {tag}] DATASET norm params: {_fmt(peek_B)}")
+
+@torch.no_grad()
 def _evaluate_decoded_metrics(
     model,
     ds: TimeSeriesDataSet,
@@ -2040,11 +2147,38 @@ def _evaluate_decoded_metrics(
             pred = getattr(y_hat, "prediction", y_hat)
             if isinstance(pred, dict) and "prediction" in pred:
                 pred = pred["prediction"]
+        
 
             # decode target for this batch once
             g_B = g  # [B]
             y_dec = _decode(y_vol, g_B)
+            # --- quick encoded median for diagnostics (before head auto-selection) ---
+            p_enc_diag, _ = _extract_heads(pred)  # returns encoded median [B] if available
+            if p_enc_diag is not None:
+                # Ensure group ids are shape [B] (sample-level)
+                g_B = g
+                while g_B.ndim > 1:
+                    g_B = g_B[:, 0]
+                g_B = g_B.long()
 
+                # Resolve the dataset's own normalizer for A/B comparison
+                try:
+                    vol_norm_ds = _extract_norm_from_dataset(ds)
+                except Exception:
+                    vol_norm_ds = None
+
+                if (b_idx == 0) and (vol_norm is not None) and (vol_norm_ds is not None):
+                    try:
+                        _fi_decode_diagnostic(
+                            vol_norm_train=vol_norm,
+                            vol_norm_ds=vol_norm_ds,
+                            y_enc_B=y_vol,
+                            p_enc_B=p_enc_diag,
+                            g_B=g_B,
+                            tag="FI-BATCH0"
+                        )
+                    except Exception as e:
+                        print(f"[DIAG] decode diagnostic failed: {e}")
             # --- choose a head on the first batch; reuse thereafter ---
             if chosen_case is None:
                 # 1) gather candidates from shapes
