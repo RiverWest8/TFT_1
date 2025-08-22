@@ -140,6 +140,79 @@ if hasattr(GroupNormalizer, "INVERSE_TRANSFORMATIONS"):
     )
 
 
+def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
+    """
+    Enforce non-decreasing quantiles along last dim and return the median (q=0.5).
+    Assumes VOL_QUANTILES has q=0.50 at index 3.
+    """
+    vol_q = torch.cummax(vol_q, dim=-1).values
+    return vol_q[..., 3]  # Q50_IDX
+
+#EXTRACT HEADSSSSS
+def _extract_heads(pred):
+            """Return (p_vol, p_dir) as 1D tensors [B] on DEVICE.
+            Handles outputs as:
+              • list/tuple: [vol(…,7), dir(…,7 or 1/2)]
+              • tensor [B, 2, 7] (after our predict_step squeeze)
+              • tensor [B, 1, 7] (vol only)
+              • tensor [B, 7] (vol only)
+            """
+            import torch
+            def _to_median_q(t):
+                if t is None:
+                    return None
+                if t.ndim == 3 and t.size(1) == 1:
+                    t = t.squeeze(1)       # [B, K]
+                if t.ndim == 2 and t.size(-1) >= 4:
+                    return t[:, 3]         # index of 0.50 in VOL_QUANTILES
+                if t.ndim == 1:
+                    return t
+                return t.reshape(t.size(0), -1)[:, 0]  # last-ditch fallback
+
+            def _to_dir_logit(t):
+                if t is None:
+                    return None
+                if t.ndim == 3 and t.size(1) == 1:
+                    t = t.squeeze(1)  # [B,7] or [B,1]
+                # if replicated across 7, take middle slot; if single, squeeze
+                if t.ndim == 2 and t.size(-1) >= 1:
+                    return t[:, t.size(-1) // 2]
+                if t.ndim == 1:
+                    return t
+                return t.reshape(t.size(0), -1)[:, 0]
+
+            # Case 1: PF-style list/tuple per target
+            if isinstance(pred, (list, tuple)):
+                p_vol_t = pred[0]
+                p_dir_t = pred[1] if len(pred) > 1 else None
+                return _point_from_quantiles(p_vol_t), _to_dir_logit(p_dir_t)
+
+
+
+            # Case 2: PF TFT with MultiLoss → concatenated last-dim: [B, 1, 7+1] or [B, 7+1]
+            if torch.is_tensor(pred):
+                t = pred
+                # squeeze prediction-length dim if present → [B, D]
+                if t.ndim == 4 and t.size(1) == 1:
+                    t = t.squeeze(1)          # [B, 2, K]? or [B, 1, D]
+                if t.ndim == 3 and t.size(1) == 1:
+                    t = t[:, 0, :]            # [B, D]
+                if t.ndim == 2:
+                    D = t.size(-1)
+                    if D >= 2:
+                        vol_q = t[:, : D-1]   # first K columns = volatility quantiles
+                        d_log = t[:, D-1]     # last column = direction logit
+                        return _point_from_quantiles(vol_q), d_log
+                    elif D == 1:
+                        # unlikely for vol head, but handle gracefully
+                        return t.squeeze(-1), None
+                # fallback (t not in an expected shape)
+                return _to_median_q(t), None
+            # Fallback: treat as vol-only
+            return _to_median_q(pred), None
+
+
+    
 
 
 # -----------------------------------------------------------------------
@@ -480,13 +553,16 @@ class PerAssetMetrics(pl.Callback):
         x = batch[0]
         if not isinstance(x, dict):
             return
+
         groups = x.get("groups")
         dec_t = x.get("decoder_target")
+
         # optional time index for plotting/joining later
         dec_time = x.get("decoder_time_idx", None)
         if dec_time is None:
             # some PF versions may expose relative index or time via different keys; try a few
             dec_time = x.get("decoder_relative_idx", None)
+
         # also fetch explicit targets from batch[1] as a fallback
         y_batch = batch[1] if isinstance(batch, (list, tuple)) and len(batch) >= 2 else None
         if groups is None:
@@ -525,6 +601,7 @@ class PerAssetMetrics(pl.Callback):
                         y_dir_t = y_dir_t[..., 0]
                     if y_dir_t.ndim == 2 and y_dir_t.size(-1) == 1:
                         y_dir_t = y_dir_t[:, 0]
+
         # Fallback: PF sometimes provides targets in batch[1] as [B, pred_len, n_targets]
         if (y_vol_t is None or y_dir_t is None) and torch.is_tensor(y_batch):
             yb = y_batch
@@ -535,91 +612,27 @@ class PerAssetMetrics(pl.Callback):
                     y_vol_t = yb[:, 0]
                 if y_dir_t is None and yb.size(1) > 1:
                     y_dir_t = yb[:, 1]
+
         if y_vol_t is None:
             return
-      
+
         # Forward pass to get predictions for this batch
         y_hat = pl_module(x)
         pred = getattr(y_hat, "prediction", y_hat)
         if isinstance(pred, dict) and "prediction" in pred:
             pred = pred["prediction"]
 
-        def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
-            # Enforce non-decreasing quantiles along the last dim and take pure median (q=0.5)
-            vol_q = torch.cummax(vol_q, dim=-1).values
-            return vol_q[..., 3]
-
-        def _extract_heads(pred):
-            """Return (p_vol, p_dir) as 1D tensors [B] on DEVICE.
-            Handles outputs as:
-              • list/tuple: [vol(…,7), dir(…,7 or 1/2)]
-              • tensor [B, 2, 7] (after our predict_step squeeze)
-              • tensor [B, 1, 7] (vol only)
-              • tensor [B, 7] (vol only)
-            """
-            import torch
-            def _to_median_q(t):
-                if t is None:
-                    return None
-                if t.ndim == 3 and t.size(1) == 1:
-                    t = t.squeeze(1)       # [B, K]
-                if t.ndim == 2 and t.size(-1) >= 4:
-                    return t[:, 3]         # index of 0.50 in VOL_QUANTILES
-                if t.ndim == 1:
-                    return t
-                return t.reshape(t.size(0), -1)[:, 0]  # last-ditch fallback
-
-            def _to_dir_logit(t):
-                if t is None:
-                    return None
-                if t.ndim == 3 and t.size(1) == 1:
-                    t = t.squeeze(1)  # [B,7] or [B,1]
-                # if replicated across 7, take middle slot; if single, squeeze
-                if t.ndim == 2 and t.size(-1) >= 1:
-                    return t[:, t.size(-1) // 2]
-                if t.ndim == 1:
-                    return t
-                return t.reshape(t.size(0), -1)[:, 0]
-
-            # Case 1: PF-style list/tuple per target
-            if isinstance(pred, (list, tuple)):
-                p_vol_t = pred[0]
-                p_dir_t = pred[1] if len(pred) > 1 else None
-                return _point_from_quantiles(p_vol_t), _to_dir_logit(p_dir_t)
-
-
-
-            # Case 2: PF TFT with MultiLoss → concatenated last-dim: [B, 1, 7+1] or [B, 7+1]
-            if torch.is_tensor(pred):
-                t = pred
-                # squeeze prediction-length dim if present → [B, D]
-                if t.ndim == 4 and t.size(1) == 1:
-                    t = t.squeeze(1)          # [B, 2, K]? or [B, 1, D]
-                if t.ndim == 3 and t.size(1) == 1:
-                    t = t[:, 0, :]            # [B, D]
-                if t.ndim == 2:
-                    D = t.size(-1)
-                    if D >= 2:
-                        vol_q = t[:, : D-1]   # first K columns = volatility quantiles
-                        d_log = t[:, D-1]     # last column = direction logit
-                        return _point_from_quantiles(vol_q), d_log
-                    elif D == 1:
-                        # unlikely for vol head, but handle gracefully
-                        return t.squeeze(-1), None
-                # fallback (t not in an expected shape)
-                return _to_median_q(t), None
-            # Fallback: treat as vol-only
-            return _to_median_q(pred), None
-
+        # --- NEW: use shared head extractor ---
         p_vol, p_dir = _extract_heads(pred)
         if p_vol is None:
-            return
+            return  # nothing usable in this batch
 
         # Store device tensors; no decode/CPU here
         L = g.shape[0]
         self._g_dev.append(g.reshape(L))
         self._yv_dev.append(y_vol_t.reshape(L))
         self._pv_dev.append(p_vol.reshape(L))
+
         # capture time index if available and shape-compatible
         if dec_time is not None and torch.is_tensor(dec_time):
             tvec = dec_time
@@ -1833,50 +1846,12 @@ def _evaluate_decoded_metrics(
             if isinstance(pred, dict) and "prediction" in pred:
                 pred = pred["prediction"]
 
-            K = len(VOL_QUANTILES)  # uses your global list
-            Q50_IDX = VOL_QUANTILES.index(0.50)  # -> 3
+            # Use shared head extractor (consistent with PerAssetMetrics)
+            p_vol, p_dir = _extract_heads(pred)
+            if p_vol is None:
+                continue  # skip batch if no usable vol head
 
-            def _split_heads(pred):
-                """
-                Return (vol_q, dir_logit).
-                vol_q: [B, K]   dir_logit: [B] or None
-                Handles tuple/list outputs and concatenated tensor outputs.
-                """
-                import torch
-                if isinstance(pred, (list, tuple)):
-                    vol_q = pred[0]
-                    if torch.is_tensor(vol_q) and vol_q.ndim == 3 and vol_q.size(1) == 1:
-                        vol_q = vol_q[:, 0, :]                 # [B, K]
-                    d = pred[1] if len(pred) > 1 else None
-                    if torch.is_tensor(d):
-                        if d.ndim == 3 and d.size(1) == 1:
-                            d = d[:, 0, :]
-                        if d.ndim == 2:                        # [B, Ddir]
-                            d = d[:, -1]                       # last logit/prob
-                        else:
-                            d = d.squeeze(-1)
-                    return vol_q, d
-                else:
-                    t = pred
-                    if torch.is_tensor(t):
-                        if t.ndim == 4 and t.size(1) == 1:
-                            t = t.squeeze(1)                   # [B, 1, D] -> [B, D]
-                        if t.ndim == 3 and t.size(1) == 1:
-                            t = t[:, 0, :]                     # [B, D]
-                        D = t.size(-1)
-                        vol_q = t[:, :K]                       # first K = vol quantiles
-                        d = t[:, K] if D >= K + 1 else None    # next = direction (if present)
-                        return vol_q, d
-                    return pred, None
-
-            # ---- split heads & get median quantile (enforce monotone first) ----
-            vol_q, p_dir = _split_heads(pred)
-            if not torch.is_tensor(vol_q):
-                continue
-            vol_q = torch.cummax(vol_q, dim=-1).values        # enforce non-decreasing quantiles
-            p_vol = vol_q[:, Q50_IDX]                         # median q=0.5
-
-            # ---- decode (same as you do below) ----
+            # ---- decode  ----
             y_dec = safe_decode_vol(y_vol.to(model_device).unsqueeze(-1), vol_norm, g.to(model_device).unsqueeze(-1)).squeeze(-1)
             p_dec = safe_decode_vol(p_vol.to(model_device).unsqueeze(-1),  vol_norm, g.to(model_device).unsqueeze(-1)).squeeze(-1)
 
