@@ -150,66 +150,123 @@ def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
 
 #EXTRACT HEADSSSSS
 def _extract_heads(pred):
-            """Return (p_vol, p_dir) as 1D tensors [B] on DEVICE.
-            Handles outputs as:
-              • list/tuple: [vol(…,7), dir(…,7 or 1/2)]
-              • tensor [B, 2, 7] (after our predict_step squeeze)
-              • tensor [B, 1, 7] (vol only)
-              • tensor [B, 7] (vol only)
-            """
-            import torch
-            def _to_median_q(t):
-                if t is None:
-                    return None
-                if t.ndim == 3 and t.size(1) == 1:
-                    t = t.squeeze(1)       # [B, K]
-                if t.ndim == 2 and t.size(-1) >= 4:
-                    return t[:, 3]         # index of 0.50 in VOL_QUANTILES
-                if t.ndim == 1:
-                    return t
-                return t.reshape(t.size(0), -1)[:, 0]  # last-ditch fallback
+    """
+    Return (p_vol, p_dir) as 1D tensors [B] on DEVICE.
 
-            def _to_dir_logit(t):
-                if t is None:
-                    return None
-                if t.ndim == 3 and t.size(1) == 1:
-                    t = t.squeeze(1)  # [B,7] or [B,1]
-                # if replicated across 7, take middle slot; if single, squeeze
-                if t.ndim == 2 and t.size(-1) >= 1:
-                    return t[:, t.size(-1) // 2]
-                if t.ndim == 1:
-                    return t
-                return t.reshape(t.size(0), -1)[:, 0]
+    Handles outputs as:
+      • list/tuple: [vol(…,K=7), dir(…,K or 1)]
+      • tensor [B, 2, K]        (vol quantiles + dir replicated or single)
+      • tensor [B, 1, K]        (vol only)
+      • tensor [B, K]           (vol only)
+      • tensor [B, K+1]         (concatenated: first 7 vol, last 1 dir)
+      • tensor [B, 1, K+1]      (concatenated with a singleton middle dim)
+    """
+    import torch
 
-            # Case 1: PF-style list/tuple per target
-            if isinstance(pred, (list, tuple)):
-                p_vol_t = pred[0]
-                p_dir_t = pred[1] if len(pred) > 1 else None
-                return _point_from_quantiles(p_vol_t), _to_dir_logit(p_dir_t)
+    K = 7         # len(VOL_QUANTILES)
+    MID = 3       # Q50 index when K=7
 
+    def _pick_median_q(vol_q: torch.Tensor) -> torch.Tensor:
+        # make sure last dim has the K quantiles
+        if vol_q.ndim == 3 and vol_q.size(1) == 1:
+            vol_q = vol_q.squeeze(1)            # [B, K]
+        if vol_q.ndim == 3 and vol_q.size(-1) == 1 and vol_q.size(1) == K:
+            vol_q = vol_q.squeeze(-1)           # [B, K]
+        if vol_q.ndim == 2 and vol_q.size(-1) >= K:
+            v = vol_q[:, :K]                    # keep exactly 7
+        elif vol_q.ndim == 2 and vol_q.size(-1) == K:
+            v = vol_q
+        else:
+            v = vol_q.reshape(vol_q.size(0), -1)[:, :K]
+        # enforce monotone and take median
+        v = torch.cummax(v, dim=-1).values
+        return v[:, MID]                        # [B]
 
+    def _pick_dir_logit(dir_t):
+        if dir_t is None:
+            return None
+        if torch.is_tensor(dir_t) and dir_t.ndim == 3 and dir_t.size(1) == 1:
+            dir_t = dir_t.squeeze(1)            # [B, K] or [B, 1]
+        if torch.is_tensor(dir_t) and dir_t.ndim == 3 and dir_t.size(-1) == 1:
+            dir_t = dir_t.squeeze(-1)           # [B, L]
+        if torch.is_tensor(dir_t) and dir_t.ndim == 2:
+            # if replicated across K, take middle; if 1, take that; else take last
+            L = dir_t.size(-1)
+            if L >= K:
+                return dir_t[:, MID]
+            return dir_t[:, -1]
+        if torch.is_tensor(dir_t) and dir_t.ndim == 1:
+            return dir_t
+        if torch.is_tensor(dir_t):
+            return dir_t.reshape(dir_t.size(0), -1)[:, -1]
+        return None
 
-            # Case 2: PF TFT with MultiLoss → concatenated last-dim: [B, 1, 7+1] or [B, 7+1]
-            if torch.is_tensor(pred):
-                t = pred
-                # squeeze prediction-length dim if present → [B, D]
-                if t.ndim == 4 and t.size(1) == 1:
-                    t = t.squeeze(1)          # [B, 2, K]? or [B, 1, D]
-                if t.ndim == 3 and t.size(1) == 1:
-                    t = t[:, 0, :]            # [B, D]
-                if t.ndim == 2:
-                    D = t.size(-1)
-                    if D >= 2:
-                        vol_q = t[:, : D-1]   # first K columns = volatility quantiles
-                        d_log = t[:, D-1]     # last column = direction logit
-                        return _point_from_quantiles(vol_q), d_log
-                    elif D == 1:
-                        # unlikely for vol head, but handle gracefully
-                        return t.squeeze(-1), None
-                # fallback (t not in an expected shape)
-                return _to_median_q(t), None
-            # Fallback: treat as vol-only
-            return _to_median_q(pred), None
+    # ---------------- cases ----------------
+
+    # Case A: list/tuple from PF: [vol, dir]
+    if isinstance(pred, (list, tuple)):
+        vol_q = pred[0]
+        dir_t = pred[1] if len(pred) > 1 else None
+        if torch.is_tensor(vol_q) and vol_q.ndim == 3 and vol_q.size(1) == 1:
+            vol_q = vol_q.squeeze(1)            # [B, K]
+        p_vol = _pick_median_q(vol_q) if torch.is_tensor(vol_q) else None
+        p_dir = _pick_dir_logit(dir_t)
+        return p_vol, p_dir
+
+    if not torch.is_tensor(pred):
+        return None, None
+
+    t = pred
+
+    # Squeeze a singleton prediction-length dim if present
+    if t.ndim == 4 and t.size(1) == 1:
+        t = t.squeeze(1)                         # [B, C, D]
+    if t.ndim == 3 and t.size(1) == 1 and t.size(-1) >= 1:
+        t = t[:, 0, :]                           # [B, D]
+
+    # Case B: [B, 2, K]  → first = vol quantiles, second = dir (K or 1 replicated)
+    if t.ndim == 3 and t.size(1) == 2:
+        vol_q = t[:, 0, :]                       # [B, K] (or [B, >=K], we’ll trim)
+        dir_t = t[:, 1, :]
+        # sometimes dir_t is shape [B, 1] replicated to [B, K]; handle both
+        if dir_t.ndim == 2 and dir_t.size(-1) == 1:
+            dir_t = dir_t[:, 0]
+        p_vol = _pick_median_q(vol_q)
+        p_dir = _pick_dir_logit(dir_t)
+        return p_vol, p_dir
+
+    # Case C: [B, K, 2]  → last dim=2 (vol, dir)
+    if t.ndim == 3 and t.size(-1) == 2 and t.size(1) >= K:
+        vol_q = t[:, :K, 0]                      # [B, K]
+        dir_t = t[:, :K, 1]                      # [B, K] (or fewer)
+        p_vol = _pick_median_q(vol_q)
+        p_dir = _pick_dir_logit(dir_t)
+        return p_vol, p_dir
+
+    # Case D: [B, K+1] (concat: first K vol, last 1 dir) or [B, K] (vol-only)
+    if t.ndim == 2:
+        D = t.size(-1)
+        if D >= K + 1:
+            vol_q = t[:, :K]
+            d_log = t[:, K]
+            return _pick_median_q(vol_q), d_log
+        if D == K:
+            return _pick_median_q(t), None
+        if D == 1:
+            return t.squeeze(-1), None
+        # Unknown 2D layout → try to peel first K as vol and last as dir
+        vol_q = t[:, :K] if D > K else t
+        d_log = t[:, -1] if D > K else None
+        return _pick_median_q(vol_q), d_log
+
+    # Fallback: flatten and try our best
+    if t.ndim >= 1:
+        flat = t.reshape(t.size(0), -1)
+        vol_q = flat[:, :K]
+        d_log = flat[:, K] if flat.size(-1) > K else None
+        return _pick_median_q(vol_q), d_log
+
+    return None, None
 
 
     
