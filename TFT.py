@@ -2615,7 +2615,7 @@ if __name__ == "__main__":
 
     # Extract the same normalizer used for volatility during training
     try:
-        train_vol_norm = _extract_norm_from_dataset(train_dataset)
+        train_vol_norm = _extract_norm_from_dataset(training_dataset)
     except Exception as e:
         print(f"[WARN] could not extract vol_norm from training dataset: {e}")
         train_vol_norm = None
