@@ -1888,7 +1888,7 @@ def _evaluate_decoded_metrics(
                 continue
 
             # groups
-            g = x.get("groups") or x.get("group_ids")
+            g = x.get("groups") if x.get("groups") is not None else x.get("group_ids")
             if isinstance(g, (list, tuple)):
                 g = g[0] if g else None
             if torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
