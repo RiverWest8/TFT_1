@@ -90,6 +90,47 @@ from pytorch_forecasting import (
     TemporalFusionTransformer,
     TimeSeriesDataSet,
 )
+
+# ---- Safer multiprocessing defaults on Linux/GCP ----
+import multiprocessing as _mp
+try:
+    # "forkserver" avoids inheriting stdout/stderr pipes which can trigger BrokenPipe on flush
+    _mp.set_start_method("forkserver", force=True)
+except RuntimeError:
+    # already set elsewhere
+    pass
+try:
+    # helps with CUDA tensor sharing across workers on some kernels
+    torch.multiprocessing.set_sharing_strategy("file_system")
+except Exception:
+    pass
+
+# Patch TimeSeriesDataSet.to_dataloader to always use safe worker settings
+_orig_to_dataloader = TimeSeriesDataSet.to_dataloader
+def _to_dataloader_spawn_safe(self, *args, **kwargs):
+    # num_workers from kwargs or ARGS default
+    nw = kwargs.get("num_workers", getattr(ARGS, "num_workers", 0))
+    try:
+        nw = int(nw)
+    except Exception:
+        nw = 0
+
+    # never keep workers alive between epochs – avoids teardown races/BrokenPipe
+    kwargs["persistent_workers"] = False
+
+    # only pass prefetch_factor when workers > 0 (PyTorch asserts otherwise)
+    if not nw or nw <= 0:
+        kwargs.pop("prefetch_factor", None)
+
+    # use a safe multiprocessing context explicitly
+    try:
+        kwargs["multiprocessing_context"] = _mp.get_context("forkserver")
+    except Exception:
+        pass
+
+    return _orig_to_dataloader(self, *args, **kwargs)
+
+TimeSeriesDataSet.to_dataloader = _to_dataloader_spawn_safe
 from pytorch_forecasting.data import MultiNormalizer, TorchNormalizer
 
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint, TQDMProgressBar
@@ -1864,8 +1905,9 @@ def _evaluate_decoded_metrics(
         train=False,
         batch_size=batch_size,
         num_workers=num_workers,
-        persistent_workers=(num_workers > 0),
-        prefetch_factor=prefetch,
+        # safer defaults: no persistent workers; only prefetch when nw>0; use forkserver context
+        persistent_workers=False,
+        prefetch_factor=(prefetch if (num_workers and num_workers > 0) else None),
         pin_memory=pin_memory,
     )
 
