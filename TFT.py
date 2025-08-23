@@ -2603,15 +2603,17 @@ if __name__ == "__main__":
 
     batch_size = min(BATCH_SIZE, len(training_dataset))
 
-    # DataLoader performance knobs — force single-process to avoid BrokenPipe on this VM/kernel
+    # DataLoader performance knobs — prefer multi-worker, fall back to single-process
     default_workers = max(2, (os.cpu_count() or 4) - 1)
     _cli_workers = int(ARGS.num_workers) if getattr(ARGS, "num_workers", None) is not None else default_workers
     prefetch = int(getattr(ARGS, "prefetch_factor", 8))
     pin = torch.cuda.is_available()
-    # Hard override: single-process data loading everywhere
-    worker_cnt = 0
-    use_persist = False
-    prefetch_kw = {}  # PyTorch forbids prefetch_factor when num_workers == 0
+
+    # Use CLI/default worker count; only disable when explicitly set to 0
+    worker_cnt = max(0, _cli_workers)
+    use_persist = worker_cnt > 0
+    # Only pass prefetch_factor when num_workers > 0
+    prefetch_kw = ({"prefetch_factor": prefetch} if worker_cnt > 0 else {})
 
     test_loader = test_dataset.to_dataloader(
         train=False,
