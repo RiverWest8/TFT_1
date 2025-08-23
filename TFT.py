@@ -124,6 +124,49 @@ Q50_IDX = VOL_QUANTILES.index(0.50)
 # handles both cases safely.
 #
 
+import lightning.pytorch as pl
+from lightning.pytorch.utilities import combined_loader
+from lightning.fabric.utilities import data as fabric_data
+
+# --- Patch CombinedLoader len() so Lightning teardown doesn't crash ---
+if not hasattr(combined_loader.CombinedLoader, "_len_safe_patch"):
+    _orig_len = combined_loader.CombinedLoader.__len__
+
+    def _len_safe(self):
+        try:
+            return _orig_len(self)
+        except RuntimeError as e:
+            if "iter(combined_loader)" in str(e):
+                # fallback: approximate by longest child iterable
+                try:
+                    return max(len(dl) for dl in self.iterables if hasattr(dl, "__len__"))
+                except Exception:
+                    return 0
+            raise
+    combined_loader.CombinedLoader.__len__ = _len_safe
+    combined_loader.CombinedLoader._len_safe_patch = True
+    print("[PATCH] CombinedLoader.__len__ patched to avoid teardown crash")
+
+# --- Patch sized_len used inside fetcher.reset() ---
+if not hasattr(fabric_data, "_sized_len_safe_patch"):
+    _orig_sized_len = fabric_data.sized_len
+
+    def sized_len_safe(obj):
+        try:
+            return _orig_sized_len(obj)
+        except RuntimeError as e:
+            if "iter(combined_loader)" in str(e):
+                # same fallback
+                try:
+                    return max(len(dl) for dl in getattr(obj, "iterables", []) if hasattr(dl, "__len__"))
+                except Exception:
+                    return 0
+            raise
+    fabric_data.sized_len = sized_len_safe
+    fabric_data._sized_len_safe_patch = True
+    print("[PATCH] fabric.utilities.data.sized_len patched")
+
+
 from pytorch_forecasting.data.encoders import GroupNormalizer
 
 # Add a robust log1p mapping as well (for PF versions that lack it or store a bare function)
@@ -1900,7 +1943,8 @@ def _evaluate_decoded_metrics(
         batch_size=batch_size,
         shuffle = False,
         num_workers=num_workers,
-        persistent_workers=(num_workers > 0),
+        persistent_workers= False,
+        multiprocessing_context = "forkserver"
         prefetch_factor=prefetch,
         pin_memory=pin_memory,
     )
