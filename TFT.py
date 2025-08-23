@@ -2783,7 +2783,7 @@ if __name__ == "__main__":
         print(f"↩️  Resuming from checkpoint: {resume_ckpt}")
 
     # Train the model
-    trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
+    trainer.fit(tft, train_dataloaders = train_dataloader, val_dataloaders =val_dataloader, ckpt_path=resume_ckpt)
 
     # Resolve the best checkpoint
     model_for_fi = _resolve_best_model(trainer, fallback=tft)
