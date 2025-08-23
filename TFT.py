@@ -691,7 +691,11 @@ class PerAssetMetrics(pl.Callback):
         x = batch[0]
         if not isinstance(x, dict):
             return
-        groups = x.get("groups") or x.get("group_ids") or x.get("group_id")
+        groups = None
+        for k in ("groups", "group_ids", "group_id"):
+            if k in x and x[k] is not None:
+                groups = x[k]
+                break
         dec_t = x.get("decoder_target")
 
         # optional time index for plotting/joining later
