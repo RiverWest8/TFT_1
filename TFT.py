@@ -1815,23 +1815,16 @@ def subset_time_series(df: pd.DataFrame, max_rows: int | None, mode: str = "per_
 from pytorch_forecasting.data.encoders import GroupNormalizer
 from pytorch_forecasting.data import MultiNormalizer as _PFMulti
 
-def _extract_norm_from_dataset(ds: TimeSeriesDataSet):
+def _extract_norm_from_dataset(ds):
     """
-    Return the *volatility* GroupNormalizer used for realised_vol.
-
+    Return the *volatility* GroupNormalizer used for the first target (realised_vol).
     Works across PF versions where target_normalizer may be:
       - a GroupNormalizer,
-      - a MultiNormalizer holding a list in .normalizers / .normalization / ._normalizers,
+      - a MultiNormalizer holding a list in .normalizers / .normalization,
       - a dict mapping target name -> normalizer.
-    Preference: the first GroupNormalizer; else fall back to the first entry.
+    Preference order: GroupNormalizer for realised_vol, else first normalizer.
     """
     tn = getattr(ds, "target_normalizer", None)
-    if tn is None:
-        # Some PF builds expose parameters via get_parameters()
-        try:
-            tn = ds.get_parameters().get("target_normalizer", None)
-        except Exception:
-            tn = None
     if tn is None:
         raise ValueError("TimeSeriesDataSet has no target_normalizer")
 
@@ -1840,22 +1833,24 @@ def _extract_norm_from_dataset(ds: TimeSeriesDataSet):
         for v in tn.values():
             if isinstance(v, GroupNormalizer):
                 return v
-        # fall back to first value
         return next(iter(tn.values()))
 
-    # MultiNormalizer
+    # MultiNormalizer (PF)
+    try:
+        from pytorch_forecasting.data import MultiNormalizer as _PFMulti
+    except Exception:
+        _PFMulti = MultiNormalizer
+
     if isinstance(tn, _PFMulti):
-        norms = (getattr(tn, "normalizers", None)
-                 or getattr(tn, "normalization", None)
-                 or getattr(tn, "_normalizers", None))
+        norms = getattr(tn, "normalizers", None) or getattr(tn, "normalization", None) or getattr(tn, "_normalizers", None)
         if isinstance(norms, (list, tuple)) and norms:
             for n in norms:
                 if isinstance(n, GroupNormalizer):
                     return n
-            return norms[0]  # fallback: first
-        return tn  # unknown container, return as is
+            return norms[0]
+        return tn  # unknown container
 
-    # already a single normalizer (ideally GroupNormalizer)
+    # already a single normalizer
     return tn
 
 def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
