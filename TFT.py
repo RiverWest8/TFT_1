@@ -1815,40 +1815,40 @@ def subset_time_series(df: pd.DataFrame, max_rows: int | None, mode: str = "per_
 from pytorch_forecasting.data.encoders import GroupNormalizer
 from pytorch_forecasting.data import MultiNormalizer as _PFMulti
 
+from pytorch_forecasting.data.encoders import GroupNormalizer
+from pytorch_forecasting.data import MultiNormalizer as _PFMulti
+
 def _extract_norm_from_dataset(ds):
     """
-    Return the *volatility* GroupNormalizer used for the first target (realised_vol).
-    Works across PF versions where target_normalizer may be:
-      - a GroupNormalizer,
-      - a MultiNormalizer holding a list in .normalizers / .normalization,
-      - a dict mapping target name -> normalizer.
-    Preference order: GroupNormalizer for realised_vol, else first normalizer.
+    Force extraction of the GroupNormalizer for realised_vol.
+    Falls back only if no GroupNormalizer exists.
     """
     tn = getattr(ds, "target_normalizer", None)
     if tn is None:
         raise ValueError("TimeSeriesDataSet has no target_normalizer")
 
-    # dict mapping target name -> normalizer
+    # dict mapping: look explicitly for realised_vol first
     if isinstance(tn, dict):
+        if "realised_vol" in tn and isinstance(tn["realised_vol"], GroupNormalizer):
+            return tn["realised_vol"]
         for v in tn.values():
             if isinstance(v, GroupNormalizer):
                 return v
         return next(iter(tn.values()))
 
-    # MultiNormalizer (PF)
-    try:
-        from pytorch_forecasting.data import MultiNormalizer as _PFMulti
-    except Exception:
-        _PFMulti = MultiNormalizer
-
+    # MultiNormalizer: search only for GroupNormalizer
     if isinstance(tn, _PFMulti):
-        norms = getattr(tn, "normalizers", None) or getattr(tn, "normalization", None) or getattr(tn, "_normalizers", None)
+        norms = (
+            getattr(tn, "normalizers", None)
+            or getattr(tn, "normalization", None)
+            or getattr(tn, "_normalizers", None)
+        )
         if isinstance(norms, (list, tuple)) and norms:
             for n in norms:
                 if isinstance(n, GroupNormalizer):
                     return n
-            return norms[0]
-        return tn  # unknown container
+            return norms[0]  # fallback
+        return tn
 
     # already a single normalizer
     return tn
@@ -1898,6 +1898,7 @@ def _evaluate_decoded_metrics(
     dl = ds.to_dataloader(
         train=False,
         batch_size=batch_size,
+        shuffle = False,
         num_workers=num_workers,
         persistent_workers=(num_workers > 0),
         prefetch_factor=prefetch,
@@ -2145,7 +2146,7 @@ def run_permutation_importance(
         model=model,
         ds=ds_base,
         batch_size=batch_size,
-        max_batches=max_batches,
+        max_batches= None,
         num_workers=num_workers,
         prefetch=prefetch,
         pin_memory=pin_memory,
