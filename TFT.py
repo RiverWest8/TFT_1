@@ -1961,14 +1961,24 @@ def _evaluate_decoded_metrics(
         if p_vol is None:
             continue
 
-        # decode to physical scale with the SAME normalizer
-        y_dec = safe_decode_vol(y_vol.to(model_device).unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
-        p_dec = safe_decode_vol(p_vol.to(model_device).unsqueeze(-1),  vol_norm, g.unsqueeze(-1)).squeeze(-1)
+        # --- Decode realised_vol to physical scale ---
+        y_dec = safe_decode_vol(y_all.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
+        p_dec = safe_decode_vol(p_all.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
 
-        # clamp tiny values
+        # Guard against near-zero decoded vols
         floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
         y_dec = torch.clamp(y_dec, min=floor_val)
         p_dec = torch.clamp(p_dec, min=floor_val)
+
+        # Debug
+        print(f"[FI DEBUG] after decode: mean(y)={y_dec.mean().item():.6f}, mean(p)={p_dec.mean().item():.6f}")
+
+        # --- Metrics ---
+        diff = (p_dec - y_dec)
+        mae  = diff.abs().mean().item()
+        rmse = (diff.pow(2).mean().sqrt().item())
+        qlike = (( (y_dec**2)/(p_dec**2+1e-12) - torch.log((y_dec**2)/(p_dec**2+1e-12)) - 1 )
+                .mean().item())
 
         # collect
         y_all.append(y_dec.detach().cpu())
@@ -2152,7 +2162,7 @@ def run_permutation_importance(
                 print(f"[FI WARN] upload failed: {e}")
     except Exception as e:
         print(f"[FI WARN] could not save FI CSV: {e}")
-        
+
 # -----------------------------------------------------------------------
 # Standard Variable Importance (SVI) via TFT.interpret_output
 # -----------------------------------------------------------------------
