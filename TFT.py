@@ -2601,12 +2601,15 @@ if __name__ == "__main__":
 
     batch_size = min(BATCH_SIZE, len(training_dataset))
 
-    # DataLoader performance knobs
+    # DataLoader performance knobs — force single-process to avoid BrokenPipe on this VM/kernel
     default_workers = max(2, (os.cpu_count() or 4) - 1)
-    worker_cnt = int(ARGS.num_workers) if getattr(ARGS, "num_workers", None) is not None else default_workers
+    _cli_workers = int(ARGS.num_workers) if getattr(ARGS, "num_workers", None) is not None else default_workers
     prefetch = int(getattr(ARGS, "prefetch_factor", 8))
     pin = torch.cuda.is_available()
-    use_persist = worker_cnt > 0
+    # Hard override: single-process data loading everywhere
+    worker_cnt = 0
+    use_persist = False
+    prefetch_kw = {}  # PyTorch forbids prefetch_factor when num_workers == 0
 
     test_loader = test_dataset.to_dataloader(
         train=False,
@@ -2614,7 +2617,7 @@ if __name__ == "__main__":
         num_workers=worker_cnt,
         pin_memory=pin,
         persistent_workers=use_persist,
-        prefetch_factor=prefetch,
+        **prefetch_kw,
     )
 
     train_dataloader = training_dataset.to_dataloader(
@@ -2622,16 +2625,16 @@ if __name__ == "__main__":
         batch_size=batch_size,
         num_workers=worker_cnt,
         persistent_workers=use_persist,
-        prefetch_factor=prefetch,
         pin_memory=pin,
+        **prefetch_kw,
     )
     val_dataloader = validation_dataset.to_dataloader(
         train=False,
         batch_size=batch_size,
         num_workers=worker_cnt,
         persistent_workers=use_persist,
-        prefetch_factor=prefetch,
         pin_memory=pin,
+        **prefetch_kw,
     )
     # --- Test dataset ---
     test_dataset = TimeSeriesDataSet.from_dataset(
@@ -2646,9 +2649,9 @@ if __name__ == "__main__":
         train=False,
         batch_size=batch_size,
         num_workers=worker_cnt,
-        prefetch_factor=prefetch,
         persistent_workers=use_persist,
         pin_memory=pin,
+        **prefetch_kw,
     )
 
     # ---- derive id→asset-name mapping for callbacks ----
