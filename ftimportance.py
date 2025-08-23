@@ -11,6 +11,9 @@ python3 ftimportance.py
 import pytorch_lightning as pl
 
 
+
+
+
 # --- Helpers ---
 def _extract_norm_from_dataset(ds):
     try:
@@ -154,6 +157,20 @@ def run_permutation_importance(model, template_ds, base_df, features,
     out_df.to_csv(out_csv_path, index=False)
     print(f"[FI] wrote {out_csv_path}")
 
+static_categoricals = GROUP_ID
+static_reals: list[str] = []
+
+base_exclude = set(GROUP_ID + [TIME_COL, "time_idx", "rv_scale"] + TARGETS)
+
+all_numeric = [c for c, dt in train_df.dtypes.items()
+                if (c not in base_exclude) and pd.api.types.is_numeric_dtype(dt)]
+
+# Specify future-known and unknown real features
+calendar_cols = ["sin_tod", "cos_tod", "sin_dow", "cos_dow"]
+time_varying_known_reals = calendar_cols + ["Is_Weekend"]
+time_varying_unknown_reals = [
+    c for c in all_numeric if c not in (calendar_cols + ["Is_Weekend"])
+]
 
 # --- Main Entrypoint ---
 if __name__ == "__main__":
