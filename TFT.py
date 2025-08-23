@@ -109,6 +109,31 @@ import argparse
 import pytorch_forecasting as pf
 import inspect
 
+# ---- Safer multiprocessing start method (prevents BrokenPipe on some systems) ----
+import torch.multiprocessing as mp
+try:
+    mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    # already set by another library / context
+    pass
+
+def _make_loader(ds, *, train: bool, batch_size: int, num_workers: int, prefetch_factor: int | None, pin_memory: bool):
+    """
+    Build a DataLoader safely:
+      - prefetch_factor valid only if num_workers > 0
+      - persistent_workers disabled to avoid teardown issues
+    """
+    pf = prefetch_factor if (num_workers and num_workers > 0) else None
+    return ds.to_dataloader(
+        train=train,
+        batch_size=batch_size,
+        num_workers=int(num_workers),
+        prefetch_factor=pf,
+        persistent_workers=False,   # <- important for stability
+        pin_memory=bool(pin_memory),
+        shuffle=train,
+    )
+
 VOL_QUANTILES = [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95]
 Q50_IDX = VOL_QUANTILES.index(0.50)  
 
@@ -2575,14 +2600,6 @@ if __name__ == "__main__":
         prefetch_factor=prefetch,
     )
 
-    train_dataloader = training_dataset.to_dataloader(
-        train=True,
-        batch_size=batch_size,
-        num_workers=worker_cnt,
-        persistent_workers=use_persist,
-        prefetch_factor=prefetch,
-        pin_memory=pin,
-    )
     # Guard: prefetch_factor only valid if num_workers > 0
     pf_val = prefetch if worker_cnt > 0 else None
 
