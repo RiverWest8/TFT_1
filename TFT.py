@@ -2583,31 +2583,35 @@ if __name__ == "__main__":
         prefetch_factor=prefetch,
         pin_memory=pin,
     )
+    # Guard: prefetch_factor only valid if num_workers > 0
+    pf_val = prefetch if worker_cnt > 0 else None
+
+    train_dataloader = training_dataset.to_dataloader(
+        train=True,
+        batch_size=batch_size,
+        num_workers=worker_cnt,
+        persistent_workers=(worker_cnt > 0),
+        prefetch_factor=pf_val,
+        pin_memory=pin,
+    )
+
     val_dataloader = validation_dataset.to_dataloader(
         train=False,
         batch_size=batch_size,
-        num_workers=0,
-        persistent_workers=use_persist,
-        prefetch_factor=prefetch,
+        num_workers=worker_cnt,
+        persistent_workers=(worker_cnt > 0),
+        prefetch_factor=pf_val,
         pin_memory=pin,
     )
-    # --- Test dataset ---
-    test_dataset = TimeSeriesDataSet.from_dataset(
-        training_dataset,
-        test_df,
-        predict=False,
-        stop_randomization=True,
-    )
 
-    # use the same loader knobs as train/val to avoid None / tensor-bool pitfalls
     test_dataloader = test_dataset.to_dataloader(
         train=False,
         batch_size=batch_size,
-        num_workers=0,
-        prefetch_factor=prefetch,
-        persistent_workers=use_persist,
+        num_workers=worker_cnt,
+        persistent_workers=(worker_cnt > 0),
+        prefetch_factor=pf_val,
         pin_memory=pin,
-        shuffle = False,
+        shuffle=False,
     )
 
     # ---- derive id→asset-name mapping for callbacks ----
