@@ -51,6 +51,18 @@ import pandas as pd
 import pandas as _pd
 pd = _pd  # Ensure pd always refers to pandas module
 import lightning.pytorch as pl
+# ---- Disable Lightning/TQDM progress bars globally to avoid BrokenPipe on stdout ----
+import os as _os
+_os.environ["TQDM_DISABLE"] = "1"  # disable tqdm globally
+try:
+    # Force Trainer to start with progress bars disabled regardless of passed kwargs
+    _orig_tr_init = pl.Trainer.__init__
+    def _no_pb_tr_init(self, *args, **kwargs):
+        kwargs["enable_progress_bar"] = False
+        return _orig_tr_init(self, *args, **kwargs)
+    pl.Trainer.__init__ = _no_pb_tr_init
+except Exception:
+    pass
 from lightning.pytorch import Trainer, seed_everything
 from torchmetrics.classification import BinaryAUROC
 import torch
@@ -92,7 +104,7 @@ from pytorch_forecasting import (
 )
 from pytorch_forecasting.data import MultiNormalizer, TorchNormalizer
 
-from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint, TQDMProgressBar
+from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
 
 # --- Cloud / performance helpers ---
@@ -1811,25 +1823,12 @@ def subset_time_series(df: pd.DataFrame, max_rows: int | None, mode: str = "per_
 # -----------------------------------------------------------------------
 
 
-def _extract_norm_from_dataset(ds: TimeSeriesDataSet):
-    """Return the GroupNormalizer used for realised_vol in our MultiNormalizer."""
-    try:
-        norm = ds.get_parameters()["target_normalizer"]
-        if hasattr(norm, "normalizers") and len(norm.normalizers) >= 1:
-            return norm.normalizers[0]
-    except Exception:
-        pass
-    return None
-
-def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
-    """
-    Use the 0.5 quantile (median) to compute a point forecast.
-    Enforces monotonic quantiles first to prevent crossing.
-    """
-    # Enforce non-decreasing quantiles
-    vol_q = torch.cummax(vol_q, dim=-1).values
-    # Take median (index 3 in VOL_QUANTILES)
-    return vol_q[..., 3]
+# NOTE: If you explicitly instantiate a TQDMProgressBar in your callbacks, remove it or comment it out.
+# For example, if you see:
+# callbacks.append(TQDMProgressBar(...))
+# or
+# callbacks = [TQDMProgressBar(...), ...]
+# remove the TQDMProgressBar from the list.
 
 @torch.no_grad()
 def _evaluate_decoded_metrics(
