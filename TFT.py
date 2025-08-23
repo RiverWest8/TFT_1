@@ -1880,7 +1880,71 @@ def subset_time_series(df: pd.DataFrame, max_rows: int | None, mode: str = "per_
 # or
 # callbacks = [TQDMProgressBar(...), ...]
 # remove the TQDMProgressBar from the list.
+# --- Robust PF inverse decode for realised_vol (uses the dataset's normalizer) ---
+def decode_vol_phys(y_enc, vol_norm, group_ids):
+    """
+    Decode encoded realised_vol back to physical scale using the SAME PF normalizer
+    used during training. Works with GroupNormalizer (with transformation="log1p",
+    scale_by_group=True) and with MultiNormalizer (takes the first/vol entry).
 
+    Args:
+        y_enc:      torch.Tensor [B] or [B,1] (encoded)
+        vol_norm:   GroupNormalizer or MultiNormalizer
+        group_ids:  torch.LongTensor [B] or [B,1] of group ids aligned with training encoders
+    Returns:
+        torch.Tensor of decoded values on the physical scale.
+    """
+    import torch
+
+    t = y_enc
+    if not torch.is_tensor(t):
+        t = torch.as_tensor(t)
+    if t.ndim == 1:
+        t = t.unsqueeze(-1)
+
+    # No normalizer available → safest fallback (log1p inverse)
+    if vol_norm is None:
+        try:
+            return torch.expm1(t)
+        except Exception:
+            return t
+
+    # Resolve to the actual volatility normalizer (may be MultiNormalizer)
+    norm = vol_norm
+    try:
+        if hasattr(norm, "normalizers") and norm.normalizers is not None:
+            ns = norm.normalizers
+            if isinstance(ns, (list, tuple)) and len(ns) > 0:
+                norm = ns[0]
+            elif isinstance(ns, dict) and len(ns) > 0:
+                norm = ns.get("realised_vol", next(iter(ns.values())))
+    except Exception:
+        pass
+
+    # Try PF inverse_transform with group ids first, then without
+    try:
+        g = group_ids
+        if g is not None:
+            if not torch.is_tensor(g):
+                g = torch.as_tensor(g)
+            if g.ndim == 1:
+                g = g.unsqueeze(-1)
+            return norm.inverse_transform(t, g.long())
+        return norm.inverse_transform(t)
+    except TypeError:
+        try:
+            return norm.inverse_transform(t)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # Last-resort fallback: log1p inverse
+    try:
+        return torch.expm1(t)
+    except Exception:
+        return t
+    
 @torch.no_grad()
 def _evaluate_decoded_metrics(
     model,
@@ -2763,7 +2827,7 @@ if __name__ == "__main__":
     val_hist_csv = LOCAL_RUN_DIR / f"tft_val_history_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv"
     val_hist_cb  = ValLossHistory(val_hist_csv)
     
-    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=10) 
+    lr_decay_cb = EpochLRDecay(gamma=0.965, start_epoch=8) 
 
     # ----------------------------
     # Trainer instance
