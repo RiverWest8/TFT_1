@@ -2751,6 +2751,7 @@ if __name__ == "__main__":
         callbacks=[best_ckpt_cb, es_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, val_hist_cb],
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
+        enable_progress_bar=True,
     )
 
 
