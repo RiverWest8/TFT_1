@@ -42,6 +42,9 @@ Adjust hyper‑parameters in the CONFIG section below.
 import warnings
 warnings.filterwarnings("ignore")
 
+import os as _os
+_os.environ["TQDM_DISABLE"] = "1"   # hard-disable tqdm everywhere
+
 import os
 from pathlib import Path
 from typing import List
@@ -2707,7 +2710,7 @@ if __name__ == "__main__":
     )
 
     lr_cb = LearningRateMonitor(logging_interval="step")
-    bar_cb = SafeTQDMProgressBar(refresh_rate=int(getattr(ARGS, "log_every_n_steps", 50)))
+    bar_cb = None  # disable progress bar to prevent BrokenPipe on stdout
 
     best_ckpt_cb = ModelCheckpoint(
         monitor="val_auroc_overall",
@@ -2745,7 +2748,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[best_ckpt_cb,bar_cb, es_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, val_hist_cb],
+        callbacks=[best_ckpt_cb, es_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, val_hist_cb],
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
     )
