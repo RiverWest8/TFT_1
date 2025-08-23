@@ -1830,7 +1830,6 @@ def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
     vol_q = torch.cummax(vol_q, dim=-1).values
     # Take median (index 3 in VOL_QUANTILES)
     return vol_q[..., 3]
-
 @torch.no_grad()
 def _evaluate_decoded_metrics(
     model,
@@ -1842,24 +1841,14 @@ def _evaluate_decoded_metrics(
     pin_memory: bool,
     vol_norm=None,
 ):
-    """
-    Compute decoded MAE, RMSE, Brier and QLIKE on up to `max_batches` of ds.
-    Mirrors the validation callback path:
-      • group id extraction → [B]
-      • head extraction via `_extract_heads`
-      • decoding via `safe_decode_vol` with the SAME normalizer
-    Returns: (mae, rmse, brier, qlike, n) where val_loss == QLIKE.
-    """
     import torch
 
-    # -- resolve the same normalizer the dataset/model used
     if vol_norm is None:
         try:
             vol_norm = _extract_norm_from_dataset(ds)
         except Exception:
             vol_norm = None
 
-    # -- dataloader
     dl = ds.to_dataloader(
         train=False,
         batch_size=batch_size,
@@ -1876,157 +1865,98 @@ def _evaluate_decoded_metrics(
 
     model.eval()
 
-    # Collect ENCODED items per-batch; decode once at the end
+    # accumulate ENCODED vols + group_ids
     y_enc_list, p_enc_list, g_list = [], [], []
     yd_list, pd_list = [], []
-
-    def _groups_to_B(g):
-        """Return group ids as [B] tensor regardless of PF shape."""
-        if isinstance(g, (list, tuple)):
-            g = g[0] if g else None
-        if not torch.is_tensor(g):
-            return None
-        while g.ndim > 1:
-            g = g[:, 0]
-        return g.long()
-
-    def _extract_targets(obj):
-        """Extract (y_vol, y_dir) robustly from PF batch tensors."""
-        if torch.is_tensor(obj):
-            t = obj
-            if t.ndim == 3 and t.size(1) == 1:
-                t = t[:, 0, :]  # [B, T]
-            if t.ndim == 2 and t.size(1) >= 1:
-                yv = t[:, 0]
-                yd = t[:, 1] if t.size(1) > 1 else None
-                return yv, yd
-            return None, None
-        if isinstance(obj, (list, tuple)) and obj:
-            yv, yd = obj[0], (obj[1] if len(obj) > 1 else None)
-            if torch.is_tensor(yv):
-                if yv.ndim == 3 and yv.size(-1) == 1: yv = yv[..., 0]
-                if yv.ndim == 3 and yv.size(1) == 1: yv = yv[:, 0, :]
-                if yv.ndim == 2 and yv.size(-1) == 1: yv = yv[:, 0]
-            if torch.is_tensor(yd):
-                if yd.ndim == 3 and yd.size(-1) == 1: yd = yd[..., 0]
-                if yd.ndim == 3 and yd.size(1) == 1: yd = yd[:, 0, :]
-                if yd.ndim == 2 and yd.size(-1) == 1: yd = yd[:, 0]
-            return (yv if torch.is_tensor(yv) else None,
-                    yd if torch.is_tensor(yd) else None)
-        return None, None
 
     for b_idx, batch in enumerate(dl):
         if max_batches is not None and b_idx >= int(max_batches):
             break
-
-        if isinstance(batch, (list, tuple)) and len(batch) >= 2:
-            x, y = batch[0], batch[1]
-        else:
-            x, y = batch, None
+        if not isinstance(batch, (list, tuple)) or len(batch) < 2:
+            continue
+        x, y = batch[0], batch[1]
         if not isinstance(x, dict):
             continue
 
-        # groups -> [B]
-        g = _groups_to_B(x.get("groups"))
-        if g is None:
-            g = _groups_to_B(x.get("group_ids"))
-        if g is None:
+        # groups
+        g = x.get("groups") or x.get("group_ids")
+        if isinstance(g, (list, tuple)):
+            g = g[0]
+        if g is None or not torch.is_tensor(g):
             continue
+        while g.ndim > 1 and g.size(-1) == 1:
+            g = g.squeeze(-1)
 
-        # targets (encoded)
-        dec_t = x.get("decoder_target")
-        if dec_t is None:
-            dec_t = x.get("target")
-        y_vol, y_dir = _extract_targets(dec_t)
-        if (y_vol is None or (y_dir is None and y is not None)) and torch.is_tensor(y):
-            yv2, yd2 = _extract_targets(y)
-            if y_vol is None: y_vol = yv2
-            if y_dir is None: y_dir = yd2
-        if not torch.is_tensor(y_vol):
+        # targets
+        dec_t = x.get("decoder_target") or x.get("target")
+        y_vol, y_dir = None, None
+        if torch.is_tensor(dec_t):
+            if dec_t.ndim == 3 and dec_t.size(1) == 1:
+                dec_t = dec_t[:, 0, :]
+            if dec_t.ndim == 2 and dec_t.size(1) >= 1:
+                y_vol = dec_t[:, 0]
+                if dec_t.size(1) > 1:
+                    y_dir = dec_t[:, 1]
+        if y_vol is None and torch.is_tensor(y):
+            y_vol = y[:, 0, 0] if y.ndim == 3 else y[:, 0]
+
+        if y_vol is None:
             continue
 
         # forward
-        x_dev = {
-            k: (
-                v.to(model_device, non_blocking=True) if torch.is_tensor(v)
-                else [vv.to(model_device, non_blocking=True) if torch.is_tensor(vv) else vv for vv in v]
-                if isinstance(v, (list, tuple)) else v
-            )
-            for k, v in x.items()
-        }
+        x_dev = {k: (v.to(model_device) if torch.is_tensor(v) else v) for k,v in x.items()}
         y_hat = model(x_dev)
         pred = getattr(y_hat, "prediction", y_hat)
         if isinstance(pred, dict) and "prediction" in pred:
             pred = pred["prediction"]
 
-        # extract encoded heads
         p_vol, p_dir = _extract_heads(pred)
         if p_vol is None:
             continue
 
-        # collect ENCODED tensors (cpu) and group ids
-        L = y_vol.shape[0]
-        y_enc_list.append(y_vol.reshape(L).detach().cpu())
-        p_enc_list.append(p_vol.reshape(L).detach().cpu())
-        g_list.append(g.reshape(L).detach().cpu())
+        # accumulate encoded
+        y_enc_list.append(y_vol.detach().cpu())
+        p_enc_list.append(p_vol.detach().cpu())
+        g_list.append(g.detach().cpu())
+        if y_dir is not None and p_dir is not None:
+            yd_list.append(y_dir.reshape(-1).detach().cpu())
+            pd_list.append(p_dir.reshape(-1).detach().cpu())
 
-        if torch.is_tensor(y_dir) and torch.is_tensor(p_dir):
-            yd_flat, pd_flat = y_dir.reshape(-1), p_dir.reshape(-1)
-            L2 = min(yd_flat.numel(), pd_flat.numel())
-            if L2 > 0:
-                yd_list.append(yd_flat[:L2].detach().cpu())
-                pd_list.append(pd_flat[:L2].detach().cpu())
-
-    # aggregate encoded → tensors
     if not y_enc_list:
         return float("nan"), float("nan"), float("nan"), float("nan"), 0
 
-    y_enc = torch.cat(y_enc_list, dim=0)
-    p_enc = torch.cat(p_enc_list, dim=0)
-    g_all = torch.cat(g_list, dim=0)
+    # concat all ENCODED
+    y_enc = torch.cat(y_enc_list)
+    p_enc = torch.cat(p_enc_list)
+    g_all = torch.cat(g_list)
 
-    # --- Decode realised_vol to physical scale (once, vectorised) ---
-    y_dec = safe_decode_vol(y_enc.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
-    p_dec = safe_decode_vol(p_enc.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
+    # --- decode ONCE ---
+    y = safe_decode_vol(y_enc.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
+    p = safe_decode_vol(p_enc.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
 
-    # guard small values
     floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
-    y_dec = torch.clamp(y_dec, min=floor_val)
-    p_dec = torch.clamp(p_dec, min=floor_val)
+    y = torch.clamp(y, min=floor_val)
+    p = torch.clamp(p, min=floor_val)
 
     # metrics
-    diff = p_dec - y_dec
+    diff = p - y
     mae  = diff.abs().mean().item()
-    rmse = torch.sqrt((diff ** 2).mean()).item()
-
+    rmse = diff.pow(2).mean().sqrt().item()
     eps = 1e-8
-    sigma2_p = torch.clamp(p_dec.abs(), min=eps) ** 2
-    sigma2_y = torch.clamp(y_dec.abs(), min=eps) ** 2
+    sigma2_p = torch.clamp(p.abs(), min=eps) ** 2
+    sigma2_y = torch.clamp(y.abs(), min=eps) ** 2
     ratio = sigma2_y / sigma2_p
     qlike = (ratio - torch.log(ratio) - 1.0).mean().item()
 
-    # direction → Brier (label-smoothed as in training)
     brier = float("nan")
     if yd_list and pd_list:
-        yd = torch.cat(yd_list).float()
-        pd = torch.cat(pd_list)
-        try:
-            if torch.isfinite(pd).any() and (pd.min() < 0 or pd.max() > 1):
-                pd = torch.sigmoid(pd)
-        except Exception:
-            pd = torch.sigmoid(pd)
+        yd, pd = torch.cat(yd_list).float(), torch.cat(pd_list)
+        pd = torch.sigmoid(pd) if (pd.min() < 0 or pd.max() > 1) else pd
         pd = torch.clamp(pd, 0.0, 1.0)
         y_smooth = yd * 0.9 + 0.05
-        brier = float(((pd - y_smooth) ** 2).mean().item())
+        brier = ((pd - y_smooth) ** 2).mean().item()
 
-    # sanity print if scale still looks encoded
-    if mae > 0.01:
-        try:
-            print(f"[FI DEBUG] decoded MAE unusually large: MAE={mae:.6f} | mean(y)={y_dec.mean().item():.6f} | mean(p)={p_dec.mean().item():.6f}")
-        except Exception:
-            pass
-
-    return float(mae), float(rmse), float(brier), float(qlike), int(y_dec.numel())
+    return float(mae), float(rmse), float(brier), float(qlike), int(y.numel())
 
 # --- after trainer.fit(...), before running FI ---
 def _resolve_best_model(trainer, fallback):
@@ -2107,9 +2037,7 @@ def run_permutation_importance(
     print(f"[FI] Baseline val_loss = {b_val:.6f} "
           f"(MAE={b_mae:.6f}, RMSE={b_rmse:.6f}, Brier={b_dir:.6f}) | N={n_base}")
 
-    if b_mae > 0.01:
-        print(f"[FI DEBUG] WARNING: baseline decoded MAE unusually large "
-              f"(expected ~0.001–0.003). Check vol_norm and decode pipeline.")
+
 
     rows = []
     work_df = base_df.copy()
