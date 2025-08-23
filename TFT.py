@@ -2586,7 +2586,7 @@ if __name__ == "__main__":
     val_dataloader = validation_dataset.to_dataloader(
         train=False,
         batch_size=batch_size,
-        num_workers=worker_cnt,
+        num_workers=0,
         persistent_workers=use_persist,
         prefetch_factor=prefetch,
         pin_memory=pin,
@@ -2603,7 +2603,7 @@ if __name__ == "__main__":
     test_dataloader = test_dataset.to_dataloader(
         train=False,
         batch_size=batch_size,
-        num_workers=worker_cnt,
+        num_workers=0,
         prefetch_factor=prefetch,
         persistent_workers=use_persist,
         pin_memory=pin,
