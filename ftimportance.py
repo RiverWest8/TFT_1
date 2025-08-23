@@ -3,7 +3,16 @@ import torch
 import pandas as pd
 from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
 from pytorch_forecasting.data.encoders import GroupNormalizer
+"""
+python3 ftimportance.py
+"""
 
+import pytorch_lightning as pl
+
+best_model = TemporalFusionTransformer.load_from_checkpoint(
+    ckpt_path,
+    loss=None  # override the loss so it doesn’t try to load AsymmetricQuantileLoss
+)
 
 # --- Helpers ---
 def _extract_norm_from_dataset(ds):
