@@ -106,6 +106,18 @@ from pytorch_forecasting.data import MultiNormalizer, TorchNormalizer
 
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
+# ---- Compatibility stub: safely neutralize TQDMProgressBar ----
+try:
+    from lightning.pytorch.callbacks import TQDMProgressBar as _RealTQDM
+    # If the real class exists but progress bars are globally disabled, alias a no-op wrapper
+    class TQDMProgressBar(pl.Callback):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+        # No methods overridden → progress bar will not be used/initialized
+except Exception:
+    class TQDMProgressBar(pl.Callback):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
 
 # --- Cloud / performance helpers ---
 import fsspec
@@ -2677,7 +2689,7 @@ if __name__ == "__main__":
     min_delta = 1e-4
     )
 
-    bar_cb = TQDMProgressBar()
+    bar_cb = None #TQDMProgressBar()
 
     metrics_cb = PerAssetMetrics(
         id_to_name=rev_asset,
@@ -2775,7 +2787,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, val_hist_cb],
+        callbacks=[best_ckpt_cb, es_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, val_hist_cb],
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
     )
