@@ -124,49 +124,6 @@ Q50_IDX = VOL_QUANTILES.index(0.50)
 # handles both cases safely.
 #
 
-import lightning.pytorch as pl
-from lightning.pytorch.utilities import combined_loader
-from lightning.fabric.utilities import data as fabric_data
-
-# --- Patch CombinedLoader len() so Lightning teardown doesn't crash ---
-if not hasattr(combined_loader.CombinedLoader, "_len_safe_patch"):
-    _orig_len = combined_loader.CombinedLoader.__len__
-
-    def _len_safe(self):
-        try:
-            return _orig_len(self)
-        except RuntimeError as e:
-            if "iter(combined_loader)" in str(e):
-                # fallback: approximate by longest child iterable
-                try:
-                    return max(len(dl) for dl in self.iterables if hasattr(dl, "__len__"))
-                except Exception:
-                    return 0
-            raise
-    combined_loader.CombinedLoader.__len__ = _len_safe
-    combined_loader.CombinedLoader._len_safe_patch = True
-    print("[PATCH] CombinedLoader.__len__ patched to avoid teardown crash")
-
-# --- Patch sized_len used inside fetcher.reset() ---
-if not hasattr(fabric_data, "_sized_len_safe_patch"):
-    _orig_sized_len = fabric_data.sized_len
-
-    def sized_len_safe(obj):
-        try:
-            return _orig_sized_len(obj)
-        except RuntimeError as e:
-            if "iter(combined_loader)" in str(e):
-                # same fallback
-                try:
-                    return max(len(dl) for dl in getattr(obj, "iterables", []) if hasattr(dl, "__len__"))
-                except Exception:
-                    return 0
-            raise
-    fabric_data.sized_len = sized_len_safe
-    fabric_data._sized_len_safe_patch = True
-    print("[PATCH] fabric.utilities.data.sized_len patched")
-
-
 from pytorch_forecasting.data.encoders import GroupNormalizer
 
 # Add a robust log1p mapping as well (for PF versions that lack it or store a bare function)
@@ -1854,47 +1811,15 @@ def subset_time_series(df: pd.DataFrame, max_rows: int | None, mode: str = "per_
 # -----------------------------------------------------------------------
 
 
-# --- REPLACE the _extract_norm_from_dataset in the FI/helpers section with this ---
-from pytorch_forecasting.data.encoders import GroupNormalizer
-from pytorch_forecasting.data import MultiNormalizer as _PFMulti
-
-from pytorch_forecasting.data.encoders import GroupNormalizer
-from pytorch_forecasting.data import MultiNormalizer as _PFMulti
-
-def _extract_norm_from_dataset(ds):
-    """
-    Force extraction of the GroupNormalizer for realised_vol.
-    Falls back only if no GroupNormalizer exists.
-    """
-    tn = getattr(ds, "target_normalizer", None)
-    if tn is None:
-        raise ValueError("TimeSeriesDataSet has no target_normalizer")
-
-    # dict mapping: look explicitly for realised_vol first
-    if isinstance(tn, dict):
-        if "realised_vol" in tn and isinstance(tn["realised_vol"], GroupNormalizer):
-            return tn["realised_vol"]
-        for v in tn.values():
-            if isinstance(v, GroupNormalizer):
-                return v
-        return next(iter(tn.values()))
-
-    # MultiNormalizer: search only for GroupNormalizer
-    if isinstance(tn, _PFMulti):
-        norms = (
-            getattr(tn, "normalizers", None)
-            or getattr(tn, "normalization", None)
-            or getattr(tn, "_normalizers", None)
-        )
-        if isinstance(norms, (list, tuple)) and norms:
-            for n in norms:
-                if isinstance(n, GroupNormalizer):
-                    return n
-            return norms[0]  # fallback
-        return tn
-
-    # already a single normalizer
-    return tn
+def _extract_norm_from_dataset(ds: TimeSeriesDataSet):
+    """Return the GroupNormalizer used for realised_vol in our MultiNormalizer."""
+    try:
+        norm = ds.get_parameters()["target_normalizer"]
+        if hasattr(norm, "normalizers") and len(norm.normalizers) >= 1:
+            return norm.normalizers[0]
+    except Exception:
+        pass
+    return None
 
 def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
     """
@@ -1906,6 +1831,7 @@ def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
     # Take median (index 3 in VOL_QUANTILES)
     return vol_q[..., 3]
     
+
 @torch.no_grad()
 def _evaluate_decoded_metrics(
     model,
@@ -1918,57 +1844,39 @@ def _evaluate_decoded_metrics(
     vol_norm=None,
 ):
     """
-    Compute decoded MAE, RMSE, Brier and QLIKE on up to `max_batches` of `ds`.
-
-    Key points:
-      • Move the entire nested batch to the model's device before forward()
-      • Accumulate ENCODED targets/preds and group ids on CPU
-      • Decode ONCE at the end using `safe_decode_vol`
-      • Use the same head extractor `_extract_heads` as validation
-
-    Returns: (mae, rmse, brier, qlike, n), where val_loss == QLIKE.
+    Compute decoded MAE, RMSE, Brier and QLIKE on up to `max_batches`.
+    - Safe group-id extraction (no boolean use of tensors)
+    - Collect ENCODED y and p across batches; decode once at the end
+    - Use the same head extractor and safe_decode_vol as validation
+    Returns: (mae, rmse, brier, qlike, n)
     """
     import torch
 
-    # --- resolve the same normalizer used for realised_vol ---
+    # Resolve the same normalizer used for realised_vol
     if vol_norm is None:
         try:
             vol_norm = _extract_norm_from_dataset(ds)
         except Exception:
-            vol_norm = None  # we still try to proceed; safe_decode_vol has fallbacks
+            vol_norm = None
 
-    # --- dataloader ---
+    # Build dataloader
     dl = ds.to_dataloader(
         train=False,
         batch_size=batch_size,
-        shuffle = False,
         num_workers=num_workers,
-        persistent_workers= False,
-        multiprocessing_context = "forkserver",
+        persistent_workers=(num_workers > 0),
         prefetch_factor=prefetch,
         pin_memory=pin_memory,
     )
 
-    # --- model device + safe mover for nested PF batches ---
-    try:
-        model_device = next(model.parameters()).device
-    except Exception:
-        model_device = torch.device("cpu")
+    model.eval()
 
-    def _move_to_device(obj, device):
-        if torch.is_tensor(obj):
-            return obj.to(device, non_blocking=True)
-        if isinstance(obj, (list, tuple)):
-            return type(obj)(_move_to_device(v, device) for v in obj)
-        if isinstance(obj, dict):
-            return {k: _move_to_device(v, device) for k, v in obj.items()}
-        return obj
+    # Accumulate ENCODED vols + group_ids; decode once at end
+    y_enc_list, p_enc_list, g_list = [], [], []
+    yd_list, pd_list = [], []
 
-    def _groups_to_B(x_dict: dict):
-        """
-        Return group ids as [B] LongTensor regardless of PF layout.
-        Avoid boolean ops on tensors.
-        """
+    def _extract_groups(x_dict: dict):
+        """Return group ids as [B] LongTensor (no boolean ops)."""
         g = x_dict.get("groups", None)
         if g is None:
             g = x_dict.get("group_ids", None)
@@ -1976,28 +1884,29 @@ def _evaluate_decoded_metrics(
             g = g[0] if g else None
         if not torch.is_tensor(g):
             return None
-        # Squeeze down to [B]
+        # squeeze trailing singleton dims to [B]
         while g.ndim > 1:
-            g = g[:, 0]
+            g = g[..., 0]
         return g.long()
 
     def _extract_targets(obj):
         """
-        Extract (yv_enc, yd) from PF batch target containers.
-        yv_enc: encoded realised_vol [B]
-        yd    : direction (0/1 or logits pairing length) [B] or None
+        Extract (y_vol, y_dir) from PF batch tensors:
+          obj can be tensor [B,1,T] or [B,T], or a list/tuple [vol, dir]
+        Returns 1D tensors (or None).
         """
         if torch.is_tensor(obj):
             t = obj
             if t.ndim == 3 and t.size(1) == 1:
-                t = t[:, 0, :]               # [B, T]
+                t = t[:, 0, :]  # [B, T]
             if t.ndim == 2 and t.size(1) >= 1:
                 yv = t[:, 0]
                 yd = t[:, 1] if t.size(1) > 1 else None
                 return yv, yd
             return None, None
         if isinstance(obj, (list, tuple)) and obj:
-            yv, yd = obj[0], (obj[1] if len(obj) > 1 else None)
+            yv = obj[0]
+            yd = obj[1] if len(obj) > 1 else None
             if torch.is_tensor(yv):
                 if yv.ndim == 3 and yv.size(-1) == 1: yv = yv[..., 0]
                 if yv.ndim == 3 and yv.size(1) == 1:  yv = yv[:, 0, :]
@@ -2010,115 +1919,102 @@ def _evaluate_decoded_metrics(
                     yd if torch.is_tensor(yd) else None)
         return None, None
 
-    model.eval()
-
-    # Accumulate ENCODED vol + group ids on CPU; decode once at end
-    y_enc_list, p_enc_list, g_list = [], [], []
-    yd_list, pd_list = [], []
-
     for b_idx, batch in enumerate(dl):
         if max_batches is not None and b_idx >= int(max_batches):
             break
 
-        # Unpack PF batch
-        if isinstance(batch, (list, tuple)) and len(batch) >= 2:
-            x, y = batch[0], batch[1]
-        else:
-            x, y = batch, None
+        if not (isinstance(batch, (list, tuple)) and len(batch) >= 2):
+            continue
+        x, y = batch[0], batch[1]
         if not isinstance(x, dict):
             continue
 
         # groups -> [B]
-        g = _groups_to_B(x)
+        g = _extract_groups(x)
         if g is None:
             continue
 
         # targets (encoded)
-        dec_t = x.get("decoder_target")
+        dec_t = x.get("decoder_target", None)
         if dec_t is None:
-            dec_t = x.get("target")
-        y_vol_enc, y_dir = _extract_targets(dec_t)
-        if (y_vol_enc is None or (y_dir is None and y is not None)) and torch.is_tensor(y):
+            dec_t = x.get("target", None)
+        y_vol, y_dir = _extract_targets(dec_t)
+        if (y_vol is None or (y_dir is None and torch.is_tensor(y))) and torch.is_tensor(y):
             yv2, yd2 = _extract_targets(y)
-            if y_vol_enc is None: y_vol_enc = yv2
-            if y_dir is None:     y_dir     = yd2
-        if not torch.is_tensor(y_vol_enc):
+            if y_vol is None: y_vol = yv2
+            if y_dir is None: y_dir = yd2
+        if not torch.is_tensor(y_vol):
             continue
 
-        # ---------- DEVICE-SAFE FORWARD ----------
-        x_dev = _move_to_device(x, model_device)
-        y_hat = model(x_dev)
+        # forward (let Lightning handle device; we keep outputs on CPU)
+        y_hat = model(x)
         pred = getattr(y_hat, "prediction", y_hat)
         if isinstance(pred, dict) and "prediction" in pred:
             pred = pred["prediction"]
 
-        p_vol_enc, p_dir = _extract_heads(pred)
-        if p_vol_enc is None:
+        p_vol, p_dir = _extract_heads(pred)
+        if p_vol is None:
             continue
 
-        # Accumulate (encoded) on CPU; keep memory small
-        B = g.shape[0]
-        y_enc_list.append(y_vol_enc.detach().cpu().reshape(B))
-        p_enc_list.append(p_vol_enc.detach().cpu().reshape(B))
-        g_list.append(g.detach().cpu().reshape(B))
+        # accumulate encoded (CPU)
+        y_enc_list.append(y_vol.detach().cpu().reshape(-1))
+        p_enc_list.append(p_vol.detach().cpu().reshape(-1))
+        g_list.append(g.detach().cpu().reshape(-1))
 
         if torch.is_tensor(y_dir) and torch.is_tensor(p_dir):
             yd_list.append(y_dir.detach().cpu().reshape(-1))
             pd_list.append(p_dir.detach().cpu().reshape(-1))
-        # ---------- END FORWARD LOOP ----------
 
-    # aggregate; if nothing, bail
+    # ---- aggregate & decode once ----
     if not y_enc_list:
         return float("nan"), float("nan"), float("nan"), float("nan"), 0
 
-    # Concatenate ENCODED series and group ids
-    y_enc = torch.cat(y_enc_list, dim=0)
-    p_enc = torch.cat(p_enc_list, dim=0)
-    g_all = torch.cat(g_list, dim=0)
+    y_enc = torch.cat(y_enc_list)          # [N]
+    p_enc = torch.cat(p_enc_list)          # [N]
+    g_all = torch.cat(g_list).long()       # [N]
 
-    # --- Decode once to physical scale ---
-    # shapes: [N] -> [N,1] for decode API
+    # decode on CPU to avoid device mismatches
     y_dec = safe_decode_vol(y_enc.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
     p_dec = safe_decode_vol(p_enc.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
 
-    # Clamp tiny decoded vols to a global floor (consistent with validation)
+    # floor small values
     floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
     y_dec = torch.clamp(y_dec, min=floor_val)
     p_dec = torch.clamp(p_dec, min=floor_val)
 
-    # --- Regression metrics on decoded scale ---
+    # quick sanity print
+    try:
+        print(f"[FI DEBUG] decoded means: mean(y)={y_dec.mean().item():.6f} | mean(p)={p_dec.mean().item():.6f}")
+    except Exception:
+        pass
+
+    # metrics (decoded)
     diff = p_dec - y_dec
     mae  = diff.abs().mean().item()
-    rmse = torch.sqrt((diff ** 2).mean()).item()
+    rmse = diff.pow(2).mean().sqrt().item()
 
     eps = 1e-8
     sigma2_p = torch.clamp(p_dec.abs(), min=eps) ** 2
     sigma2_y = torch.clamp(y_dec.abs(), min=eps) ** 2
-    ratio    = sigma2_y / sigma2_p
-    qlike    = (ratio - torch.log(ratio) - 1.0).mean().item()
+    ratio = sigma2_y / sigma2_p
+    qlike = (ratio - torch.log(ratio) - 1.0).mean().item()
 
-    # --- Direction (Brier) on probabilities if available ---
     brier = float("nan")
     if yd_list and pd_list:
         yd = torch.cat(yd_list).float()
         pd = torch.cat(pd_list)
         try:
-            # convert logits → probs if needed
             if torch.isfinite(pd).any() and (pd.min() < 0 or pd.max() > 1):
                 pd = torch.sigmoid(pd)
         except Exception:
             pd = torch.sigmoid(pd)
         pd = torch.clamp(pd, 0.0, 1.0)
-        # use same smoothing as training callback for stability
         y_smooth = yd * 0.9 + 0.05
-        brier = float(((pd - y_smooth) ** 2).mean().item())
+        brier = ((pd - y_smooth) ** 2).mean().item()
 
-    # Sanity warning if we somehow stayed on encoded scale
+    # warn if scale still looks encoded
     if mae > 0.01:
-        try:
-            print(f"[FI DEBUG] decoded MAE unusually large: MAE={mae:.6f} | mean(y)={y_dec.mean().item():.6f} | mean(p)={p_dec.mean().item():.6f}")
-        except Exception:
-            pass
+        print(f"[FI DEBUG] decoded MAE unusually large: MAE={mae:.6f} | mean(y)={y_dec.mean().item():.6f} | mean(p)={p_dec.mean().item():.6f}")
 
     return float(mae), float(rmse), float(brier), float(qlike), int(y_dec.numel())
 
@@ -2190,7 +2086,7 @@ def run_permutation_importance(
         model=model,
         ds=ds_base,
         batch_size=batch_size,
-        max_batches= None,
+        max_batches=max_batches,
         num_workers=num_workers,
         prefetch=prefetch,
         pin_memory=pin_memory,
@@ -2268,27 +2164,26 @@ def save_standard_variable_importance(
     ds,                                # pass your validation_dataset here
     out_csv_path="standard_variable_importance.csv",
     uploader=None,
-    max_batches: int = 40              # number of batches to aggregate
+    min_samples: int = 10_000,         # target number of samples to aggregate
+    max_batches: int | None = None     # optional hard cap on batches
 ):
     """
-    Compute Standard Variable Importance (SVI) by averaging TFT.interpret_output
-    across exactly `max_batches` batches (or until the dataloader is exhausted).
+    Compute Standard Variable Importance (SVI) by averaging PF's interpret_output
+    across many batches until we have at least `min_samples` examples (or the
+    dataloader is exhausted). Works across PF versions that return dicts/tuples.
 
-    We gather up to three groups (if provided by PF):
+    We gather three groups (if available):
       - encoder variable importance
       - decoder variable importance
       - static variable importance
-
-    Robust to PF versions that do not return 'decoder_attention' or use different keys.
     """
     import numpy as np
     import pandas as pd
     import torch
-    from pathlib import Path
 
     model.eval()
 
-    # ---- helpers ----
+    # ---- utils ----
     def _move_to_device(x, device):
         if isinstance(x, dict):
             out = {}
@@ -2309,30 +2204,33 @@ def save_standard_variable_importance(
         return default
 
     def _norm_out(out_obj):
+        # normalise PF interpret_output return to a dict
         if isinstance(out_obj, dict):
             return out_obj
         if isinstance(out_obj, (list, tuple)):
             for o in out_obj:
                 if isinstance(o, dict):
                     return o
+            # fallback: wrap positional outputs (rare)
             return {"attention": out_obj}
         return {}
 
-    def _to_numpy_vec(a):
+    def _to_numpy_1d(a):
         if a is None:
             return None
         if isinstance(a, torch.Tensor):
-            a = a.detach().cpu().numpy()
-        else:
-            a = np.asarray(a)
-        if a.ndim == 1:
-            return a.astype(float).ravel()
-        if a.ndim >= 2:
-            # PF often returns [B, n_vars]
-            return a.mean(axis=0).astype(float).ravel()
+            a = a.detach().cpu()
+        a = np.asarray(a)
+        # PF often returns [B, n_vars] for reduction='none' → average over B
+        if a.ndim == 2:
+            a = a.mean(axis=0)
+        elif a.ndim > 2:
+            # collapse batch-ish dims
+            new = a.reshape(-1, a.shape[-1]).mean(axis=0)
+            a = new
         return a.astype(float).ravel()
 
-    # names from the dataset (do NOT rely on model.dataset)
+    # names from the dataset (never rely on model.dataset)
     enc_names = list(getattr(ds, "encoder_variables", []) or [])
     dec_names = list(getattr(ds, "decoder_variables", []) or [])
     stat_names = list(
@@ -2341,14 +2239,21 @@ def save_standard_variable_importance(
     )
 
     device = next(model.parameters()).device
+    n_seen = 0
 
+    # running sums (so we can average at the end)
     enc_sum = None
     dec_sum = None
     stat_sum = None
 
+    it = iter(dataloader)
     b = 0
-    for batch in dataloader:
+    while True:
         if max_batches is not None and b >= int(max_batches):
+            break
+        try:
+            batch = next(it)
+        except StopIteration:
             break
         b += 1
 
@@ -2359,28 +2264,56 @@ def save_standard_variable_importance(
 
         x_dev = _move_to_device(x, device)
 
+        # Prefer reduction='none' so we can average across many batches ourselves.
+        # If PF version errors on that, fall back to 'mean'.
         try:
             out = model.interpret_output(x_dev, reduction="none")
         except Exception:
-            try:
-                out = model.interpret_output(x_dev, reduction="mean")
-            except Exception as e:
-                print(f"[SVI] interpret_output failed on batch {b}: {e}")
-                continue
-
+            out = model.interpret_output(x_dev, reduction="mean")
         res = _norm_out(out)
 
         enc_imp = _get_any(res, ["encoder_variables", "encoder_variable_importance", "encoder_importance"])
         dec_imp = _get_any(res, ["decoder_variables", "decoder_variable_importance", "decoder_importance"])
         stat_imp = _get_any(res, ["static_variables", "static_variable_importance", "static_importance"])
 
-        enc_vec = _to_numpy_vec(enc_imp)
-        dec_vec = _to_numpy_vec(dec_imp)
-        stat_vec = _to_numpy_vec(stat_imp)
+        enc_vec = _to_numpy_1d(enc_imp)
+        dec_vec = _to_numpy_1d(dec_imp)
+        stat_vec = _to_numpy_1d(stat_imp)
 
+        # Determine how many samples this batch contributed. With reduction='none'
+        # encoder/decoder often come back as [B, n_vars]; otherwise assume batch size.
+        try:
+            # pick a representative tensor to infer B
+            rep = None
+            for cand in (enc_imp, dec_imp, stat_imp):
+                if isinstance(cand, torch.Tensor) and cand.ndim >= 2:
+                    rep = cand
+                    break
+            if rep is None and isinstance(enc_imp, torch.Tensor):
+                rep = enc_imp
+            if rep is None and isinstance(dec_imp, torch.Tensor):
+                rep = dec_imp
+            if rep is None and isinstance(stat_imp, torch.Tensor):
+                rep = stat_imp
+            if isinstance(rep, torch.Tensor) and rep.ndim >= 2:
+                contrib = rep.shape[0]
+            else:
+                # fallback to batch size if we can find it in x
+                contrib = None
+                for k, v in x.items():
+                    if torch.is_tensor(v) and v.shape[0] > 0:
+                        contrib = v.shape[0]
+                        break
+                if contrib is None:
+                    contrib = 0
+        except Exception:
+            contrib = 0
+
+        # accumulate
         if enc_vec is not None:
             if enc_sum is None:
                 enc_sum = np.zeros_like(enc_vec, dtype=float)
+            # align length to names if needed
             if len(enc_vec) == len(enc_sum):
                 enc_sum += enc_vec
         if dec_vec is not None:
@@ -2394,47 +2327,98 @@ def save_standard_variable_importance(
             if len(stat_vec) == len(stat_sum):
                 stat_sum += stat_vec
 
-    if (enc_sum is None) and (dec_sum is None) and (stat_sum is None):
-        print("[SVI] No variable importance tensors collected; nothing to save.")
+        n_seen += int(contrib)
+
+        # stop once we hit min_samples
+        if n_seen >= int(min_samples):
+            break
+
+    if n_seen == 0:
+        print("[SVI] No samples aggregated; cannot compute variable importance.")
         return
 
-    enc_avg = (enc_sum / max(1, b)) if enc_sum is not None else None
-    dec_avg = (dec_sum / max(1, b)) if dec_sum is not None else None
-    stat_avg = (stat_sum / max(1, b)) if stat_sum is not None else None
+    # average the sums
+    def _avg(vec):
+        return None if vec is None else (vec / max(1, b))
+
+    enc_avg = _avg(enc_sum)
+    dec_avg = _avg(dec_sum)
+    stat_avg = _avg(stat_sum)
 
     rows = []
-
-    def _append_rows(group_name, names, vec):
-        nonlocal rows
-        if vec is None or vec.size == 0 or not names:
-            return
-        L = min(len(names), vec.shape[0])
-        rows.extend(
-            {"group": group_name, "feature": names[i], "importance": float(vec[i])}
-            for i in range(L)
-        )
-
-    _append_rows("encoder", enc_names, enc_avg if enc_avg is not None else np.array([]))
-    _append_rows("decoder", dec_names, dec_avg if dec_avg is not None else np.array([]))
-    _append_rows("static",  stat_names, stat_avg if stat_avg is not None else np.array([]))
+    if enc_avg is not None and len(enc_names) == enc_avg.shape[0]:
+        rows += [{"group": "encoder", "feature": n, "importance": float(v)}
+                 for n, v in zip(enc_names, enc_avg)]
+    if dec_avg is not None and len(dec_names) == dec_avg.shape[0]:
+        rows += [{"group": "decoder", "feature": n, "importance": float(v)}
+                 for n, v in zip(dec_names, dec_avg)]
+    if stat_avg is not None and len(stat_names) == stat_avg.shape[0]:
+        rows += [{"group": "static", "feature": n, "importance": float(v)}
+                 for n, v in zip(stat_names, stat_avg)]
 
     if not rows:
-        print("[SVI] Parsed no variable importances (name/length mismatch?).")
+        print("[SVI] Parsed no variable importances (shape/name mismatch?).")
         return
 
     df = pd.DataFrame(rows).sort_values(["group", "importance"], ascending=[True, False])
-    try:
-        df.to_csv(out_csv_path, index=False)
-        print(f"[SVI] wrote {out_csv_path} | batches={b}")
-    except Exception as e:
-        print(f"[SVI] Failed to save CSV: {e}")
-        return
+    df.to_csv(out_csv_path, index=False)
+    print(f"[SVI] wrote {out_csv_path} | batches={b} | aggregated_samples≈{n_seen}")
 
     if uploader is not None:
         try:
             uploader(out_csv_path, f"{GCS_OUTPUT_PREFIX}/{Path(out_csv_path).name}")
         except Exception as e:
             print(f"[SVI] upload failed: {e}")
+
+
+    # Get names from model dataset if available
+    names = getattr(model.dataset, "encoder_variables", None)
+    if names is None and isinstance(vi, dict) and "variable_names" in vi:
+        names = vi["variable_names"]
+    if names is None and feature_names is not None:
+        names = feature_names
+
+    enc = np.array(vi.get("encoder_variable_importance", [])) if isinstance(vi, dict) else np.array([])
+    dec = np.array(vi.get("decoder_variable_importance", [])) if isinstance(vi, dict) else np.array([])
+    sta = np.array(vi.get("static_variable_importance", [])) if isinstance(vi, dict) else np.array([])
+
+    # Align arrays
+    max_len = max(len(enc), len(dec), len(sta))
+    if names is None:
+        names = [f"var_{i}" for i in range(max_len)]
+
+    def _fix(arr, L):
+        arr = np.array(arr, dtype=float).flatten()
+        if len(arr) < L:
+            arr = np.pad(arr, (0, L - len(arr)), mode="constant")
+        elif len(arr) > L:
+            arr = arr[:L]
+        return arr
+
+    L = max(max_len, len(names))
+    enc, dec, sta = (_fix(enc, L), _fix(dec, L), _fix(sta, L))
+    if len(names) < L:
+        names = names + [f"var_{i}" for i in range(len(names), L)]
+
+    total = enc + dec + sta
+
+    df_vi = pd.DataFrame({
+        "variable": names,
+        "encoder_importance": enc,
+        "decoder_importance": dec,
+        "static_importance": sta,
+        "total": total,
+    }).sort_values("total", ascending=False)
+
+    try:
+        df_vi.to_csv(out_csv_path, index=False)
+        print(f"✓ Saved Standard Variable Importance → {out_csv_path}")
+        try:
+            uploader(out_csv_path, f"{GCS_OUTPUT_PREFIX}/" + os.path.basename(out_csv_path))
+        except Exception as e:
+            print(f"[WARN] Could not upload SVI CSV: {e}")
+    except Exception as e:
+        print(f"[SVI] Failed to save CSV: {e}")
         
 # Data preparation
 # -----------------------------------------------------------------------
@@ -2608,7 +2592,7 @@ if __name__ == "__main__":
     # DataLoader performance knobs
     default_workers = max(2, (os.cpu_count() or 4) - 1)
     worker_cnt = int(ARGS.num_workers) if getattr(ARGS, "num_workers", None) is not None else default_workers
-    prefetch = int((ARGS.prefetch_factor if ARGS.num_workers and ARGS.num_workers > 0 else None))
+    prefetch = int(getattr(ARGS, "prefetch_factor", 8))
     pin = torch.cuda.is_available()
     use_persist = worker_cnt > 0
 
@@ -2785,74 +2769,68 @@ if __name__ == "__main__":
 
     from types import MethodType
 
-    # --- Disable PF's plotting/logging that may touch tensors/figures ---
+    # Completely skip PF's internal figure creation & TensorBoard logging during validation.
     def _no_log_prediction(self, *args, **kwargs):
         # Intentionally do nothing so BaseModel.create_log won't attempt to log a Matplotlib figure.
         return
 
+    tft.log_prediction = MethodType(_no_log_prediction, tft)
+
+    # (Optional, extra safety) If any PF path calls plot_prediction directly, hand back a blank figure
+    # so nothing touches your tensors or bf16 -> NumPy conversion.
     def _blank_plot(self, *args, **kwargs):
-        # Headless-safe backend and a blank figure in case any PF path calls plot_prediction
         import matplotlib
-        matplotlib.use("Agg", force=True)
+        matplotlib.use("Agg", force=True)  # headless-safe backend
         import matplotlib.pyplot as plt
         fig = plt.figure()
         return fig
 
-    # Bind safely
-    try:
-        tft.log_prediction = MethodType(_no_log_prediction, tft)
-    except Exception:
-        pass
-    try:
-        tft.plot_prediction = MethodType(_blank_plot, tft)
-    except Exception:
-        pass
-
-    # --- Resume (optional) and train ---
+    tft.plot_prediction = MethodType(_blank_plot, tft)
     resume_ckpt = get_resume_ckpt_path() if RESUME_ENABLED else None
     if resume_ckpt:
         print(f"↩️  Resuming from checkpoint: {resume_ckpt}")
 
-    trainer.fit(tft, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader, ckpt_path=resume_ckpt)
+    # Train the model
+    trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
 
-    # --- Resolve best model to use for FI/test ---
+    # Resolve the best checkpoint
     model_for_fi = _resolve_best_model(trainer, fallback=tft)
 
-    # --- Extract the SAME normalizer used for realised_vol during training ---
+    # Extract the same normalizer used for volatility during training
     try:
         train_vol_norm = _extract_norm_from_dataset(training_dataset)
     except Exception as e:
         print(f"[WARN] could not extract vol_norm from training dataset: {e}")
-        try:
-            train_vol_norm = _extract_norm_from_dataset(validation_dataset)
-        except Exception as e2:
-            print(f"[WARN] could not extract vol_norm from validation dataset either: {e2}")
-            train_vol_norm = None
-
+        train_vol_norm = None
     # ---- Permutation Importance (decoded) ----
-    if ENABLE_FEATURE_IMPORTANCE:
-        fi_csv = str(LOCAL_OUTPUT_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")
+if ENABLE_FEATURE_IMPORTANCE:
+    fi_csv = str(LOCAL_OUTPUT_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")
+    feats = time_varying_unknown_reals.copy()
+    # optional: drop calendar features from FI
+    feats = [f for f in feats if f not in ("sin_tod", "cos_tod", "sin_dow", "cos_dow", "Is_Weekend")]
 
-        # Start from unknown reals; drop calendar/known cols so we measure pure unknowns
-        feats = time_varying_unknown_reals.copy()
-        feats = [f for f in feats if f not in ("sin_tod", "cos_tod", "sin_dow", "cos_dow", "Is_Weekend")]
+    # Prefer TRAIN dataset as template → guarantees same encoders & normalizers
+    try:
+        train_vol_norm = _extract_norm_from_dataset(training_dataset)
+    except Exception:
+        # fallback to validation dataset if needed
+        train_vol_norm = _extract_norm_from_dataset(validation_dataset)
 
-        # Use TRAIN as the template dataset so encoders/normalizers match exactly
-        run_permutation_importance(
-            model=model_for_fi,
-            template_ds=training_dataset,
-            base_df=val_df,
-            features=feats,
-            block_size=int(PERM_BLOCK_SIZE) if PERM_BLOCK_SIZE else 1,
-            batch_size=BATCH_SIZE,
-            max_batches=int(FI_MAX_BATCHES) if FI_MAX_BATCHES else None,
-            num_workers=worker_cnt,
-            prefetch=prefetch if worker_cnt > 0 else None,
-            pin_memory=pin,
-            vol_norm=train_vol_norm,  # ensure decoded metrics use the same normalizer
-            out_csv_path=fi_csv,
-            uploader=upload_file_to_gcs,
-        )
+    run_permutation_importance(
+        model=model_for_fi,
+        template_ds=training_dataset,          # 👈 use TRAIN template
+        base_df=val_df,
+        features=feats,
+        block_size=int(PERM_BLOCK_SIZE) if PERM_BLOCK_SIZE else 1,
+        batch_size=256,
+        max_batches=int(FI_MAX_BATCHES) if FI_MAX_BATCHES else 40,
+        num_workers=4,
+        prefetch=2,
+        pin_memory=pin,
+        vol_norm=train_vol_norm,               # 👈 ensure decoded metrics
+        out_csv_path=fi_csv,
+        uploader=upload_file_to_gcs,
+    )
     # --- Safe plotting/logging: deep-cast any nested tensors to CPU float32 ---
     # --- Safe plotting/logging: class-level patch to handle bf16 + integer lengths robustly ---
 
@@ -2994,7 +2972,8 @@ save_standard_variable_importance(
     ds=validation_dataset,                                # names come from dataset
     out_csv_path=str(LOCAL_OUTPUT_DIR / "standard_variable_importance.csv"),
     uploader=upload_file_to_gcs,
-    max_batches=40
+    min_samples=10_000,                                   # ← your requirement
+    max_batches=None                                      # or set e.g. 60 as a guard
 )
 
 
