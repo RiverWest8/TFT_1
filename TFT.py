@@ -103,20 +103,6 @@ def __safe_print(*args, **kwargs):
 _builtins = _builtins  # keep a name bound
 _builtins.print = __safe_print
 
-# Force PyTorch-Forecasting TimeSeriesDataSet to create single-process DataLoaders globally
-try:
-    from pytorch_forecasting import TimeSeriesDataSet as _PF_TSD
-    _orig_to_dl = _PF_TSD.to_dataloader
-    def _to_dl_single(self, *args, **kwargs):
-        kwargs["num_workers"] = 0
-        kwargs["persistent_workers"] = False
-        kwargs.pop("prefetch_factor", None)
-        kwargs.pop("multiprocessing_context", None)
-        return _orig_to_dl(self, *args, **kwargs)
-    _PF_TSD.to_dataloader = _to_dl_single
-except Exception:
-    pass
-
 from lightning.pytorch import Trainer, seed_everything
 from torchmetrics.classification import BinaryAUROC
 import torch
@@ -727,7 +713,6 @@ class PerAssetMetrics(pl.Callback):
         x = batch[0]
         if not isinstance(x, dict):
             return
-        print("[DEBUG] on_validation_batch_end got batch with keys:", list(x.keys())[:10])
         groups = x.get("groups") or x.get("group_ids") or x.get("group_id")
         dec_t = x.get("decoder_target")
 
