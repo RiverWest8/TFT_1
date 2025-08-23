@@ -41,6 +41,19 @@ Adjust hyper‑parameters in the CONFIG section below.
 
 import warnings
 warnings.filterwarnings("ignore")
+# ---- Set safest multiprocessing mode as early as possible ----
+import multiprocessing as _mp_early
+try:
+    # Prefer 'spawn' for maximum safety; fall back to 'forkserver' if unavailable
+    _mp_early.set_start_method("spawn", force=True)
+except RuntimeError:
+    # already set in this interpreter; nothing to do
+    pass
+except Exception:
+    try:
+        _mp_early.set_start_method("forkserver", force=True)
+    except Exception:
+        pass
 
 import os
 from pathlib import Path
@@ -56,6 +69,40 @@ from torchmetrics.classification import BinaryAUROC
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# ---- Lightning teardown safety patches (avoid __len__ crash on CombinedLoader) ----
+try:
+    from lightning.pytorch.utilities.combined_loader import CombinedLoader as _PLCombinedLoader
+    _orig_pl_comb_len = _PLCombinedLoader.__len__
+    def _safe_combined_len(self):
+        try:
+            return _orig_pl_comb_len(self)
+        except RuntimeError as e:
+            if "iter(combined_loader)" in str(e):
+                try:
+                    iter(self)
+                    return _orig_pl_comb_len(self)
+                except Exception:
+                    return 0
+            raise
+    _PLCombinedLoader.__len__ = _safe_combined_len
+except Exception:
+    pass
+
+try:
+    from lightning.fabric.utilities import data as _lfu_data
+    _orig_sized_len = _lfu_data.sized_len
+    def _safe_sized_len(dataloader):
+        try:
+            return _orig_sized_len(dataloader)
+        except RuntimeError as e:
+            if "iter(combined_loader)" in str(e):
+                return 0
+            raise
+    _lfu_data.sized_len = _safe_sized_len
+except Exception:
+    pass
+
 def _permute_series_inplace(df: pd.DataFrame, col: str, block: int, group_col: str = "asset") -> None:
     if col not in df.columns:
         return
@@ -91,21 +138,9 @@ from pytorch_forecasting import (
     TimeSeriesDataSet,
 )
 
-# ---- Safer multiprocessing defaults on Linux/GCP ----
-import multiprocessing as _mp
-try:
-    # "forkserver" avoids inheriting stdout/stderr pipes which can trigger BrokenPipe on flush
-    _mp.set_start_method("forkserver", force=True)
-except RuntimeError:
-    # already set elsewhere
-    pass
-try:
-    # helps with CUDA tensor sharing across workers on some kernels
-    torch.multiprocessing.set_sharing_strategy("file_system")
-except Exception:
-    pass
 
-# Patch TimeSeriesDataSet.to_dataloader to always use safe worker settings
+# ---- Safe DataLoader defaults across the script ----
+import multiprocessing as _mp
 _orig_to_dataloader = TimeSeriesDataSet.to_dataloader
 def _to_dataloader_spawn_safe(self, *args, **kwargs):
     # num_workers from kwargs or ARGS default
@@ -115,22 +150,26 @@ def _to_dataloader_spawn_safe(self, *args, **kwargs):
     except Exception:
         nw = 0
 
-    # never keep workers alive between epochs – avoids teardown races/BrokenPipe
+    # do not keep workers alive between epochs – avoids teardown races
     kwargs["persistent_workers"] = False
 
     # only pass prefetch_factor when workers > 0 (PyTorch asserts otherwise)
     if not nw or nw <= 0:
         kwargs.pop("prefetch_factor", None)
 
-    # use a safe multiprocessing context explicitly
+    # use a safe multiprocessing context explicitly (spawn preferred)
     try:
-        kwargs["multiprocessing_context"] = _mp.get_context("forkserver")
+        kwargs["multiprocessing_context"] = _mp.get_context("spawn")
     except Exception:
-        pass
+        try:
+            kwargs["multiprocessing_context"] = _mp.get_context("forkserver")
+        except Exception:
+            pass
 
     return _orig_to_dataloader(self, *args, **kwargs)
 
 TimeSeriesDataSet.to_dataloader = _to_dataloader_spawn_safe
+
 from pytorch_forecasting.data import MultiNormalizer, TorchNormalizer
 
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint, TQDMProgressBar
@@ -1900,12 +1939,10 @@ def _evaluate_decoded_metrics(
         except Exception:
             vol_norm = None
 
-    # Build dataloader
     dl = ds.to_dataloader(
         train=False,
         batch_size=batch_size,
         num_workers=num_workers,
-        # safer defaults: no persistent workers; only prefetch when nw>0; use forkserver context
         persistent_workers=False,
         prefetch_factor=(prefetch if (num_workers and num_workers > 0) else None),
         pin_memory=pin_memory,
