@@ -1830,6 +1830,7 @@ def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
     vol_q = torch.cummax(vol_q, dim=-1).values
     # Take median (index 3 in VOL_QUANTILES)
     return vol_q[..., 3]
+
 @torch.no_grad()
 def _evaluate_decoded_metrics(
     model,
