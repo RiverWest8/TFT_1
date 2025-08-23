@@ -1830,6 +1830,7 @@ def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
     vol_q = torch.cummax(vol_q, dim=-1).values
     # Take median (index 3 in VOL_QUANTILES)
     return vol_q[..., 3]
+    
 
 @torch.no_grad()
 def _evaluate_decoded_metrics(
@@ -1842,14 +1843,23 @@ def _evaluate_decoded_metrics(
     pin_memory: bool,
     vol_norm=None,
 ):
+    """
+    Compute decoded MAE, RMSE, Brier and QLIKE on up to `max_batches`.
+    - Safe group-id extraction (no boolean use of tensors)
+    - Collect ENCODED y and p across batches; decode once at the end
+    - Use the same head extractor and safe_decode_vol as validation
+    Returns: (mae, rmse, brier, qlike, n)
+    """
     import torch
 
+    # Resolve the same normalizer used for realised_vol
     if vol_norm is None:
         try:
             vol_norm = _extract_norm_from_dataset(ds)
         except Exception:
             vol_norm = None
 
+    # Build dataloader
     dl = ds.to_dataloader(
         train=False,
         batch_size=batch_size,
@@ -1859,54 +1869,85 @@ def _evaluate_decoded_metrics(
         pin_memory=pin_memory,
     )
 
-    try:
-        model_device = next(model.parameters()).device
-    except Exception:
-        model_device = torch.device("cpu")
-
     model.eval()
 
-    # accumulate ENCODED vols + group_ids
+    # Accumulate ENCODED vols + group_ids; decode once at end
     y_enc_list, p_enc_list, g_list = [], [], []
     yd_list, pd_list = [], []
+
+    def _extract_groups(x_dict: dict):
+        """Return group ids as [B] LongTensor (no boolean ops)."""
+        g = x_dict.get("groups", None)
+        if g is None:
+            g = x_dict.get("group_ids", None)
+        if isinstance(g, (list, tuple)):
+            g = g[0] if g else None
+        if not torch.is_tensor(g):
+            return None
+        # squeeze trailing singleton dims to [B]
+        while g.ndim > 1:
+            g = g[..., 0]
+        return g.long()
+
+    def _extract_targets(obj):
+        """
+        Extract (y_vol, y_dir) from PF batch tensors:
+          obj can be tensor [B,1,T] or [B,T], or a list/tuple [vol, dir]
+        Returns 1D tensors (or None).
+        """
+        if torch.is_tensor(obj):
+            t = obj
+            if t.ndim == 3 and t.size(1) == 1:
+                t = t[:, 0, :]  # [B, T]
+            if t.ndim == 2 and t.size(1) >= 1:
+                yv = t[:, 0]
+                yd = t[:, 1] if t.size(1) > 1 else None
+                return yv, yd
+            return None, None
+        if isinstance(obj, (list, tuple)) and obj:
+            yv = obj[0]
+            yd = obj[1] if len(obj) > 1 else None
+            if torch.is_tensor(yv):
+                if yv.ndim == 3 and yv.size(-1) == 1: yv = yv[..., 0]
+                if yv.ndim == 3 and yv.size(1) == 1:  yv = yv[:, 0, :]
+                if yv.ndim == 2 and yv.size(-1) == 1: yv = yv[:, 0]
+            if torch.is_tensor(yd):
+                if yd.ndim == 3 and yd.size(-1) == 1: yd = yd[..., 0]
+                if yd.ndim == 3 and yd.size(1) == 1:  yd = yd[:, 0, :]
+                if yd.ndim == 2 and yd.size(-1) == 1: yd = yd[:, 0]
+            return (yv if torch.is_tensor(yv) else None,
+                    yd if torch.is_tensor(yd) else None)
+        return None, None
 
     for b_idx, batch in enumerate(dl):
         if max_batches is not None and b_idx >= int(max_batches):
             break
-        if not isinstance(batch, (list, tuple)) or len(batch) < 2:
+
+        if not (isinstance(batch, (list, tuple)) and len(batch) >= 2):
             continue
         x, y = batch[0], batch[1]
         if not isinstance(x, dict):
             continue
 
-        # groups
-        g = x.get("groups") or x.get("group_ids")
-        if isinstance(g, (list, tuple)):
-            g = g[0]
-        if g is None or not torch.is_tensor(g):
-            continue
-        while g.ndim > 1 and g.size(-1) == 1:
-            g = g.squeeze(-1)
-
-        # targets
-        dec_t = x.get("decoder_target") or x.get("target")
-        y_vol, y_dir = None, None
-        if torch.is_tensor(dec_t):
-            if dec_t.ndim == 3 and dec_t.size(1) == 1:
-                dec_t = dec_t[:, 0, :]
-            if dec_t.ndim == 2 and dec_t.size(1) >= 1:
-                y_vol = dec_t[:, 0]
-                if dec_t.size(1) > 1:
-                    y_dir = dec_t[:, 1]
-        if y_vol is None and torch.is_tensor(y):
-            y_vol = y[:, 0, 0] if y.ndim == 3 else y[:, 0]
-
-        if y_vol is None:
+        # groups -> [B]
+        g = _extract_groups(x)
+        if g is None:
             continue
 
-        # forward
-        x_dev = {k: (v.to(model_device) if torch.is_tensor(v) else v) for k,v in x.items()}
-        y_hat = model(x_dev)
+        # targets (encoded)
+        dec_t = x.get("decoder_target", None)
+        if dec_t is None:
+            dec_t = x.get("target", None)
+        y_vol, y_dir = _extract_targets(dec_t)
+        if (y_vol is None or (y_dir is None and torch.is_tensor(y))) and torch.is_tensor(y):
+            yv2, yd2 = _extract_targets(y)
+            if y_vol is None: y_vol = yv2
+            if y_dir is None: y_dir = yd2
+        if not torch.is_tensor(y_vol):
+            continue
+
+        # forward (let Lightning handle device; we keep outputs on CPU)
+        y_hat = model(x)
         pred = getattr(y_hat, "prediction", y_hat)
         if isinstance(pred, dict) and "prediction" in pred:
             pred = pred["prediction"]
@@ -1915,49 +1956,67 @@ def _evaluate_decoded_metrics(
         if p_vol is None:
             continue
 
-        # accumulate encoded
-        y_enc_list.append(y_vol.detach().cpu())
-        p_enc_list.append(p_vol.detach().cpu())
-        g_list.append(g.detach().cpu())
-        if y_dir is not None and p_dir is not None:
-            yd_list.append(y_dir.reshape(-1).detach().cpu())
-            pd_list.append(p_dir.reshape(-1).detach().cpu())
+        # accumulate encoded (CPU)
+        y_enc_list.append(y_vol.detach().cpu().reshape(-1))
+        p_enc_list.append(p_vol.detach().cpu().reshape(-1))
+        g_list.append(g.detach().cpu().reshape(-1))
 
+        if torch.is_tensor(y_dir) and torch.is_tensor(p_dir):
+            yd_list.append(y_dir.detach().cpu().reshape(-1))
+            pd_list.append(p_dir.detach().cpu().reshape(-1))
+
+    # ---- aggregate & decode once ----
     if not y_enc_list:
         return float("nan"), float("nan"), float("nan"), float("nan"), 0
 
-    # concat all ENCODED
-    y_enc = torch.cat(y_enc_list)
-    p_enc = torch.cat(p_enc_list)
-    g_all = torch.cat(g_list)
+    y_enc = torch.cat(y_enc_list)          # [N]
+    p_enc = torch.cat(p_enc_list)          # [N]
+    g_all = torch.cat(g_list).long()       # [N]
 
-    # --- decode ONCE ---
-    y = safe_decode_vol(y_enc.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
-    p = safe_decode_vol(p_enc.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
+    # decode on CPU to avoid device mismatches
+    y_dec = safe_decode_vol(y_enc.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
+    p_dec = safe_decode_vol(p_enc.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
 
+    # floor small values
     floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
-    y = torch.clamp(y, min=floor_val)
-    p = torch.clamp(p, min=floor_val)
+    y_dec = torch.clamp(y_dec, min=floor_val)
+    p_dec = torch.clamp(p_dec, min=floor_val)
 
-    # metrics
-    diff = p - y
+    # quick sanity print
+    try:
+        print(f"[FI DEBUG] decoded means: mean(y)={y_dec.mean().item():.6f} | mean(p)={p_dec.mean().item():.6f}")
+    except Exception:
+        pass
+
+    # metrics (decoded)
+    diff = p_dec - y_dec
     mae  = diff.abs().mean().item()
     rmse = diff.pow(2).mean().sqrt().item()
+
     eps = 1e-8
-    sigma2_p = torch.clamp(p.abs(), min=eps) ** 2
-    sigma2_y = torch.clamp(y.abs(), min=eps) ** 2
+    sigma2_p = torch.clamp(p_dec.abs(), min=eps) ** 2
+    sigma2_y = torch.clamp(y_dec.abs(), min=eps) ** 2
     ratio = sigma2_y / sigma2_p
     qlike = (ratio - torch.log(ratio) - 1.0).mean().item()
 
     brier = float("nan")
     if yd_list and pd_list:
-        yd, pd = torch.cat(yd_list).float(), torch.cat(pd_list)
-        pd = torch.sigmoid(pd) if (pd.min() < 0 or pd.max() > 1) else pd
+        yd = torch.cat(yd_list).float()
+        pd = torch.cat(pd_list)
+        try:
+            if torch.isfinite(pd).any() and (pd.min() < 0 or pd.max() > 1):
+                pd = torch.sigmoid(pd)
+        except Exception:
+            pd = torch.sigmoid(pd)
         pd = torch.clamp(pd, 0.0, 1.0)
         y_smooth = yd * 0.9 + 0.05
         brier = ((pd - y_smooth) ** 2).mean().item()
 
-    return float(mae), float(rmse), float(brier), float(qlike), int(y.numel())
+    # warn if scale still looks encoded
+    if mae > 0.01:
+        print(f"[FI DEBUG] decoded MAE unusually large: MAE={mae:.6f} | mean(y)={y_dec.mean().item():.6f} | mean(p)={p_dec.mean().item():.6f}")
+
+    return float(mae), float(rmse), float(brier), float(qlike), int(y_dec.numel())
 
 # --- after trainer.fit(...), before running FI ---
 def _resolve_best_model(trainer, fallback):
