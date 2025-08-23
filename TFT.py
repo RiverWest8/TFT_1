@@ -51,18 +51,7 @@ import pandas as pd
 import pandas as _pd
 pd = _pd  # Ensure pd always refers to pandas module
 import lightning.pytorch as pl
-# ---- Disable Lightning/TQDM progress bars globally to avoid BrokenPipe on stdout ----
-import os as _os
-_os.environ["TQDM_DISABLE"] = "1"  # disable tqdm globally
-try:
-    # Force Trainer to start with progress bars disabled regardless of passed kwargs
-    _orig_tr_init = pl.Trainer.__init__
-    def _no_pb_tr_init(self, *args, **kwargs):
-        kwargs["enable_progress_bar"] = False
-        return _orig_tr_init(self, *args, **kwargs)
-    pl.Trainer.__init__ = _no_pb_tr_init
-except Exception:
-    pass
+
 from lightning.pytorch import Trainer, seed_everything
 from torchmetrics.classification import BinaryAUROC
 import torch
@@ -1219,6 +1208,23 @@ class BiasWarmupCallback(pl.Callback):
             f"guard={'ON' if self._frozen else 'off'} "
             f"lr={lr0 if lr0 is not None else 'n/a'}"
         )
+
+import sys
+
+class SafeTQDMProgressBar(TQDMProgressBar):
+    """Write tqdm to stderr to avoid BrokenPipe on stdout; reduce flush frequency."""
+    def __init__(self, refresh_rate: int = 50):
+        super().__init__(refresh_rate=refresh_rate)
+        if not hasattr(self, "_tqdm_kwargs") or self._tqdm_kwargs is None:
+            self._tqdm_kwargs = {}
+        self._tqdm_kwargs.update({
+            "file": sys.stderr,
+            "mininterval": 0.5,      # fewer flushes
+            "dynamic_ncols": True,
+            "leave": True,
+        })
+
+
 
 class MedianMSELoss(nn.Module):
     def forward(self, y_hat_quantiles, y_true):
@@ -2787,7 +2793,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[best_ckpt_cb, es_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, val_hist_cb],
+        callbacks=[best_ckpt_cb,bar_cb, es_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, val_hist_cb],
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
     )
