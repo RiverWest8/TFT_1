@@ -9,10 +9,6 @@ python3 ftimportance.py
 
 import pytorch_lightning as pl
 
-best_model = TemporalFusionTransformer.load_from_checkpoint(
-    ckpt_path,
-    loss=None  # override the loss so it doesn’t try to load AsymmetricQuantileLoss
-)
 
 # --- Helpers ---
 def _extract_norm_from_dataset(ds):
@@ -160,7 +156,12 @@ def run_permutation_importance(model, template_ds, base_df, features,
 
 # --- Main Entrypoint ---
 if __name__ == "__main__":
-    ckpt_path = "/tmp/tft_run/checkpoints/tft_best_e21_20250822T110911Z.ckpt"
+    from TFT import get_resume_ckpt_path  # import your function
+
+    ckpt_path = get_resume_ckpt_path()
+    if ckpt_path is None:
+        raise FileNotFoundError("No checkpoint found for feature importance run.")
+
     best_model = TemporalFusionTransformer.load_from_checkpoint(ckpt_path)
 
     # you must import your val_df and validation_dataset objects here from your training script
