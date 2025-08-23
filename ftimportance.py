@@ -3,6 +3,7 @@ import torch
 import pandas as pd
 from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
 from pytorch_forecasting.data.encoders import GroupNormalizer
+from TFT import val_df, validation_dataset, time_varying_unknown_reals
 """
 python3 ftimportance.py
 """
