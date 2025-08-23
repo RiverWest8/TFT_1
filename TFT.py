@@ -717,6 +717,7 @@ class PerAssetMetrics(pl.Callback):
     @torch.no_grad()
     def on_validation_epoch_start(self, trainer, pl_module):
         self.reset()
+        print(f"[VAL HOOK] start epoch {getattr(trainer,'current_epoch',-1)+1}")
 
     @torch.no_grad()
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx: int = 0):
@@ -726,8 +727,8 @@ class PerAssetMetrics(pl.Callback):
         x = batch[0]
         if not isinstance(x, dict):
             return
-
-        groups = x.get("groups")
+        print("[DEBUG] on_validation_batch_end got batch with keys:", list(x.keys())[:10])
+        groups = x.get("groups") or x.get("group_ids") or x.get("group_id")
         dec_t = x.get("decoder_target")
 
         # optional time index for plotting/joining later
