@@ -2224,27 +2224,24 @@ def save_standard_variable_importance(
     ds,                                # pass your validation_dataset here
     out_csv_path="standard_variable_importance.csv",
     uploader=None,
-    max_batches: int = 40              # number of batches to aggregate
+    max_batches: int = 40,             # number of batches to aggregate
 ):
     """
-    Compute Standard Variable Importance (SVI) by averaging TFT.interpret_output
-    across exactly `max_batches` batches (or until the dataloader is exhausted).
+    Compute Standard Variable Importance (SVI) by averaging PF's interpret_output
+    across up to `max_batches` minibatches. Works across PF versions that return
+    dicts/tuples.
 
-    We gather up to three groups (if provided by PF):
+    We gather three groups (if available):
       - encoder variable importance
       - decoder variable importance
       - static variable importance
-
-    Robust to PF versions that do not return 'decoder_attention' or use different keys.
     """
     import numpy as np
     import pandas as pd
     import torch
-    from pathlib import Path
 
     model.eval()
 
-    # ---- helpers ----
     def _move_to_device(x, device):
         if isinstance(x, dict):
             out = {}
@@ -2258,37 +2255,48 @@ def save_standard_variable_importance(
             return out
         return x
 
+    def _norm_pf_output(y_hat):
+        """
+        Normalize forward() return to the dict that interpret_output expects.
+        PF variants:
+          - dict with keys ('decoder_attention', ...)  -> use directly
+          - object with .output or .prediction         -> use that
+          - plain tensor/list -> wrap or return {}
+        """
+        if isinstance(y_hat, dict):
+            return y_hat
+        # common: object with .output or .prediction
+        for attr in ("output", "prediction"):
+            obj = getattr(y_hat, attr, None)
+            if isinstance(obj, dict):
+                return obj
+        # sometimes forward returns a tuple/list, one of which is a dict
+        if isinstance(y_hat, (list, tuple)):
+            for o in y_hat:
+                if isinstance(o, dict):
+                    return o
+        return {}
+
     def _get_any(d, keys, default=None):
         for k in keys:
             if k in d and d[k] is not None:
                 return d[k]
         return default
 
-    def _norm_out(out_obj):
-        if isinstance(out_obj, dict):
-            return out_obj
-        if isinstance(out_obj, (list, tuple)):
-            for o in out_obj:
-                if isinstance(o, dict):
-                    return o
-            return {"attention": out_obj}
-        return {}
-
-    def _to_numpy_vec(a):
+    def _to_numpy_1d(a):
         if a is None:
             return None
         if isinstance(a, torch.Tensor):
-            a = a.detach().cpu().numpy()
-        else:
-            a = np.asarray(a)
-        if a.ndim == 1:
-            return a.astype(float).ravel()
-        if a.ndim >= 2:
-            # PF often returns [B, n_vars]
-            return a.mean(axis=0).astype(float).ravel()
+            a = a.detach().cpu()
+        a = np.asarray(a)
+        # PF often returns [B, n_vars] for reduction='none' → average over B
+        if a.ndim == 2:
+            a = a.mean(axis=0)
+        elif a.ndim > 2:
+            a = a.reshape(-1, a.shape[-1]).mean(axis=0)
         return a.astype(float).ravel()
 
-    # names from the dataset (do NOT rely on model.dataset)
+    # names from the dataset (never rely on model.dataset)
     enc_names = list(getattr(ds, "encoder_variables", []) or [])
     dec_names = list(getattr(ds, "decoder_variables", []) or [])
     stat_names = list(
@@ -2298,93 +2306,83 @@ def save_standard_variable_importance(
 
     device = next(model.parameters()).device
 
-    enc_sum = None
-    dec_sum = None
-    stat_sum = None
+    # running sums + batch counter
+    enc_sum = dec_sum = stat_sum = None
+    batches_used = 0
 
-    b = 0
-    for batch in dataloader:
-        if max_batches is not None and b >= int(max_batches):
+    for b_idx, batch in enumerate(dataloader):
+        if b_idx >= int(max_batches):
             break
-        b += 1
 
-        # x only; interpret_output will run forward internally
         x = batch[0] if isinstance(batch, (list, tuple)) else batch
         if not isinstance(x, dict):
             continue
-
         x_dev = _move_to_device(x, device)
 
+        # forward pass to get the correct payload
+        y_hat = model(x_dev)
+        out_dict = _norm_pf_output(y_hat)
+        if not out_dict:
+            # as a last resort, try interpreting the forward return directly
+            out_dict = _norm_pf_output(getattr(y_hat, "prediction", {}))
+
+        if not out_dict:
+            # skip this batch if we still don't have a proper dict
+            continue
+
+        # call interpret_output on the OUTPUT, not on x
         try:
-            out = model.interpret_output(x_dev, reduction="none")
+            vi = model.interpret_output(out_dict, reduction="none")
         except Exception:
-            try:
-                out = model.interpret_output(x_dev, reduction="mean")
-            except Exception as e:
-                print(f"[SVI] interpret_output failed on batch {b}: {e}")
-                continue
+            vi = model.interpret_output(out_dict, reduction="mean")
 
-        res = _norm_out(out)
+        # PF key variability
+        enc_imp = _get_any(vi, ["encoder_variables", "encoder_variable_importance", "encoder_importance"])
+        dec_imp = _get_any(vi, ["decoder_variables", "decoder_variable_importance", "decoder_importance"])
+        stat_imp = _get_any(vi, ["static_variables", "static_variable_importance", "static_importance"])
 
-        enc_imp = _get_any(res, ["encoder_variables", "encoder_variable_importance", "encoder_importance"])
-        dec_imp = _get_any(res, ["decoder_variables", "decoder_variable_importance", "decoder_importance"])
-        stat_imp = _get_any(res, ["static_variables", "static_variable_importance", "static_importance"])
-
-        enc_vec = _to_numpy_vec(enc_imp)
-        dec_vec = _to_numpy_vec(dec_imp)
-        stat_vec = _to_numpy_vec(stat_imp)
+        enc_vec = _to_numpy_1d(enc_imp)
+        dec_vec = _to_numpy_1d(dec_imp)
+        stat_vec = _to_numpy_1d(stat_imp)
 
         if enc_vec is not None:
-            if enc_sum is None:
-                enc_sum = np.zeros_like(enc_vec, dtype=float)
-            if len(enc_vec) == len(enc_sum):
-                enc_sum += enc_vec
+            enc_sum = enc_vec if enc_sum is None else (enc_sum + enc_vec)
         if dec_vec is not None:
-            if dec_sum is None:
-                dec_sum = np.zeros_like(dec_vec, dtype=float)
-            if len(dec_vec) == len(dec_sum):
-                dec_sum += dec_vec
+            dec_sum = dec_vec if dec_sum is None else (dec_sum + dec_vec)
         if stat_vec is not None:
-            if stat_sum is None:
-                stat_sum = np.zeros_like(stat_vec, dtype=float)
-            if len(stat_vec) == len(stat_sum):
-                stat_sum += stat_vec
+            stat_sum = stat_vec if stat_sum is None else (stat_sum + stat_vec)
 
-    if (enc_sum is None) and (dec_sum is None) and (stat_sum is None):
-        print("[SVI] No variable importance tensors collected; nothing to save.")
+        batches_used += 1
+
+    if batches_used == 0:
+        print("[SVI] No usable batches; could not compute variable importance.")
         return
 
-    enc_avg = (enc_sum / max(1, b)) if enc_sum is not None else None
-    dec_avg = (dec_sum / max(1, b)) if dec_sum is not None else None
-    stat_avg = (stat_sum / max(1, b)) if stat_sum is not None else None
+    def _avg(vec):
+        return None if vec is None else (vec / batches_used)
+
+    enc_avg = _avg(enc_sum)
+    dec_avg = _avg(dec_sum)
+    stat_avg = _avg(stat_sum)
 
     rows = []
-
-    def _append_rows(group_name, names, vec):
-        nonlocal rows
-        if vec is None or vec.size == 0 or not names:
-            return
-        L = min(len(names), vec.shape[0])
-        rows.extend(
-            {"group": group_name, "feature": names[i], "importance": float(vec[i])}
-            for i in range(L)
-        )
-
-    _append_rows("encoder", enc_names, enc_avg if enc_avg is not None else np.array([]))
-    _append_rows("decoder", dec_names, dec_avg if dec_avg is not None else np.array([]))
-    _append_rows("static",  stat_names, stat_avg if stat_avg is not None else np.array([]))
+    if enc_avg is not None and len(enc_names) == enc_avg.shape[0]:
+        rows += [{"group": "encoder", "feature": n, "importance": float(v)}
+                 for n, v in zip(enc_names, enc_avg)]
+    if dec_avg is not None and len(dec_names) == dec_avg.shape[0]:
+        rows += [{"group": "decoder", "feature": n, "importance": float(v)}
+                 for n, v in zip(dec_names, dec_avg)]
+    if stat_avg is not None and len(stat_names) == stat_avg.shape[0]:
+        rows += [{"group": "static", "feature": n, "importance": float(v)}
+                 for n, v in zip(stat_names, stat_avg)]
 
     if not rows:
-        print("[SVI] Parsed no variable importances (name/length mismatch?).")
+        print("[SVI] Parsed no variable importances (shape/name mismatch?).")
         return
 
     df = pd.DataFrame(rows).sort_values(["group", "importance"], ascending=[True, False])
-    try:
-        df.to_csv(out_csv_path, index=False)
-        print(f"[SVI] wrote {out_csv_path} | batches={b}")
-    except Exception as e:
-        print(f"[SVI] Failed to save CSV: {e}")
-        return
+    df.to_csv(out_csv_path, index=False)
+    print(f"[SVI] wrote {out_csv_path} | batches={batches_used}")
 
     if uploader is not None:
         try:
@@ -2609,6 +2607,7 @@ if __name__ == "__main__":
         prefetch_factor=prefetch,
         persistent_workers=use_persist,
         pin_memory=pin,
+        shuffle = False,
     )
 
     # ---- derive id→asset-name mapping for callbacks ----
@@ -2941,10 +2940,10 @@ except Exception:
 save_standard_variable_importance(
     best_model,
     val_dataloader,
-    ds=validation_dataset,                                # names come from dataset
+    ds=validation_dataset,
     out_csv_path=str(LOCAL_OUTPUT_DIR / "standard_variable_importance.csv"),
     uploader=upload_file_to_gcs,
-    max_batches=40
+    max_batches=40,   # e.g., ~10k samples with bs=256
 )
 
 
