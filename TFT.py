@@ -1945,6 +1945,7 @@ def decode_vol_phys(y_enc, vol_norm, group_ids):
     except Exception:
         return t
     
+
 @torch.no_grad()
 def _evaluate_decoded_metrics(
     model,
@@ -2100,8 +2101,12 @@ def _evaluate_decoded_metrics(
     g_all = torch.cat(g_list, dim=0)
 
     # --- Decode realised_vol to physical scale (once, vectorised) ---
-    y_dec = safe_decode_vol(y_enc.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
-    p_dec = safe_decode_vol(p_enc.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
+    y_dec = decode_vol_phys(y_enc.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
+    p_dec = decode_vol_phys(p_enc.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
+    try:
+        print(f"[EVAL SCALE] mean(y_dec)={y_dec.mean().item():.6f} mean(p_dec)={p_dec.mean().item():.6f}")
+    except Exception:
+        pass
 
     # guard small values
     floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
