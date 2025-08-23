@@ -1831,7 +1831,6 @@ def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
     # Take median (index 3 in VOL_QUANTILES)
     return vol_q[..., 3]
     
-
 @torch.no_grad()
 def _evaluate_decoded_metrics(
     model,
@@ -1844,22 +1843,26 @@ def _evaluate_decoded_metrics(
     vol_norm=None,
 ):
     """
-    Compute decoded MAE, RMSE, Brier and QLIKE on up to `max_batches`.
-    - Safe group-id extraction (no boolean use of tensors)
-    - Collect ENCODED y and p across batches; decode once at the end
-    - Use the same head extractor and safe_decode_vol as validation
-    Returns: (mae, rmse, brier, qlike, n)
+    Compute decoded MAE, RMSE, Brier and QLIKE on up to `max_batches` of `ds`.
+
+    Key points:
+      • Move the entire nested batch to the model's device before forward()
+      • Accumulate ENCODED targets/preds and group ids on CPU
+      • Decode ONCE at the end using `safe_decode_vol`
+      • Use the same head extractor `_extract_heads` as validation
+
+    Returns: (mae, rmse, brier, qlike, n), where val_loss == QLIKE.
     """
     import torch
 
-    # Resolve the same normalizer used for realised_vol
+    # --- resolve the same normalizer used for realised_vol ---
     if vol_norm is None:
         try:
             vol_norm = _extract_norm_from_dataset(ds)
         except Exception:
-            vol_norm = None
+            vol_norm = None  # we still try to proceed; safe_decode_vol has fallbacks
 
-    # Build dataloader
+    # --- dataloader ---
     dl = ds.to_dataloader(
         train=False,
         batch_size=batch_size,
@@ -1869,14 +1872,26 @@ def _evaluate_decoded_metrics(
         pin_memory=pin_memory,
     )
 
-    model.eval()
+    # --- model device + safe mover for nested PF batches ---
+    try:
+        model_device = next(model.parameters()).device
+    except Exception:
+        model_device = torch.device("cpu")
 
-    # Accumulate ENCODED vols + group_ids; decode once at end
-    y_enc_list, p_enc_list, g_list = [], [], []
-    yd_list, pd_list = [], []
+    def _move_to_device(obj, device):
+        if torch.is_tensor(obj):
+            return obj.to(device, non_blocking=True)
+        if isinstance(obj, (list, tuple)):
+            return type(obj)(_move_to_device(v, device) for v in obj)
+        if isinstance(obj, dict):
+            return {k: _move_to_device(v, device) for k, v in obj.items()}
+        return obj
 
-    def _extract_groups(x_dict: dict):
-        """Return group ids as [B] LongTensor (no boolean ops)."""
+    def _groups_to_B(x_dict: dict):
+        """
+        Return group ids as [B] LongTensor regardless of PF layout.
+        Avoid boolean ops on tensors.
+        """
         g = x_dict.get("groups", None)
         if g is None:
             g = x_dict.get("group_ids", None)
@@ -1884,29 +1899,28 @@ def _evaluate_decoded_metrics(
             g = g[0] if g else None
         if not torch.is_tensor(g):
             return None
-        # squeeze trailing singleton dims to [B]
+        # Squeeze down to [B]
         while g.ndim > 1:
-            g = g[..., 0]
+            g = g[:, 0]
         return g.long()
 
     def _extract_targets(obj):
         """
-        Extract (y_vol, y_dir) from PF batch tensors:
-          obj can be tensor [B,1,T] or [B,T], or a list/tuple [vol, dir]
-        Returns 1D tensors (or None).
+        Extract (yv_enc, yd) from PF batch target containers.
+        yv_enc: encoded realised_vol [B]
+        yd    : direction (0/1 or logits pairing length) [B] or None
         """
         if torch.is_tensor(obj):
             t = obj
             if t.ndim == 3 and t.size(1) == 1:
-                t = t[:, 0, :]  # [B, T]
+                t = t[:, 0, :]               # [B, T]
             if t.ndim == 2 and t.size(1) >= 1:
                 yv = t[:, 0]
                 yd = t[:, 1] if t.size(1) > 1 else None
                 return yv, yd
             return None, None
         if isinstance(obj, (list, tuple)) and obj:
-            yv = obj[0]
-            yd = obj[1] if len(obj) > 1 else None
+            yv, yd = obj[0], (obj[1] if len(obj) > 1 else None)
             if torch.is_tensor(yv):
                 if yv.ndim == 3 and yv.size(-1) == 1: yv = yv[..., 0]
                 if yv.ndim == 3 and yv.size(1) == 1:  yv = yv[:, 0, :]
@@ -1919,102 +1933,115 @@ def _evaluate_decoded_metrics(
                     yd if torch.is_tensor(yd) else None)
         return None, None
 
+    model.eval()
+
+    # Accumulate ENCODED vol + group ids on CPU; decode once at end
+    y_enc_list, p_enc_list, g_list = [], [], []
+    yd_list, pd_list = [], []
+
     for b_idx, batch in enumerate(dl):
         if max_batches is not None and b_idx >= int(max_batches):
             break
 
-        if not (isinstance(batch, (list, tuple)) and len(batch) >= 2):
-            continue
-        x, y = batch[0], batch[1]
+        # Unpack PF batch
+        if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+            x, y = batch[0], batch[1]
+        else:
+            x, y = batch, None
         if not isinstance(x, dict):
             continue
 
         # groups -> [B]
-        g = _extract_groups(x)
+        g = _groups_to_B(x)
         if g is None:
             continue
 
         # targets (encoded)
-        dec_t = x.get("decoder_target", None)
+        dec_t = x.get("decoder_target")
         if dec_t is None:
-            dec_t = x.get("target", None)
-        y_vol, y_dir = _extract_targets(dec_t)
-        if (y_vol is None or (y_dir is None and torch.is_tensor(y))) and torch.is_tensor(y):
+            dec_t = x.get("target")
+        y_vol_enc, y_dir = _extract_targets(dec_t)
+        if (y_vol_enc is None or (y_dir is None and y is not None)) and torch.is_tensor(y):
             yv2, yd2 = _extract_targets(y)
-            if y_vol is None: y_vol = yv2
-            if y_dir is None: y_dir = yd2
-        if not torch.is_tensor(y_vol):
+            if y_vol_enc is None: y_vol_enc = yv2
+            if y_dir is None:     y_dir     = yd2
+        if not torch.is_tensor(y_vol_enc):
             continue
 
-        # forward (let Lightning handle device; we keep outputs on CPU)
-        y_hat = model(x)
+        # ---------- DEVICE-SAFE FORWARD ----------
+        x_dev = _move_to_device(x, model_device)
+        y_hat = model(x_dev)
         pred = getattr(y_hat, "prediction", y_hat)
         if isinstance(pred, dict) and "prediction" in pred:
             pred = pred["prediction"]
 
-        p_vol, p_dir = _extract_heads(pred)
-        if p_vol is None:
+        p_vol_enc, p_dir = _extract_heads(pred)
+        if p_vol_enc is None:
             continue
 
-        # accumulate encoded (CPU)
-        y_enc_list.append(y_vol.detach().cpu().reshape(-1))
-        p_enc_list.append(p_vol.detach().cpu().reshape(-1))
-        g_list.append(g.detach().cpu().reshape(-1))
+        # Accumulate (encoded) on CPU; keep memory small
+        B = g.shape[0]
+        y_enc_list.append(y_vol_enc.detach().cpu().reshape(B))
+        p_enc_list.append(p_vol_enc.detach().cpu().reshape(B))
+        g_list.append(g.detach().cpu().reshape(B))
 
         if torch.is_tensor(y_dir) and torch.is_tensor(p_dir):
             yd_list.append(y_dir.detach().cpu().reshape(-1))
             pd_list.append(p_dir.detach().cpu().reshape(-1))
+        # ---------- END FORWARD LOOP ----------
 
-    # ---- aggregate & decode once ----
+    # aggregate; if nothing, bail
     if not y_enc_list:
         return float("nan"), float("nan"), float("nan"), float("nan"), 0
 
-    y_enc = torch.cat(y_enc_list)          # [N]
-    p_enc = torch.cat(p_enc_list)          # [N]
-    g_all = torch.cat(g_list).long()       # [N]
+    # Concatenate ENCODED series and group ids
+    y_enc = torch.cat(y_enc_list, dim=0)
+    p_enc = torch.cat(p_enc_list, dim=0)
+    g_all = torch.cat(g_list, dim=0)
 
-    # decode on CPU to avoid device mismatches
+    # --- Decode once to physical scale ---
+    # shapes: [N] -> [N,1] for decode API
     y_dec = safe_decode_vol(y_enc.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
     p_dec = safe_decode_vol(p_enc.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
 
-    # floor small values
+    # Clamp tiny decoded vols to a global floor (consistent with validation)
     floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
     y_dec = torch.clamp(y_dec, min=floor_val)
     p_dec = torch.clamp(p_dec, min=floor_val)
 
-    # quick sanity print
-    try:
-        print(f"[FI DEBUG] decoded means: mean(y)={y_dec.mean().item():.6f} | mean(p)={p_dec.mean().item():.6f}")
-    except Exception:
-        pass
-
-    # metrics (decoded)
+    # --- Regression metrics on decoded scale ---
     diff = p_dec - y_dec
     mae  = diff.abs().mean().item()
-    rmse = diff.pow(2).mean().sqrt().item()
+    rmse = torch.sqrt((diff ** 2).mean()).item()
 
     eps = 1e-8
     sigma2_p = torch.clamp(p_dec.abs(), min=eps) ** 2
     sigma2_y = torch.clamp(y_dec.abs(), min=eps) ** 2
-    ratio = sigma2_y / sigma2_p
-    qlike = (ratio - torch.log(ratio) - 1.0).mean().item()
+    ratio    = sigma2_y / sigma2_p
+    qlike    = (ratio - torch.log(ratio) - 1.0).mean().item()
 
+    # --- Direction (Brier) on probabilities if available ---
     brier = float("nan")
     if yd_list and pd_list:
         yd = torch.cat(yd_list).float()
         pd = torch.cat(pd_list)
         try:
+            # convert logits → probs if needed
             if torch.isfinite(pd).any() and (pd.min() < 0 or pd.max() > 1):
                 pd = torch.sigmoid(pd)
         except Exception:
             pd = torch.sigmoid(pd)
         pd = torch.clamp(pd, 0.0, 1.0)
+        # use same smoothing as training callback for stability
         y_smooth = yd * 0.9 + 0.05
-        brier = ((pd - y_smooth) ** 2).mean().item()
+        brier = float(((pd - y_smooth) ** 2).mean().item())
 
-    # warn if scale still looks encoded
+    # Sanity warning if we somehow stayed on encoded scale
     if mae > 0.01:
-        print(f"[FI DEBUG] decoded MAE unusually large: MAE={mae:.6f} | mean(y)={y_dec.mean().item():.6f} | mean(p)={p_dec.mean().item():.6f}")
+        try:
+            print(f"[FI DEBUG] decoded MAE unusually large: MAE={mae:.6f} | mean(y)={y_dec.mean().item():.6f} | mean(p)={p_dec.mean().item():.6f}")
+        except Exception:
+            pass
 
     return float(mae), float(rmse), float(brier), float(qlike), int(y_dec.numel())
 
