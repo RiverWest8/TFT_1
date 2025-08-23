@@ -1852,7 +1852,7 @@ def _evaluate_decoded_metrics(
     """
     import torch
 
-    # -- find the same normalizer the model/dataset used during training
+    # -- resolve the same normalizer the dataset/model used
     if vol_norm is None:
         try:
             vol_norm = _extract_norm_from_dataset(ds)
@@ -1875,7 +1875,10 @@ def _evaluate_decoded_metrics(
         model_device = torch.device("cpu")
 
     model.eval()
-    y_all, p_all, yd_all, pd_all = [], [], [], []
+
+    # Collect ENCODED items per-batch; decode once at the end
+    y_enc_list, p_enc_list, g_list = [], [], []
+    yd_list, pd_list = [], []
 
     def _groups_to_B(g):
         """Return group ids as [B] tensor regardless of PF shape."""
@@ -1956,75 +1959,74 @@ def _evaluate_decoded_metrics(
         if isinstance(pred, dict) and "prediction" in pred:
             pred = pred["prediction"]
 
-        # use the SAME head extractor as validation
+        # extract encoded heads
         p_vol, p_dir = _extract_heads(pred)
         if p_vol is None:
             continue
 
-        # --- Decode realised_vol to physical scale ---
-        y_dec = safe_decode_vol(y_all.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
-        p_dec = safe_decode_vol(p_all.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
+        # collect ENCODED tensors (cpu) and group ids
+        L = y_vol.shape[0]
+        y_enc_list.append(y_vol.reshape(L).detach().cpu())
+        p_enc_list.append(p_vol.reshape(L).detach().cpu())
+        g_list.append(g.reshape(L).detach().cpu())
 
-        # Guard against near-zero decoded vols
-        floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
-        y_dec = torch.clamp(y_dec, min=floor_val)
-        p_dec = torch.clamp(p_dec, min=floor_val)
-
-        # Debug
-        print(f"[FI DEBUG] after decode: mean(y)={y_dec.mean().item():.6f}, mean(p)={p_dec.mean().item():.6f}")
-
-        # --- Metrics ---
-        diff = (p_dec - y_dec)
-        mae  = diff.abs().mean().item()
-        rmse = (diff.pow(2).mean().sqrt().item())
-        qlike = (( (y_dec**2)/(p_dec**2+1e-12) - torch.log((y_dec**2)/(p_dec**2+1e-12)) - 1 )
-                .mean().item())
-
-        # collect
-        y_all.append(y_dec.detach().cpu())
-        p_all.append(p_dec.detach().cpu())
         if torch.is_tensor(y_dir) and torch.is_tensor(p_dir):
             yd_flat, pd_flat = y_dir.reshape(-1), p_dir.reshape(-1)
             L2 = min(yd_flat.numel(), pd_flat.numel())
             if L2 > 0:
-                yd_all.append(yd_flat[:L2].detach().cpu())
-                pd_all.append(pd_flat[:L2].detach().cpu())
+                yd_list.append(yd_flat[:L2].detach().cpu())
+                pd_list.append(pd_flat[:L2].detach().cpu())
 
-    # aggregate
-    if not y_all:
+    # aggregate encoded → tensors
+    if not y_enc_list:
         return float("nan"), float("nan"), float("nan"), float("nan"), 0
 
-    y = torch.cat(y_all)
-    p = torch.cat(p_all)
-    mae  = (p - y).abs().mean().item()
-    rmse = torch.sqrt(((p - y) ** 2).mean()).item()
+    y_enc = torch.cat(y_enc_list, dim=0)
+    p_enc = torch.cat(p_enc_list, dim=0)
+    g_all = torch.cat(g_list, dim=0)
+
+    # --- Decode realised_vol to physical scale (once, vectorised) ---
+    y_dec = safe_decode_vol(y_enc.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
+    p_dec = safe_decode_vol(p_enc.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
+
+    # guard small values
+    floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
+    y_dec = torch.clamp(y_dec, min=floor_val)
+    p_dec = torch.clamp(p_dec, min=floor_val)
+
+    # metrics
+    diff = p_dec - y_dec
+    mae  = diff.abs().mean().item()
+    rmse = torch.sqrt((diff ** 2).mean()).item()
 
     eps = 1e-8
-    sigma2_p = torch.clamp(p.abs(), min=eps) ** 2
-    sigma2_y = torch.clamp(y.abs(), min=eps) ** 2
+    sigma2_p = torch.clamp(p_dec.abs(), min=eps) ** 2
+    sigma2_y = torch.clamp(y_dec.abs(), min=eps) ** 2
     ratio = sigma2_y / sigma2_p
     qlike = (ratio - torch.log(ratio) - 1.0).mean().item()
 
+    # direction → Brier (label-smoothed as in training)
     brier = float("nan")
-    if yd_all and pd_all:
-        yd, pd = torch.cat(yd_all).float(), torch.cat(pd_all)
+    if yd_list and pd_list:
+        yd = torch.cat(yd_list).float()
+        pd = torch.cat(pd_list)
         try:
             if torch.isfinite(pd).any() and (pd.min() < 0 or pd.max() > 1):
-                pd = torch.sigmoid(pd)  # logits → probs
+                pd = torch.sigmoid(pd)
         except Exception:
             pd = torch.sigmoid(pd)
         pd = torch.clamp(pd, 0.0, 1.0)
         y_smooth = yd * 0.9 + 0.05
         brier = float(((pd - y_smooth) ** 2).mean().item())
 
-    # sanity: warn if scale suggests we stayed on encoded space
+    # sanity print if scale still looks encoded
     if mae > 0.01:
         try:
-            print(f"[FI DEBUG] decoded MAE unusually large: MAE={mae:.6f} | mean(y)={y.mean().item():.6f} | mean(p)={p.mean().item():.6f}")
+            print(f"[FI DEBUG] decoded MAE unusually large: MAE={mae:.6f} | mean(y)={y_dec.mean().item():.6f} | mean(p)={p_dec.mean().item():.6f}")
         except Exception:
             pass
 
-    return float(mae), float(rmse), float(brier), float(qlike), int(y.numel())
+    return float(mae), float(rmse), float(brier), float(qlike), int(y_dec.numel())
 
 # --- after trainer.fit(...), before running FI ---
 def _resolve_best_model(trainer, fallback):
