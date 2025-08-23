@@ -2224,26 +2224,27 @@ def save_standard_variable_importance(
     ds,                                # pass your validation_dataset here
     out_csv_path="standard_variable_importance.csv",
     uploader=None,
-    min_samples: int = 10_000,         # target number of samples to aggregate
-    max_batches: int | None = None     # optional hard cap on batches
+    max_batches: int = 40              # number of batches to aggregate
 ):
     """
-    Compute Standard Variable Importance (SVI) by averaging PF's interpret_output
-    across many batches until we have at least `min_samples` examples (or the
-    dataloader is exhausted). Works across PF versions that return dicts/tuples.
+    Compute Standard Variable Importance (SVI) by averaging TFT.interpret_output
+    across exactly `max_batches` batches (or until the dataloader is exhausted).
 
-    We gather three groups (if available):
+    We gather up to three groups (if provided by PF):
       - encoder variable importance
       - decoder variable importance
       - static variable importance
+
+    Robust to PF versions that do not return 'decoder_attention' or use different keys.
     """
     import numpy as np
     import pandas as pd
     import torch
+    from pathlib import Path
 
     model.eval()
 
-    # ---- utils ----
+    # ---- helpers ----
     def _move_to_device(x, device):
         if isinstance(x, dict):
             out = {}
@@ -2264,33 +2265,30 @@ def save_standard_variable_importance(
         return default
 
     def _norm_out(out_obj):
-        # normalise PF interpret_output return to a dict
         if isinstance(out_obj, dict):
             return out_obj
         if isinstance(out_obj, (list, tuple)):
             for o in out_obj:
                 if isinstance(o, dict):
                     return o
-            # fallback: wrap positional outputs (rare)
             return {"attention": out_obj}
         return {}
 
-    def _to_numpy_1d(a):
+    def _to_numpy_vec(a):
         if a is None:
             return None
         if isinstance(a, torch.Tensor):
-            a = a.detach().cpu()
-        a = np.asarray(a)
-        # PF often returns [B, n_vars] for reduction='none' → average over B
-        if a.ndim == 2:
-            a = a.mean(axis=0)
-        elif a.ndim > 2:
-            # collapse batch-ish dims
-            new = a.reshape(-1, a.shape[-1]).mean(axis=0)
-            a = new
+            a = a.detach().cpu().numpy()
+        else:
+            a = np.asarray(a)
+        if a.ndim == 1:
+            return a.astype(float).ravel()
+        if a.ndim >= 2:
+            # PF often returns [B, n_vars]
+            return a.mean(axis=0).astype(float).ravel()
         return a.astype(float).ravel()
 
-    # names from the dataset (never rely on model.dataset)
+    # names from the dataset (do NOT rely on model.dataset)
     enc_names = list(getattr(ds, "encoder_variables", []) or [])
     dec_names = list(getattr(ds, "decoder_variables", []) or [])
     stat_names = list(
@@ -2299,21 +2297,14 @@ def save_standard_variable_importance(
     )
 
     device = next(model.parameters()).device
-    n_seen = 0
 
-    # running sums (so we can average at the end)
     enc_sum = None
     dec_sum = None
     stat_sum = None
 
-    it = iter(dataloader)
     b = 0
-    while True:
+    for batch in dataloader:
         if max_batches is not None and b >= int(max_batches):
-            break
-        try:
-            batch = next(it)
-        except StopIteration:
             break
         b += 1
 
@@ -2324,56 +2315,28 @@ def save_standard_variable_importance(
 
         x_dev = _move_to_device(x, device)
 
-        # Prefer reduction='none' so we can average across many batches ourselves.
-        # If PF version errors on that, fall back to 'mean'.
         try:
             out = model.interpret_output(x_dev, reduction="none")
         except Exception:
-            out = model.interpret_output(x_dev, reduction="mean")
+            try:
+                out = model.interpret_output(x_dev, reduction="mean")
+            except Exception as e:
+                print(f"[SVI] interpret_output failed on batch {b}: {e}")
+                continue
+
         res = _norm_out(out)
 
         enc_imp = _get_any(res, ["encoder_variables", "encoder_variable_importance", "encoder_importance"])
         dec_imp = _get_any(res, ["decoder_variables", "decoder_variable_importance", "decoder_importance"])
         stat_imp = _get_any(res, ["static_variables", "static_variable_importance", "static_importance"])
 
-        enc_vec = _to_numpy_1d(enc_imp)
-        dec_vec = _to_numpy_1d(dec_imp)
-        stat_vec = _to_numpy_1d(stat_imp)
+        enc_vec = _to_numpy_vec(enc_imp)
+        dec_vec = _to_numpy_vec(dec_imp)
+        stat_vec = _to_numpy_vec(stat_imp)
 
-        # Determine how many samples this batch contributed. With reduction='none'
-        # encoder/decoder often come back as [B, n_vars]; otherwise assume batch size.
-        try:
-            # pick a representative tensor to infer B
-            rep = None
-            for cand in (enc_imp, dec_imp, stat_imp):
-                if isinstance(cand, torch.Tensor) and cand.ndim >= 2:
-                    rep = cand
-                    break
-            if rep is None and isinstance(enc_imp, torch.Tensor):
-                rep = enc_imp
-            if rep is None and isinstance(dec_imp, torch.Tensor):
-                rep = dec_imp
-            if rep is None and isinstance(stat_imp, torch.Tensor):
-                rep = stat_imp
-            if isinstance(rep, torch.Tensor) and rep.ndim >= 2:
-                contrib = rep.shape[0]
-            else:
-                # fallback to batch size if we can find it in x
-                contrib = None
-                for k, v in x.items():
-                    if torch.is_tensor(v) and v.shape[0] > 0:
-                        contrib = v.shape[0]
-                        break
-                if contrib is None:
-                    contrib = 0
-        except Exception:
-            contrib = 0
-
-        # accumulate
         if enc_vec is not None:
             if enc_sum is None:
                 enc_sum = np.zeros_like(enc_vec, dtype=float)
-            # align length to names if needed
             if len(enc_vec) == len(enc_sum):
                 enc_sum += enc_vec
         if dec_vec is not None:
@@ -2387,98 +2350,47 @@ def save_standard_variable_importance(
             if len(stat_vec) == len(stat_sum):
                 stat_sum += stat_vec
 
-        n_seen += int(contrib)
-
-        # stop once we hit min_samples
-        if n_seen >= int(min_samples):
-            break
-
-    if n_seen == 0:
-        print("[SVI] No samples aggregated; cannot compute variable importance.")
+    if (enc_sum is None) and (dec_sum is None) and (stat_sum is None):
+        print("[SVI] No variable importance tensors collected; nothing to save.")
         return
 
-    # average the sums
-    def _avg(vec):
-        return None if vec is None else (vec / max(1, b))
-
-    enc_avg = _avg(enc_sum)
-    dec_avg = _avg(dec_sum)
-    stat_avg = _avg(stat_sum)
+    enc_avg = (enc_sum / max(1, b)) if enc_sum is not None else None
+    dec_avg = (dec_sum / max(1, b)) if dec_sum is not None else None
+    stat_avg = (stat_sum / max(1, b)) if stat_sum is not None else None
 
     rows = []
-    if enc_avg is not None and len(enc_names) == enc_avg.shape[0]:
-        rows += [{"group": "encoder", "feature": n, "importance": float(v)}
-                 for n, v in zip(enc_names, enc_avg)]
-    if dec_avg is not None and len(dec_names) == dec_avg.shape[0]:
-        rows += [{"group": "decoder", "feature": n, "importance": float(v)}
-                 for n, v in zip(dec_names, dec_avg)]
-    if stat_avg is not None and len(stat_names) == stat_avg.shape[0]:
-        rows += [{"group": "static", "feature": n, "importance": float(v)}
-                 for n, v in zip(stat_names, stat_avg)]
+
+    def _append_rows(group_name, names, vec):
+        nonlocal rows
+        if vec is None or vec.size == 0 or not names:
+            return
+        L = min(len(names), vec.shape[0])
+        rows.extend(
+            {"group": group_name, "feature": names[i], "importance": float(vec[i])}
+            for i in range(L)
+        )
+
+    _append_rows("encoder", enc_names, enc_avg if enc_avg is not None else np.array([]))
+    _append_rows("decoder", dec_names, dec_avg if dec_avg is not None else np.array([]))
+    _append_rows("static",  stat_names, stat_avg if stat_avg is not None else np.array([]))
 
     if not rows:
-        print("[SVI] Parsed no variable importances (shape/name mismatch?).")
+        print("[SVI] Parsed no variable importances (name/length mismatch?).")
         return
 
     df = pd.DataFrame(rows).sort_values(["group", "importance"], ascending=[True, False])
-    df.to_csv(out_csv_path, index=False)
-    print(f"[SVI] wrote {out_csv_path} | batches={b} | aggregated_samples≈{n_seen}")
+    try:
+        df.to_csv(out_csv_path, index=False)
+        print(f"[SVI] wrote {out_csv_path} | batches={b}")
+    except Exception as e:
+        print(f"[SVI] Failed to save CSV: {e}")
+        return
 
     if uploader is not None:
         try:
             uploader(out_csv_path, f"{GCS_OUTPUT_PREFIX}/{Path(out_csv_path).name}")
         except Exception as e:
             print(f"[SVI] upload failed: {e}")
-
-
-    # Get names from model dataset if available
-    names = getattr(model.dataset, "encoder_variables", None)
-    if names is None and isinstance(vi, dict) and "variable_names" in vi:
-        names = vi["variable_names"]
-    if names is None and feature_names is not None:
-        names = feature_names
-
-    enc = np.array(vi.get("encoder_variable_importance", [])) if isinstance(vi, dict) else np.array([])
-    dec = np.array(vi.get("decoder_variable_importance", [])) if isinstance(vi, dict) else np.array([])
-    sta = np.array(vi.get("static_variable_importance", [])) if isinstance(vi, dict) else np.array([])
-
-    # Align arrays
-    max_len = max(len(enc), len(dec), len(sta))
-    if names is None:
-        names = [f"var_{i}" for i in range(max_len)]
-
-    def _fix(arr, L):
-        arr = np.array(arr, dtype=float).flatten()
-        if len(arr) < L:
-            arr = np.pad(arr, (0, L - len(arr)), mode="constant")
-        elif len(arr) > L:
-            arr = arr[:L]
-        return arr
-
-    L = max(max_len, len(names))
-    enc, dec, sta = (_fix(enc, L), _fix(dec, L), _fix(sta, L))
-    if len(names) < L:
-        names = names + [f"var_{i}" for i in range(len(names), L)]
-
-    total = enc + dec + sta
-
-    df_vi = pd.DataFrame({
-        "variable": names,
-        "encoder_importance": enc,
-        "decoder_importance": dec,
-        "static_importance": sta,
-        "total": total,
-    }).sort_values("total", ascending=False)
-
-    try:
-        df_vi.to_csv(out_csv_path, index=False)
-        print(f"✓ Saved Standard Variable Importance → {out_csv_path}")
-        try:
-            uploader(out_csv_path, f"{GCS_OUTPUT_PREFIX}/" + os.path.basename(out_csv_path))
-        except Exception as e:
-            print(f"[WARN] Could not upload SVI CSV: {e}")
-    except Exception as e:
-        print(f"[SVI] Failed to save CSV: {e}")
         
 # Data preparation
 # -----------------------------------------------------------------------
@@ -2829,68 +2741,74 @@ if __name__ == "__main__":
 
     from types import MethodType
 
-    # Completely skip PF's internal figure creation & TensorBoard logging during validation.
+    # --- Disable PF's plotting/logging that may touch tensors/figures ---
     def _no_log_prediction(self, *args, **kwargs):
         # Intentionally do nothing so BaseModel.create_log won't attempt to log a Matplotlib figure.
         return
 
-    tft.log_prediction = MethodType(_no_log_prediction, tft)
-
-    # (Optional, extra safety) If any PF path calls plot_prediction directly, hand back a blank figure
-    # so nothing touches your tensors or bf16 -> NumPy conversion.
     def _blank_plot(self, *args, **kwargs):
+        # Headless-safe backend and a blank figure in case any PF path calls plot_prediction
         import matplotlib
-        matplotlib.use("Agg", force=True)  # headless-safe backend
+        matplotlib.use("Agg", force=True)
         import matplotlib.pyplot as plt
         fig = plt.figure()
         return fig
 
-    tft.plot_prediction = MethodType(_blank_plot, tft)
+    # Bind safely
+    try:
+        tft.log_prediction = MethodType(_no_log_prediction, tft)
+    except Exception:
+        pass
+    try:
+        tft.plot_prediction = MethodType(_blank_plot, tft)
+    except Exception:
+        pass
+
+    # --- Resume (optional) and train ---
     resume_ckpt = get_resume_ckpt_path() if RESUME_ENABLED else None
     if resume_ckpt:
         print(f"↩️  Resuming from checkpoint: {resume_ckpt}")
 
-    # Train the model
-    trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
+    trainer.fit(tft, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader, ckpt_path=resume_ckpt)
 
-    # Resolve the best checkpoint
+    # --- Resolve best model to use for FI/test ---
     model_for_fi = _resolve_best_model(trainer, fallback=tft)
 
-    # Extract the same normalizer used for volatility during training
+    # --- Extract the SAME normalizer used for realised_vol during training ---
     try:
         train_vol_norm = _extract_norm_from_dataset(training_dataset)
     except Exception as e:
         print(f"[WARN] could not extract vol_norm from training dataset: {e}")
-        train_vol_norm = None
+        try:
+            train_vol_norm = _extract_norm_from_dataset(validation_dataset)
+        except Exception as e2:
+            print(f"[WARN] could not extract vol_norm from validation dataset either: {e2}")
+            train_vol_norm = None
+
     # ---- Permutation Importance (decoded) ----
-if ENABLE_FEATURE_IMPORTANCE:
-    fi_csv = str(LOCAL_OUTPUT_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")
-    feats = time_varying_unknown_reals.copy()
-    # optional: drop calendar features from FI
-    feats = [f for f in feats if f not in ("sin_tod", "cos_tod", "sin_dow", "cos_dow", "Is_Weekend")]
+    if ENABLE_FEATURE_IMPORTANCE:
+        fi_csv = str(LOCAL_OUTPUT_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")
 
-    # Prefer TRAIN dataset as template → guarantees same encoders & normalizers
-    try:
-        train_vol_norm = _extract_norm_from_dataset(training_dataset)
-    except Exception:
-        # fallback to validation dataset if needed
-        train_vol_norm = _extract_norm_from_dataset(validation_dataset)
+        # Start from unknown reals; drop calendar/known cols so we measure pure unknowns
+        feats = time_varying_unknown_reals.copy()
+        feats = [f for f in feats if f not in ("sin_tod", "cos_tod", "sin_dow", "cos_dow", "Is_Weekend")]
 
-    run_permutation_importance(
-        model=model_for_fi,
-        template_ds=training_dataset,          # 👈 use TRAIN template
-        base_df=val_df,
-        features=feats,
-        block_size=int(PERM_BLOCK_SIZE) if PERM_BLOCK_SIZE else 1,
-        batch_size=256,
-        max_batches=int(FI_MAX_BATCHES) if FI_MAX_BATCHES else 40,
-        num_workers=4,
-        prefetch=2,
-        pin_memory=pin,
-        vol_norm=train_vol_norm,               # 👈 ensure decoded metrics
-        out_csv_path=fi_csv,
-        uploader=upload_file_to_gcs,
-    )
+        # Use TRAIN as the template dataset so encoders/normalizers match exactly
+        run_permutation_importance(
+            model=model_for_fi,
+            template_ds=training_dataset,
+            base_df=val_df,
+            features=feats,
+            block_size=int(PERM_BLOCK_SIZE) if PERM_BLOCK_SIZE else 1,
+            batch_size=BATCH_SIZE,
+            max_batches=int(FI_MAX_BATCHES) if FI_MAX_BATCHES else None,
+            num_workers=worker_cnt,
+            prefetch=prefetch if worker_cnt > 0 else None,
+            pin_memory=pin,
+            vol_norm=train_vol_norm,  # ensure decoded metrics use the same normalizer
+            out_csv_path=fi_csv,
+            uploader=upload_file_to_gcs,
+        )
     # --- Safe plotting/logging: deep-cast any nested tensors to CPU float32 ---
     # --- Safe plotting/logging: class-level patch to handle bf16 + integer lengths robustly ---
 
@@ -3032,8 +2950,7 @@ save_standard_variable_importance(
     ds=validation_dataset,                                # names come from dataset
     out_csv_path=str(LOCAL_OUTPUT_DIR / "standard_variable_importance.csv"),
     uploader=upload_file_to_gcs,
-    min_samples=10_000,                                   # ← your requirement
-    max_batches=None                                      # or set e.g. 60 as a guard
+    max_batches=40
 )
 
 
