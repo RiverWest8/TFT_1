@@ -2608,7 +2608,7 @@ if __name__ == "__main__":
     # DataLoader performance knobs
     default_workers = max(2, (os.cpu_count() or 4) - 1)
     worker_cnt = int(ARGS.num_workers) if getattr(ARGS, "num_workers", None) is not None else default_workers
-    prefetch = int(getattr(ARGS, "prefetch_factor", 8))
+    prefetch = int((ARGS.prefetch_factor if ARGS.num_workers and ARGS.num_workers > 0 else None))
     pin = torch.cuda.is_available()
     use_persist = worker_cnt > 0
 
