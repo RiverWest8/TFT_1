@@ -41,10 +41,7 @@ Adjust hyper‑parameters in the CONFIG section below.
 
 import warnings
 warnings.filterwarnings("ignore")
-
-import os as _os
-_os.environ["TQDM_DISABLE"] = "1"   # hard-disable tqdm everywhere
-
+from lightning.pytorch.callbacks import TQDMProgressBar
 import os
 from pathlib import Path
 from typing import List
@@ -55,27 +52,8 @@ import pandas as _pd
 pd = _pd  # Ensure pd always refers to pandas module
 import lightning.pytorch as pl
 
-# ---- Hard-disable Lightning's tqdm progress bar & force single-process dataloaders ----
-# Make Trainer default to no progress bar even if a caller forgets the kwarg.
-try:
-    from lightning.pytorch import Trainer as _LT_Trainer
-    _orig_tr_init = _LT_Trainer.__init__
-    def _trainer_no_pb(self, *args, **kwargs):
-        kwargs["enable_progress_bar"] = False
-        return _orig_tr_init(self, *args, **kwargs)
-    _LT_Trainer.__init__ = _trainer_no_pb
-except Exception:
-    pass
 
-# Replace Lightning's internal TQDMProgressBar class with a no-op so it never touches stdout.
-try:
-    import lightning.pytorch.callbacks.progress.tqdm_progress as _lp_tqdm
-    class _NoTQDM(pl.Callback):
-        """No-op replacement for TQDMProgressBar to avoid stdout flushes."""
-        pass
-    _lp_tqdm.TQDMProgressBar = _NoTQDM
-except Exception:
-    pass
+
 
 # Extra belt-and-braces: swallow BrokenPipe errors on stdout.flush() if any other lib calls it.
 try:
@@ -2801,10 +2779,10 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[best_ckpt_cb, es_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, val_hist_cb],
+        callbacks=[best_ckpt_cb, TQDMProgressBar(refresh_rate=50), es_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, val_hist_cb],
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
-        enable_progress_bar=False,
+        enable_progress_bar=True,
     )
 
 
