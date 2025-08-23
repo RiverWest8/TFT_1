@@ -90,6 +90,19 @@ try:
 except Exception:
     pass
 
+# Route all prints to stderr and swallow BrokenPipe to avoid crashes during teardown
+import builtins as _builtins, sys as _sys
+__orig_print = _builtins.print
+def __safe_print(*args, **kwargs):
+    try:
+        if "file" not in kwargs or kwargs["file"] is None:
+            kwargs["file"] = _sys.stderr   # default to stderr
+        return __orig_print(*args, **kwargs)
+    except BrokenPipeError:
+        return None
+_builtins = _builtins  # keep a name bound
+_builtins.print = __safe_print
+
 # Force PyTorch-Forecasting TimeSeriesDataSet to create single-process DataLoaders globally
 try:
     from pytorch_forecasting import TimeSeriesDataSet as _PF_TSD
@@ -2348,11 +2361,17 @@ def save_standard_variable_importance(
         # If PF version errors on that, fall back to 'mean'.
         try:
             out = model.interpret_output(x_dev, reduction="none")
+        except KeyError:
+            # PF version/config did not return attentions (e.g., 'decoder_attention' missing)
+            # Exit SVI quietly; nothing to aggregate.
+            return
         except Exception:
             try:
                 out = model.interpret_output(x_dev, reduction="mean")
-            except Exception as e:
-                print(f"[SVI] interpret_output failed on a batch: {e}")
+            except KeyError:
+                return
+            except Exception:
+                # Skip this batch quietly
                 continue
 
         res = _norm_out(out)
@@ -2414,8 +2433,7 @@ def save_standard_variable_importance(
         if n_seen >= int(min_samples):
             break
 
-    if (enc_sum is None) and (dec_sum is None) and (stat_sum is None):
-        print("[SVI] No variable importance returned by interpret_output; skipping.")
+    if (enc_sum is None) and (stat_sum is None) and (dec_sum is None):
         return
 
     # average the sums across batches processed
