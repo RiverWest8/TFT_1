@@ -41,19 +41,6 @@ Adjust hyper‑parameters in the CONFIG section below.
 
 import warnings
 warnings.filterwarnings("ignore")
-# ---- Set safest multiprocessing mode as early as possible ----
-import multiprocessing as _mp_early
-try:
-    # Prefer 'spawn' for maximum safety; fall back to 'forkserver' if unavailable
-    _mp_early.set_start_method("spawn", force=True)
-except RuntimeError:
-    # already set in this interpreter; nothing to do
-    pass
-except Exception:
-    try:
-        _mp_early.set_start_method("forkserver", force=True)
-    except Exception:
-        pass
 
 import os
 from pathlib import Path
@@ -69,40 +56,6 @@ from torchmetrics.classification import BinaryAUROC
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-# ---- Lightning teardown safety patches (avoid __len__ crash on CombinedLoader) ----
-try:
-    from lightning.pytorch.utilities.combined_loader import CombinedLoader as _PLCombinedLoader
-    _orig_pl_comb_len = _PLCombinedLoader.__len__
-    def _safe_combined_len(self):
-        try:
-            return _orig_pl_comb_len(self)
-        except RuntimeError as e:
-            if "iter(combined_loader)" in str(e):
-                try:
-                    iter(self)
-                    return _orig_pl_comb_len(self)
-                except Exception:
-                    return 0
-            raise
-    _PLCombinedLoader.__len__ = _safe_combined_len
-except Exception:
-    pass
-
-try:
-    from lightning.fabric.utilities import data as _lfu_data
-    _orig_sized_len = _lfu_data.sized_len
-    def _safe_sized_len(dataloader):
-        try:
-            return _orig_sized_len(dataloader)
-        except RuntimeError as e:
-            if "iter(combined_loader)" in str(e):
-                return 0
-            raise
-    _lfu_data.sized_len = _safe_sized_len
-except Exception:
-    pass
-
 def _permute_series_inplace(df: pd.DataFrame, col: str, block: int, group_col: str = "asset") -> None:
     if col not in df.columns:
         return
@@ -137,39 +90,6 @@ from pytorch_forecasting import (
     TemporalFusionTransformer,
     TimeSeriesDataSet,
 )
-
-
-# ---- Safe DataLoader defaults across the script ----
-import multiprocessing as _mp
-_orig_to_dataloader = TimeSeriesDataSet.to_dataloader
-def _to_dataloader_spawn_safe(self, *args, **kwargs):
-    # num_workers from kwargs or ARGS default
-    nw = kwargs.get("num_workers", getattr(ARGS, "num_workers", 0))
-    try:
-        nw = int(nw)
-    except Exception:
-        nw = 0
-
-    # do not keep workers alive between epochs – avoids teardown races
-    kwargs["persistent_workers"] = False
-
-    # only pass prefetch_factor when workers > 0 (PyTorch asserts otherwise)
-    if not nw or nw <= 0:
-        kwargs.pop("prefetch_factor", None)
-
-    # use a safe multiprocessing context explicitly (spawn preferred)
-    try:
-        kwargs["multiprocessing_context"] = _mp.get_context("spawn")
-    except Exception:
-        try:
-            kwargs["multiprocessing_context"] = _mp.get_context("forkserver")
-        except Exception:
-            pass
-
-    return _orig_to_dataloader(self, *args, **kwargs)
-
-TimeSeriesDataSet.to_dataloader = _to_dataloader_spawn_safe
-
 from pytorch_forecasting.data import MultiNormalizer, TorchNormalizer
 
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint, TQDMProgressBar
@@ -1910,7 +1830,6 @@ def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
     vol_q = torch.cummax(vol_q, dim=-1).values
     # Take median (index 3 in VOL_QUANTILES)
     return vol_q[..., 3]
-    
 
 @torch.no_grad()
 def _evaluate_decoded_metrics(
@@ -1924,56 +1843,55 @@ def _evaluate_decoded_metrics(
     vol_norm=None,
 ):
     """
-    Compute decoded MAE, RMSE, Brier and QLIKE on up to `max_batches`.
-    - Safe group-id extraction (no boolean use of tensors)
-    - Collect ENCODED y and p across batches; decode once at the end
-    - Use the same head extractor and safe_decode_vol as validation
-    Returns: (mae, rmse, brier, qlike, n)
+    Compute decoded MAE, RMSE, Brier and QLIKE on up to `max_batches` of ds.
+    Mirrors the validation callback path:
+      • group id extraction → [B]
+      • head extraction via `_extract_heads`
+      • decoding via `safe_decode_vol` with the SAME normalizer
+    Returns: (mae, rmse, brier, qlike, n) where val_loss == QLIKE.
     """
     import torch
 
-    # Resolve the same normalizer used for realised_vol
+    # -- resolve the same normalizer the dataset/model used
     if vol_norm is None:
         try:
             vol_norm = _extract_norm_from_dataset(ds)
         except Exception:
             vol_norm = None
 
+    # -- dataloader
     dl = ds.to_dataloader(
         train=False,
         batch_size=batch_size,
         num_workers=num_workers,
-        persistent_workers=False,
-        prefetch_factor=(prefetch if (num_workers and num_workers > 0) else None),
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=prefetch,
         pin_memory=pin_memory,
     )
 
+    try:
+        model_device = next(model.parameters()).device
+    except Exception:
+        model_device = torch.device("cpu")
+
     model.eval()
 
-    # Accumulate ENCODED vols + group_ids; decode once at end
+    # Collect ENCODED items per-batch; decode once at the end
     y_enc_list, p_enc_list, g_list = [], [], []
     yd_list, pd_list = [], []
 
-    def _extract_groups(x_dict: dict):
-        """Return group ids as [B] LongTensor (no boolean ops)."""
-        g = x_dict.get("groups", None)
-        if g is None:
-            g = x_dict.get("group_ids", None)
+    def _groups_to_B(g):
+        """Return group ids as [B] tensor regardless of PF shape."""
         if isinstance(g, (list, tuple)):
             g = g[0] if g else None
         if not torch.is_tensor(g):
             return None
-        # squeeze trailing singleton dims to [B]
         while g.ndim > 1:
-            g = g[..., 0]
+            g = g[:, 0]
         return g.long()
 
     def _extract_targets(obj):
-        """
-        Extract (y_vol, y_dir) from PF batch tensors:
-          obj can be tensor [B,1,T] or [B,T], or a list/tuple [vol, dir]
-        Returns 1D tensors (or None).
-        """
+        """Extract (y_vol, y_dir) robustly from PF batch tensors."""
         if torch.is_tensor(obj):
             t = obj
             if t.ndim == 3 and t.size(1) == 1:
@@ -1984,15 +1902,14 @@ def _evaluate_decoded_metrics(
                 return yv, yd
             return None, None
         if isinstance(obj, (list, tuple)) and obj:
-            yv = obj[0]
-            yd = obj[1] if len(obj) > 1 else None
+            yv, yd = obj[0], (obj[1] if len(obj) > 1 else None)
             if torch.is_tensor(yv):
                 if yv.ndim == 3 and yv.size(-1) == 1: yv = yv[..., 0]
-                if yv.ndim == 3 and yv.size(1) == 1:  yv = yv[:, 0, :]
+                if yv.ndim == 3 and yv.size(1) == 1: yv = yv[:, 0, :]
                 if yv.ndim == 2 and yv.size(-1) == 1: yv = yv[:, 0]
             if torch.is_tensor(yd):
                 if yd.ndim == 3 and yd.size(-1) == 1: yd = yd[..., 0]
-                if yd.ndim == 3 and yd.size(1) == 1:  yd = yd[:, 0, :]
+                if yd.ndim == 3 and yd.size(1) == 1: yd = yd[:, 0, :]
                 if yd.ndim == 2 and yd.size(-1) == 1: yd = yd[:, 0]
             return (yv if torch.is_tensor(yv) else None,
                     yd if torch.is_tensor(yd) else None)
@@ -2002,75 +1919,85 @@ def _evaluate_decoded_metrics(
         if max_batches is not None and b_idx >= int(max_batches):
             break
 
-        if not (isinstance(batch, (list, tuple)) and len(batch) >= 2):
-            continue
-        x, y = batch[0], batch[1]
+        if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+            x, y = batch[0], batch[1]
+        else:
+            x, y = batch, None
         if not isinstance(x, dict):
             continue
 
         # groups -> [B]
-        g = _extract_groups(x)
+        g = _groups_to_B(x.get("groups"))
+        if g is None:
+            g = _groups_to_B(x.get("group_ids"))
         if g is None:
             continue
 
         # targets (encoded)
-        dec_t = x.get("decoder_target", None)
+        dec_t = x.get("decoder_target")
         if dec_t is None:
-            dec_t = x.get("target", None)
+            dec_t = x.get("target")
         y_vol, y_dir = _extract_targets(dec_t)
-        if (y_vol is None or (y_dir is None and torch.is_tensor(y))) and torch.is_tensor(y):
+        if (y_vol is None or (y_dir is None and y is not None)) and torch.is_tensor(y):
             yv2, yd2 = _extract_targets(y)
             if y_vol is None: y_vol = yv2
             if y_dir is None: y_dir = yd2
         if not torch.is_tensor(y_vol):
             continue
 
-        # forward (let Lightning handle device; we keep outputs on CPU)
-        y_hat = model(x)
+        # forward
+        x_dev = {
+            k: (
+                v.to(model_device, non_blocking=True) if torch.is_tensor(v)
+                else [vv.to(model_device, non_blocking=True) if torch.is_tensor(vv) else vv for vv in v]
+                if isinstance(v, (list, tuple)) else v
+            )
+            for k, v in x.items()
+        }
+        y_hat = model(x_dev)
         pred = getattr(y_hat, "prediction", y_hat)
         if isinstance(pred, dict) and "prediction" in pred:
             pred = pred["prediction"]
 
+        # extract encoded heads
         p_vol, p_dir = _extract_heads(pred)
         if p_vol is None:
             continue
 
-        # accumulate encoded (CPU)
-        y_enc_list.append(y_vol.detach().cpu().reshape(-1))
-        p_enc_list.append(p_vol.detach().cpu().reshape(-1))
-        g_list.append(g.detach().cpu().reshape(-1))
+        # collect ENCODED tensors (cpu) and group ids
+        L = y_vol.shape[0]
+        y_enc_list.append(y_vol.reshape(L).detach().cpu())
+        p_enc_list.append(p_vol.reshape(L).detach().cpu())
+        g_list.append(g.reshape(L).detach().cpu())
 
         if torch.is_tensor(y_dir) and torch.is_tensor(p_dir):
-            yd_list.append(y_dir.detach().cpu().reshape(-1))
-            pd_list.append(p_dir.detach().cpu().reshape(-1))
+            yd_flat, pd_flat = y_dir.reshape(-1), p_dir.reshape(-1)
+            L2 = min(yd_flat.numel(), pd_flat.numel())
+            if L2 > 0:
+                yd_list.append(yd_flat[:L2].detach().cpu())
+                pd_list.append(pd_flat[:L2].detach().cpu())
 
-    # ---- aggregate & decode once ----
+    # aggregate encoded → tensors
     if not y_enc_list:
         return float("nan"), float("nan"), float("nan"), float("nan"), 0
 
-    y_enc = torch.cat(y_enc_list)          # [N]
-    p_enc = torch.cat(p_enc_list)          # [N]
-    g_all = torch.cat(g_list).long()       # [N]
+    y_enc = torch.cat(y_enc_list, dim=0)
+    p_enc = torch.cat(p_enc_list, dim=0)
+    g_all = torch.cat(g_list, dim=0)
 
-    # decode on CPU to avoid device mismatches
+    # --- Decode realised_vol to physical scale (once, vectorised) ---
     y_dec = safe_decode_vol(y_enc.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
     p_dec = safe_decode_vol(p_enc.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
 
-    # floor small values
+    # guard small values
     floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
     y_dec = torch.clamp(y_dec, min=floor_val)
     p_dec = torch.clamp(p_dec, min=floor_val)
 
-    # quick sanity print
-    try:
-        print(f"[FI DEBUG] decoded means: mean(y)={y_dec.mean().item():.6f} | mean(p)={p_dec.mean().item():.6f}")
-    except Exception:
-        pass
-
-    # metrics (decoded)
+    # metrics
     diff = p_dec - y_dec
     mae  = diff.abs().mean().item()
-    rmse = diff.pow(2).mean().sqrt().item()
+    rmse = torch.sqrt((diff ** 2).mean()).item()
 
     eps = 1e-8
     sigma2_p = torch.clamp(p_dec.abs(), min=eps) ** 2
@@ -2078,6 +2005,7 @@ def _evaluate_decoded_metrics(
     ratio = sigma2_y / sigma2_p
     qlike = (ratio - torch.log(ratio) - 1.0).mean().item()
 
+    # direction → Brier (label-smoothed as in training)
     brier = float("nan")
     if yd_list and pd_list:
         yd = torch.cat(yd_list).float()
@@ -2089,11 +2017,14 @@ def _evaluate_decoded_metrics(
             pd = torch.sigmoid(pd)
         pd = torch.clamp(pd, 0.0, 1.0)
         y_smooth = yd * 0.9 + 0.05
-        brier = ((pd - y_smooth) ** 2).mean().item()
+        brier = float(((pd - y_smooth) ** 2).mean().item())
 
-    # warn if scale still looks encoded
+    # sanity print if scale still looks encoded
     if mae > 0.01:
-        print(f"[FI DEBUG] decoded MAE unusually large: MAE={mae:.6f} | mean(y)={y_dec.mean().item():.6f} | mean(p)={p_dec.mean().item():.6f}")
+        try:
+            print(f"[FI DEBUG] decoded MAE unusually large: MAE={mae:.6f} | mean(y)={y_dec.mean().item():.6f} | mean(p)={p_dec.mean().item():.6f}")
+        except Exception:
+            pass
 
     return float(mae), float(rmse), float(brier), float(qlike), int(y_dec.numel())
 
@@ -2176,7 +2107,9 @@ def run_permutation_importance(
     print(f"[FI] Baseline val_loss = {b_val:.6f} "
           f"(MAE={b_mae:.6f}, RMSE={b_rmse:.6f}, Brier={b_dir:.6f}) | N={n_base}")
 
-
+    if b_mae > 0.01:
+        print(f"[FI DEBUG] WARNING: baseline decoded MAE unusually large "
+              f"(expected ~0.001–0.003). Check vol_norm and decode pipeline.")
 
     rows = []
     work_df = base_df.copy()
