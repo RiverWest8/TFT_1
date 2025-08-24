@@ -1502,7 +1502,9 @@ else:
     )
 
 def get_resume_ckpt_path():
-    # Prefer newest local checkpoint
+    if not RESUME_ENABLED:
+        return None
+
     try:
         local_ckpts = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
         if local_ckpts:
@@ -1734,6 +1736,7 @@ if getattr(ARGS, "fi_max_batches", None) is not None:
 # ---- Learning rate and resume CLI overrides ----
 LR_OVERRIDE = float(ARGS.learning_rate) if getattr(ARGS, "learning_rate", None) is not None else None
 RESUME_ENABLED = bool(getattr(ARGS, "resume", True))
+RESUME_CKPT = get_resume_ckpt_path() if RESUME_ENABLED else None
 
 # -----------------------------------------------------------------------
 # Utility functions
@@ -2887,6 +2890,8 @@ if __name__ == "__main__":
     resume_ckpt = get_resume_ckpt_path() if RESUME_ENABLED else None
     if resume_ckpt:
         print(f"↩️  Resuming from checkpoint: {resume_ckpt}")
+    else:
+        print("▶ Starting a fresh run (no resume)")
 
     # Train the model
     trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
