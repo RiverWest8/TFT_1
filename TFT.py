@@ -2212,7 +2212,7 @@ def run_permutation_importance(
     )
 
     # --- Baseline metrics ---
-    b_mae, b_rmse, b_qlike, n_base = _evaluate_decoded_metrics(
+    b_mae, b_rmse, b_brier, b_qlike, n_base = _evaluate_decoded_metrics(
         model=model,
         ds=ds_base,
         batch_size=batch_size,
