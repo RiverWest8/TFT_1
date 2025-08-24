@@ -151,9 +151,26 @@ import argparse
 import pytorch_forecasting as pf
 import inspect
 
-VOL_QUANTILES = [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95]
-Q50_IDX = VOL_QUANTILES.index(0.50)  
+#VOL_QUANTILES = [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95] #The quantiles which yielded our best so far
+#Q50_IDX = VOL_QUANTILES.index(0.50)  
+VOL_QUANTILES = [0.05, 0.15, 0.35, 0.50, 0.65, 0.85, 0.95]
+Q50_IDX = VOL_QUANTILES.index(0.50)
 
+# Composite metric weights (override via --metric_weights "w_mae,w_rmse,w_qlike")
+COMP_WEIGHTS = (1.0, 1.0, 0.333)  # default: slightly emphasise QLIKE for RV focus
+
+def composite_score(mae, rmse, qlike,
+                    b_mae=None, b_rmse=None, b_qlike=None,
+                    weights=None, eps=1e-12):
+    """If baselines are provided → normalised composite (for FI).
+       Else → absolute composite (for validation)."""
+    w_mae, w_rmse, w_qlike = (weights or COMP_WEIGHTS)
+    if b_mae is None or b_rmse is None or b_qlike is None:
+        return w_mae*float(mae) + w_rmse*float(rmse) + w_qlike*float(qlike)
+    mae_r   = float(mae)   / max(eps, float(b_mae))
+    rmse_r  = float(rmse)  / max(eps, float(b_rmse))
+    qlike_r = float(qlike) / max(eps, float(b_qlike))
+    return w_mae*mae_r + w_rmse*rmse_r + w_qlike*qlike_r
 # -----------------------------------------------------------------------
 # Ensure a robust "identity" transformation for GroupNormalizer
 # -----------------------------------------------------------------------
@@ -907,7 +924,11 @@ class PerAssetMetrics(pl.Callback):
             epoch_num = None
 
         # 🔑 Use QLIKE as the validation loss
-        val_loss_value = overall_qlike
+        # 🔑 Use composite(MAE,RMSE,QLIKE) as the validation loss (absolute form)
+        val_composite  = composite_score(overall_mae, overall_rmse, overall_qlike)
+        val_loss_value = float(val_composite)
+        trainer.callback_metrics["val_composite_overall"] = torch.tensor(float(val_composite))
+        trainer.callback_metrics["val_loss_source"] = "composite(MAE,RMSE,QLIKE)"
 
         msg = (
             f"[VAL EPOCH {epoch_num}] "
@@ -915,10 +936,11 @@ class PerAssetMetrics(pl.Callback):
             f"RMSE={overall_rmse:.6f} "
             f"MSE={overall_mse:.6f} "
             f"QLIKE={overall_qlike:.6f} "
+            f"CompLoss = {val_composite:.6f}"
             + (f"| ACC={acc:.3f} " if acc is not None else "")
             + (f"| Brier={brier:.4f} " if brier is not None else "")
             + (f"| AUROC={auroc:.3f} " if auroc is not None else "")
-            + f"| N={N} | VAL_LOSS={val_loss_value:.6f}"
+            + f"| N={N} | VAL_LOSS(comp)={val_loss_value:.6f}"
         )
         print(msg)
 
@@ -1587,6 +1609,37 @@ class ReduceLROnPlateauCallback(pl.Callback):
                 print(f"[LR Plateau] ↓ lr → {new_lr:.6g}")
                 self.bad, self.cool = 0, self.cooldown
 
+
+VOL_LOSS = AsymmetricQuantileLoss(
+    quantiles=VOL_QUANTILES,
+    underestimation_factor=1.00,  # managed by BiasWarmupCallback
+    mean_bias_weight=0.01,        # small centering on the median for MAE
+    tail_q=0.85,
+    tail_weight=1.0,              # will be ramped by TailWeightRamp
+    qlike_weight=0.0,             # QLIKE weight is ramped safely in BiasWarmupCallback
+    reduction="mean",
+)
+# ---------------- Callback bundle (bias warm-up, tail ramp, LR control) ----------------
+EXTRA_CALLBACKS = [
+    # Gated calibration: ramps alpha/mean-bias and only enables QLIKE when scale is near 1
+    BiasWarmupCallback(
+        vol_loss=VOL_LOSS,
+        target_under=1.00,
+        target_mean_bias=0.04,
+        warmup_epochs=4,
+        qlike_target_weight=0.20,   # ramps in when mean(y)/mean(p) ~ 1
+        start_mean_bias=0.0,
+        mean_bias_ramp_until=8,
+        guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
+        guard_tol=getattr(ARGS, "warmup_guard_tol", 0.0),
+        alpha_step=0.05,
+    ),
+    # Gradually emphasise upper tail once training is stable → protects QLIKE
+    TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=1.22, ramp_epochs=12),
+    # Safety net if QLIKE plateaus
+    ReduceLROnPlateauCallback(monitor="val_loss", factor=0.5, patience=5, min_lr=1e-5, cooldown=1),
+]
+
 class ValLossHistory(pl.Callback):
     """
     Records per-epoch validation metrics to a CSV so you can plot later.
@@ -1648,7 +1701,14 @@ from datetime import datetime, timezone, timedelta
 RUN_SUFFIX = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 MODEL_SAVE_PATH = (LOCAL_CKPT_DIR / f"tft_realised_vol_e{MAX_EPOCHS}_{RUN_SUFFIX}.ckpt")
 
-SEED = 50
+SEED = 8
+# Full-run determinism for reproducible validation metrics
+try:
+    seed_everything(SEED, workers=True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+except Exception:
+    pass
 WEIGHT_DECAY = 0.0001 #0.00578350719515325     # weight decay for AdamW
 GRADIENT_CLIP_VAL = 0.78 #0.78    # gradient clipping value for Trainer
 # Feature-importance controls
@@ -2128,21 +2188,23 @@ def run_permutation_importance(
     build_ds_fn=lambda: None,       # compatibility; unused
 ) -> None:
     """
-    Compute permutation importance by **decoded** validation loss:
-        val_loss = QLIKE (on decoded realised_vol).
-    Reports decoded MAE, RMSE, Brier for direction.
+    Compute permutation importance by **decoded** validation loss using the same
+    composite metric as validation:
+        CompLoss = w_mae*MAE + w_rmse*RMSE + w_qlike*QLIKE (baseline‑normalised for FI).
+    We also report decoded MAE, RMSE, QLIKE (val_loss==QLIKE), and Brier for direction.
     """
+    global COMP_WEIGHTS, composite_score
 
     # --- Baseline dataset ---
     ds_base = TimeSeriesDataSet.from_dataset(
         template_ds,
         base_df,
-        predict=False,
+        predict=True,
         stop_randomization=True,
     )
 
     # --- Baseline metrics ---
-    b_mae, b_rmse, b_dir, b_val, n_base = _evaluate_decoded_metrics(
+    b_mae, b_rmse, b_qlike, n_base = _evaluate_decoded_metrics(
         model=model,
         ds=ds_base,
         batch_size=batch_size,
@@ -2153,9 +2215,14 @@ def run_permutation_importance(
         vol_norm=vol_norm,  # 👈 ensure decoded with same normalizer
     )
 
+    # Baseline composite (normalised to itself → equals sum of weights)
+    base_comp = composite_score(b_mae, b_rmse, b_qlike, b_mae, b_rmse, b_qlike, COMP_WEIGHTS)
+
     print(f"[FI] Dataset size (samples): {len(base_df)} | batch_size={batch_size}")
-    print(f"[FI] Baseline val_loss = {b_val:.6f} "
-          f"(MAE={b_mae:.6f}, RMSE={b_rmse:.6f}, Brier={b_dir:.6f}) | N={n_base}")
+    print(
+        f"[FI] Baseline: QLIKE={b_qlike:.6f} | MAE={b_mae:.6f} | RMSE={b_rmse:.6f} | "
+        f"COMPOSITE(base)={base_comp:.4f} | N={n_base}"
+    )
 
     if b_mae > 0.01:
         print(f"[FI DEBUG] WARNING: baseline decoded MAE unusually large "
@@ -2172,11 +2239,11 @@ def run_permutation_importance(
         ds_perm = TimeSeriesDataSet.from_dataset(
             template_ds,
             df_perm,
-            predict=False,
+            predict=True,
             stop_randomization=True,
         )
 
-        p_mae, p_rmse, p_dir, p_val, n_p = _evaluate_decoded_metrics(
+        p_mae, p_rmse, p_dir, p_qlike, n_p = _evaluate_decoded_metrics(
             model=model,
             ds=ds_perm,
             batch_size=batch_size,
@@ -2187,18 +2254,33 @@ def run_permutation_importance(
             vol_norm=vol_norm,  # 👈 ensure decoded with same normalizer
         )
 
-        delta = p_val - b_val
-        print(f"[FI] {feat:>20s} | val_p={p_val:.6f} | Δ={delta:+.6f} | "
-              f"(MAE={p_mae:.6f}, RMSE={p_rmse:.6f}, Brier={p_dir:.6f})")
+        # Individual deltas (lower is better)
+        d_mae   = float(p_mae  - b_mae)
+        d_rmse  = float(p_rmse - b_rmse)
+        d_qlike = float(p_qlike - b_qlike)
+
+        # Baseline‑normalised composite
+        p_comp = composite_score(p_mae, p_rmse, p_qlike, b_mae, b_rmse, b_qlike, COMP_WEIGHTS)
+        d_comp = float(p_comp - base_comp)
+
+        print(
+            f"[FI] {feat:>20s} | QLIKE={p_qlike:.6f} Δ_QLIKE={d_qlike:+.6f} | "
+            f"Δ_MAE={d_mae:+.6f} Δ_RMSE={d_rmse:+.6f} | COMPOSITE={p_comp:.4f} Δ_COMP={d_comp:+.4f}"
+        )
 
         rows.append({
             "feature": feat,
-            "baseline_val_loss": float(b_val),
-            "permuted_val_loss": float(p_val),
-            "delta": float(delta),
+            "baseline_val_loss": float(b_qlike),
+            "permuted_val_loss": float(p_qlike),
+            "delta_qlike": float(d_qlike),
             "mae": float(p_mae),
             "rmse": float(p_rmse),
             "brier": float(p_dir),
+            "delta_mae": float(d_mae),
+            "delta_rmse": float(d_rmse),
+            "composite": float(p_comp),
+            "delta_composite": float(d_comp),
+            "weights": f"mae={COMP_WEIGHTS[0]},rmse={COMP_WEIGHTS[1]},qlike={COMP_WEIGHTS[2]}",
             "n": int(n_p),
         })
 
@@ -2589,10 +2671,10 @@ if __name__ == "__main__":
 
     # Build validation/test from TRAIN template so group ID mapping and normalizer stats MATCH
     validation_dataset = TimeSeriesDataSet.from_dataset(
-        training_dataset, val_df, predict=False, stop_randomization=True
+        training_dataset, val_df, predict=True, stop_randomization=True
     )
     test_dataset = TimeSeriesDataSet.from_dataset(
-        training_dataset, test_df, predict=False, stop_randomization=True
+        training_dataset, test_df, predict=True, stop_randomization=True
     )
     vol_normalizer = _extract_norm_from_dataset(training_dataset)  # must be from TRAIN
     # make it available to both the model and the metrics callback
@@ -2680,7 +2762,7 @@ if __name__ == "__main__":
     print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.0017978}")
     
     es_cb = EarlyStopping(
-    monitor="val_qlike_overall",
+    monitor="val_loss",
     patience=EARLY_STOP_PATIENCE,
     mode="min",
     min_delta = 1e-4
@@ -2699,15 +2781,6 @@ if __name__ == "__main__":
 
 
 
-    VOL_LOSS = AsymmetricQuantileLoss(
-        quantiles=VOL_QUANTILES,
-        underestimation_factor=1.00, #1.1115   # you can keep your scheduler on this
-        mean_bias_weight=0.0,          # or small value if you want median centering
-        tail_q=0.85,
-        tail_weight=1.0,               # set >0 if you want extra tail emphasis
-        qlike_weight=0.25,             # << QLIKE back in (tune 0.1–0.3)
-        reduction="mean",
-    )
     from pytorch_forecasting.metrics import MultiLoss
     # one-off in your data prep (TRAIN split)
     counts = train_df["direction"].value_counts()
@@ -2720,7 +2793,7 @@ if __name__ == "__main__":
 
 
     FIXED_VOL_WEIGHT = 1.0
-    FIXED_DIR_WEIGHT = 0.15
+    FIXED_DIR_WEIGHT = 0.1
  
 
     tft = TemporalFusionTransformer.from_dataset(
@@ -2750,7 +2823,7 @@ if __name__ == "__main__":
 
 
     best_ckpt_cb = ModelCheckpoint(
-        monitor="val_auroc_overall",
+        monitor="val_loss",
         mode="max",
         save_top_k=1,
         save_last=True,
@@ -2785,7 +2858,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[best_ckpt_cb, TQDMProgressBar(refresh_rate=50), es_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, val_hist_cb],
+        callbacks=[best_ckpt_cb, TQDMProgressBar(refresh_rate=50), es_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, val_hist_cb] + EXTRA_CALLBACKS,
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
         enable_progress_bar=True,
