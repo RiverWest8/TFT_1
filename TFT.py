@@ -2207,7 +2207,7 @@ def run_permutation_importance(
     ds_base = TimeSeriesDataSet.from_dataset(
         template_ds,
         base_df,
-        predict=True,
+        predict=False,
         stop_randomization=True,
     )
 
@@ -2247,7 +2247,7 @@ def run_permutation_importance(
         ds_perm = TimeSeriesDataSet.from_dataset(
             template_ds,
             df_perm,
-            predict=True,
+            predict=False,
             stop_randomization=True,
         )
 
@@ -2679,10 +2679,10 @@ if __name__ == "__main__":
 
     # Build validation/test from TRAIN template so group ID mapping and normalizer stats MATCH
     validation_dataset = TimeSeriesDataSet.from_dataset(
-        training_dataset, val_df, predict=True, stop_randomization=True
+        training_dataset, val_df, predict=False, stop_randomization=True
     )
     test_dataset = TimeSeriesDataSet.from_dataset(
-        training_dataset, test_df, predict=True, stop_randomization=True
+        training_dataset, test_df, predict=False, stop_randomization=True
     )
     vol_normalizer = _extract_norm_from_dataset(training_dataset)  # must be from TRAIN
     # make it available to both the model and the metrics callback
