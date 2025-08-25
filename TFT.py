@@ -1967,6 +1967,7 @@ def _evaluate_decoded_metrics(
     Returns: (mae, rmse, brier, qlike, N)
     """
     model.eval()
+    model_device = next(model.parameters()).device  # <<< NEW
 
     # dataloader mirrors validation loader; dataset already has predict=True
     loader = ds.to_dataloader(
@@ -1980,7 +1981,17 @@ def _evaluate_decoded_metrics(
         prefetch_factor=prefetch if num_workers and num_workers > 0 else None,
     )
 
-    # accumulators (device tensors, then we'll decode at the end)
+    # --- helper to move nested batch dicts to model_device ---
+    def _move_to_device(x):
+        if torch.is_tensor(x):
+            return x.to(model_device, non_blocking=True)
+        if isinstance(x, dict):
+            return {k: _move_to_device(v) for k, v in x.items()}
+        if isinstance(x, (list, tuple)):
+            t = [_move_to_device(v) for v in x]
+            return type(x)(t) if not isinstance(x, tuple) else tuple(t)
+        return x
+
     g_list, yv_list, pv_list = [], [], []
     yd_list, pd_list = [], []
 
@@ -1994,11 +2005,14 @@ def _evaluate_decoded_metrics(
         if not isinstance(x, dict):
             continue
 
-        # group ids
+        # --- MOVE EVERYTHING to the model's device BEFORE forward ---
+        x_dev = _move_to_device(x)
+
+        # group ids (taken from x_dev so same device)
         groups = None
         for k in ("groups", "group_ids", "group_id"):
-            if k in x and x[k] is not None:
-                groups = x[k]
+            if k in x_dev and x_dev[k] is not None:
+                groups = x_dev[k]
                 break
         if groups is None:
             continue
@@ -2007,7 +2021,7 @@ def _evaluate_decoded_metrics(
             g = g.squeeze(-1)
 
         # targets from decoder_target (fallback to y)
-        dec_t = x.get("decoder_target", None)
+        dec_t = x_dev.get("decoder_target", None)
         y_vol_t, y_dir_t = None, None
         if torch.is_tensor(dec_t):
             t = dec_t
@@ -2027,7 +2041,7 @@ def _evaluate_decoded_metrics(
                     y_dir_t = y_dir_t[..., 0]
 
         if (y_vol_t is None) and torch.is_tensor(y):
-            yy = y
+            yy = y.to(model_device, non_blocking=True)  # <<< ensure same device if used
             if yy.ndim == 3 and yy.size(1) == 1:
                 yy = yy[:, 0, :]
             if yy.ndim == 2 and yy.size(1) >= 1:
@@ -2039,18 +2053,45 @@ def _evaluate_decoded_metrics(
             continue
 
         # forward pass and head extraction
-        y_hat = model(x)
+        y_hat = model(x_dev)  # <<< CUDA-safe now
         pred = getattr(y_hat, "prediction", y_hat)
         if isinstance(pred, dict) and "prediction" in pred:
             pred = pred["prediction"]
+
+        # split heads (same logic as before)
+        def _extract_heads(prediction):
+            if isinstance(prediction, (list, tuple)):
+                vol_q = prediction[0]
+                d_log = prediction[1] if len(prediction) > 1 else None
+                return vol_q, d_log
+            t = prediction
+            if torch.is_tensor(t):
+                if t.ndim >= 4 and t.size(1) == 1:
+                    t = t.squeeze(1)
+                if t.ndim == 3 and t.size(1) == 1:
+                    t = t[:, 0, :]
+                if t.ndim == 2:
+                    vol_q = t[:, :-1]
+                    d_log = t[:, -1]
+                    return vol_q, d_log
+            return None, None
+
         p_vol, p_dir = _extract_heads(pred)
         if p_vol is None:
             continue
 
+        # take median quantile for vol
+        def _median_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
+            vol_q = torch.cummax(vol_q, dim=-1).values
+            # assumes 7 quantiles with 0.50 at index 3
+            return vol_q[..., 3]
+
+        p_vol_med = _median_from_quantiles(p_vol)
+
         L = g.shape[0]
         g_list.append(g.reshape(L))
         yv_list.append(y_vol_t.reshape(L))
-        pv_list.append(p_vol.reshape(L))
+        pv_list.append(p_vol_med.reshape(L))
 
         if y_dir_t is not None and p_dir is not None:
             yd = y_dir_t.reshape(-1)
