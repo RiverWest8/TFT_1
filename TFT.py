@@ -1626,37 +1626,33 @@ class TailWeightRamp(pl.Callback):
 
 
 class CosineLR(pl.Callback):
-    def __init__(self, start_epoch=8, min_lr=1e-5):
+    def __init__(self, start_epoch=8, min_lr=5.5e-5):
         super().__init__()
         self.start_epoch = int(start_epoch)
         self.min_lr = float(min_lr)
-        self._base_lrs = None
+        self._schedulers = None
+        self._tmax = None
 
     def on_fit_start(self, trainer, pl_module):
-        # snapshot base LRs once, before cosine begins
-        self._base_lrs = []
+        # Create a CosineAnnealingLR for each optimizer, but only step it from start_epoch onwards
+        max_epochs = int(getattr(trainer, "max_epochs", 0))
+        self._tmax = max(1, max_epochs - self.start_epoch)
+        self._schedulers = []
         for opt in trainer.optimizers:
-            for pg in opt.param_groups:
-                self._base_lrs.append(float(pg.get("lr", 0.0)))
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self._tmax, eta_min=self.min_lr)
+            self._schedulers.append(sched)
 
     def on_train_epoch_start(self, trainer, pl_module):
+        # Smooth cosine decay starting from start_epoch (inclusive)
         e = int(getattr(trainer, "current_epoch", 0))
-        if (self._base_lrs is None) or (e < self.start_epoch):
+        if (self._schedulers is None) or (e < self.start_epoch):
             return
-        max_epochs = int(getattr(trainer, "max_epochs", e+1))
-        T = max(1, max_epochs - self.start_epoch)
-        t = min(T, e - self.start_epoch)
-        ratio = 0.5 * (1.0 + math.cos(math.pi * t / T))  # 1 → 0 over [start, max_epochs]
-
-        i = 0
-        for opt in trainer.optimizers:
-            for pg in opt.param_groups:
-                base = float(self._base_lrs[i])
-                new_lr = self.min_lr + (base - self.min_lr) * ratio
-                pg["lr"] = float(new_lr)
-                i += 1
+        # Map epoch e -> scheduler step index (1-based so we actually decay at start_epoch)
+        step_idx = (e - self.start_epoch) + 1
+        for sched in self._schedulers:
+            sched.step(step_idx)
         try:
-            print(f"[LR Cosine] epoch={e} ratio={ratio:.4f} lr={trainer.optimizers[0].param_groups[0]['lr']:.6g}")
+            print(f"[LR CosineBuiltin] epoch={e} lr={trainer.optimizers[0].param_groups[0]['lr']:.6g}")
         except Exception:
             pass
 
