@@ -2651,10 +2651,38 @@ if __name__ == "__main__":
     all_numeric = [c for c, dt in train_df.dtypes.items()
                    if (c not in base_exclude) and pd.api.types.is_numeric_dtype(dt)]
 
+    # Features we want to drop from model
+    drop_features = {
+        "Parkinson_Vol_2","rv48","MA_cross_12_48","mvmd_z_Log_Range_mode3_energy","Parkinson_Vol_1",
+        "mvmd_z_Log_Volume_mode3_sig","rv2","MA_diff_6_12","mvmd_z_Log_Range_mode1_amp","z_Log_Volume",
+        "mvmd_z_Log_Range_mode3_freq","mvmd_z_Log_Range_mode4_freq","Log_Range","True_Range",
+        "mvmd_z_Log_Range_mode1_entropy","mvmd_z_Log_Range_mode2_amp","z_Log_Close","MA_diff_24_96",
+        "mvmd_z_Log_Volume_mode5_entropy","mvmd_z_Log_Volume_mode2_amp","mvmd_z_Log_Close_mode5_sig",
+        "mvmd_z_Log_Volume_mode4_freq","mvmd_z_Log_Close_mode1_freq","mvmd_z_Log_Volume_mode3_amp",
+        "Corr_DOGE_TRX","mvmd_z_Log_Volume_mode2_freq","mvmd_z_Log_Close_mode2_energy",
+        "mvmd_z_Log_Volume_mode5_energy","RS_Vol_2","mvmd_z_Log_Range_mode2_entropy","MA_cross_24_96",
+        "Log_Return","Corr_DOGE_XRP","mvmd_z_Log_Close_mode3_sig","mvmd_z_Log_Close_mode3_freq",
+        "Corr_BTC_XRP","Parkinson_Var","mvmd_z_Log_Volume_mode1_freq","mvmd_z_Log_Close_mode4_freq",
+        "mvmd_z_Log_Range_mode4_energy","mvmd_z_Log_Range_mode1_sig","mvmd_z_Log_Close_mode2_entropy",
+        "mvmd_z_Log_Close_mode4_energy","Realised_Var","Corr_BTC_DOGE","rv6","Log_Volume","Corr_DOGE_BTC",
+        "mvmd_z_Log_Close_mode5_freq","RQ3","RQ2","Corr_TRX_ETH","Corr_DOGE_XRP_filled","Corr_XRP_DOGE",
+        "Corr_XRP_DOGE_filled","Corr_ETH_TRX","Corr_ETH_TRX_filled","Corr_XRP_TRX_filled","Corr_ETH_XRP",
+        "Corr_ETH_XRP_filled","Corr_XRP_ETH","Corr_TRX_XRP","Corr_TRX_XRP_filled","Corr_XRP_TRX","mvmd_pos",
+        "Corr_TRX_ETH_filled","Corr_TRX_DOGE_filled","Corr_XRP_ETH_filled","Corr_DOGE_TRX_filled",
+        "Corr_BTC_DOGE_filled","Corr_DOGE_BTC_filled","Corr_BTC_ETH_filled","Corr_ETH_BTC",
+        "Corr_TRX_DOGE","Corr_BTC_TRX_filled","Corr_TRX_BTC","Corr_ETH_BTC_filled","Corr_BTC_XRP_filled",
+        "Corr_XRP_BTC","Corr_XRP_BTC_filled","Corr_ETH_DOGE_filled","Corr_DOGE_ETH_filled",
+        "Corr_TRX_BTC_filled","Corr_ETH_DOGE"
+    }
+
     # Specify future-known and unknown real features
     calendar_cols = ["sin_tod", "cos_tod", "sin_dow", "cos_dow"]
     time_varying_known_reals = calendar_cols + ["Is_Weekend"]
-    time_varying_unknown_reals = [c for c in all_numeric if c not in (calendar_cols + ["Is_Weekend"]) ]
+
+    time_varying_unknown_reals = [
+        c for c in all_numeric
+        if c not in (calendar_cols + ["Is_Weekend"]) and c not in drop_features
+    ]
 
 
 
