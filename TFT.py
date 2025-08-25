@@ -2976,7 +2976,7 @@ if __name__ == "__main__":
     val_hist_cb  = ValLossHistory(val_hist_csv)
 
 
-    cosine_cb = CosineLR(start_epoch=8, min_lr=1e-4)
+    cosine_cb = CosineLR(start_epoch=8, min_lr=5.5e-5)
 
 
     # ----------------------------
