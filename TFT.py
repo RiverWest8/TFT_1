@@ -1819,9 +1819,8 @@ if getattr(ARGS, "fi_max_batches", None) is not None:
 
 # ---- Learning rate and resume CLI overrides ----
 LR_OVERRIDE = float(ARGS.learning_rate) if getattr(ARGS, "learning_rate", None) is not None else None
-
 RESUME_ENABLED = bool(getattr(ARGS, "resume", True))
-RESUME_CKPT = ARGS.ckpt_path or (get_resume_ckpt_path() if RESUME_ENABLED else None)
+RESUME_CKPT = get_resume_ckpt_path() if RESUME_ENABLED else None
 
 # -----------------------------------------------------------------------
 # Utility functions
