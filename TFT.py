@@ -929,6 +929,10 @@ class PerAssetMetrics(pl.Callback):
         val_loss_value = float(val_composite)
         trainer.callback_metrics["val_composite_overall"] = torch.tensor(float(val_composite))
         trainer.callback_metrics["val_loss_source"] = "composite(MAE,RMSE,QLIKE)"
+        try:
+            pl_module.log("val_composie_overall", torch.tensor(float(comp_value)), prog_bar=True, sync_dist=False)
+        except Exception:
+            pass
 
         msg = (
             f"[VAL EPOCH {epoch_num}] "
@@ -1118,41 +1122,38 @@ class PerAssetMetrics(pl.Callback):
 import lightning.pytorch as pl
 
 class BiasWarmupCallback(pl.Callback):
-    """
-    Adaptive warm-up with a safety guard.
-
-    • EMA of mean(y)/mean(p) steers underestimation bias (alpha).
-    • Warm-ups are frozen if validation worsens for `guard_patience` epochs.
-    • QLIKE ramps only when scale is near 1 to avoid fighting calibration.
-    """
     def __init__(
         self,
-        vol_loss=None,
-        target_under: float = 1.12,
-        target_mean_bias: float = 0.04,
-        warmup_epochs: int = 4,
-        qlike_target_weight: float | None = 0.04,
-        start_mean_bias: float = 0.0,
-        mean_bias_ramp_until: int = 8,
-        guard_patience: int = 2,
-        guard_tol: float = 0.0,
-        alpha_step: float = 0.05,
+        vol_loss,
+        target_under=1.00,
+        target_mean_bias=0.04,
+        warmup_epochs=4,
+        qlike_target_weight=0.10,
+        start_mean_bias=0.0,
+        mean_bias_ramp_until=10,   # was 8
+        guard_patience=2,
+        guard_tol=0.0,
+        activate_tol=0.03,         # require |scale_ema-1| < 3%
+        activate_patience=2,       # and keep it for 2 consecutive epochs
+        lr_kick=1.15,              # one-off +15% LR on activation
     ):
         super().__init__()
-        self._vol_loss_hint = vol_loss
+        self.vol_loss = vol_loss
         self.target_under = float(target_under)
         self.target_mean_bias = float(target_mean_bias)
-        self.qlike_target_weight = None if qlike_target_weight is None else float(qlike_target_weight)
-        self.warm = int(max(0, warmup_epochs))
+        self.warmup_epochs = int(warmup_epochs)
+        self.qlike_target_weight = float(qlike_target_weight)
         self.start_mean_bias = float(start_mean_bias)
-        self.mean_bias_ramp_until = int(max(mean_bias_ramp_until, self.warm))
-        self.guard_patience = int(max(1, guard_patience))
+        self.mean_bias_ramp_until = int(mean_bias_ramp_until)
+        self.guard_patience = int(guard_patience)
         self.guard_tol = float(guard_tol)
         self.alpha_step = float(alpha_step)
-
-        self._scale_ema = None
-        self._prev_val = None
-        self._worse_streak = 0
+        # NEW
+        self.activate_tol = float(activate_tol)
+        self.activate_patience = int(activate_patience)
+        self.lr_kick = float(lr_kick)
+        self._ok_streak = 0
+        self._qlike_on = False
         self._frozen = False
 
     def _resolve_vol_loss(self, pl_module):
@@ -1587,12 +1588,53 @@ class TailWeightRamp(pl.Callback):
         self.vol_loss.tail_weight = self.start + (eff_end - self.start) * prog
         print(f"[TAIL] epoch={e} tail_weight={self.vol_loss.tail_weight}")
 
+
+
+class CosineLR(pl.Callback):
+    def __init__(self, start_epoch=8, min_lr=1e-5):
+        super().__init__()
+        self.start_epoch = int(start_epoch)
+        self.min_lr = float(min_lr)
+        self._base_lrs = None
+
+    def on_fit_start(self, trainer, pl_module):
+        # snapshot base LRs once, before cosine begins
+        self._base_lrs = []
+        for opt in trainer.optimizers:
+            for pg in opt.param_groups:
+                self._base_lrs.append(float(pg.get("lr", 0.0)))
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        e = int(getattr(trainer, "current_epoch", 0))
+        if (self._base_lrs is None) or (e < self.start_epoch):
+            return
+        max_epochs = int(getattr(trainer, "max_epochs", e+1))
+        T = max(1, max_epochs - self.start_epoch)
+        t = min(T, e - self.start_epoch)
+        ratio = 0.5 * (1.0 + math.cos(math.pi * t / T))  # 1 → 0 over [start, max_epochs]
+
+        i = 0
+        for opt in trainer.optimizers:
+            for pg in opt.param_groups:
+                base = float(self._base_lrs[i])
+                new_lr = self.min_lr + (base - self.min_lr) * ratio
+                pg["lr"] = float(new_lr)
+                i += 1
+        try:
+            print(f"[LR Cosine] epoch={e} ratio={ratio:.4f} lr={trainer.optimizers[0].param_groups[0]['lr']:.6g}")
+        except Exception:
+            pass
+
 class ReduceLROnPlateauCallback(pl.Callback):
-    def __init__(self, monitor="val_qlike_overall", factor=0.5, patience=3, min_lr=1e-5, cooldown=0):
+    def __init__(self, monitor="val_comp_overall", factor=0.5, patience=2, min_lr=1e-5, cooldown=0, stop_after_epoch=None):
         self.monitor, self.factor, self.patience, self.min_lr, self.cooldown = monitor, factor, patience, min_lr, cooldown
+        self.stop_after_epoch = stop_after_epoch
         self.best, self.bad, self.cool = float("inf"), 0, 0
 
     def on_validation_end(self, trainer, pl_module):
+        e = int(getattr(trainer, "current_epoch", 0))
+        if (self.stop_after_epoch is not None) and (e >= int(self.stop_after_epoch)):
+            return  # hand over to cosine
         if self.cool:
             self.cool -= 1
             return
@@ -1634,17 +1676,19 @@ EXTRA_CALLBACKS = [
         target_under=1.00,
         target_mean_bias=0.04,
         warmup_epochs=4,
-        qlike_target_weight=0.20,   # ramps in when mean(y)/mean(p) ~ 1
+        qlike_target_weight=0.1,   # ramps in when mean(y)/mean(p) ~ 1
         start_mean_bias=0.0,
-        mean_bias_ramp_until=8,
+        mean_bias_ramp_until=10,
         guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
         guard_tol=getattr(ARGS, "warmup_guard_tol", 0.0),
         alpha_step=0.05,
     ),
     # Gradually emphasise upper tail once training is stable → protects QLIKE
-    TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=1.22, ramp_epochs=12),
+    TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=1.28, ramp_epochs=16),
     # Safety net if QLIKE plateaus
-    ReduceLROnPlateauCallback(monitor="val_loss", factor=0.5, patience=5, min_lr=1e-5, cooldown=1),
+    ReduceLROnPlateauCallback(
+    monitor="val_comp_overall", factor=0.5, patience=7, min_lr=1e-5, cooldown=0, stop_after_epoch=7
+),
 ]
 
 class ValLossHistory(pl.Callback):
@@ -2239,6 +2283,8 @@ def run_permutation_importance(
     )
 
     base_comp = composite_score(b_mae, b_rmse, b_qlike, b_mae, b_rmse, b_qlike, COMP_WEIGHTS)
+
+
 
     print(
         f"[FI] Dataset size (samples): {len(base_df)} | batch_size={batch_size}\n"
@@ -2893,8 +2939,10 @@ if __name__ == "__main__":
 
     val_hist_csv = LOCAL_RUN_DIR / f"tft_val_history_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv"
     val_hist_cb  = ValLossHistory(val_hist_csv)
-    
-    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=8) 
+
+
+    cosine_cb = CosineLR(start_epoch=8, min_lr=1e-5)
+
 
     # ----------------------------
     # Trainer instance
@@ -2916,7 +2964,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[best_ckpt_cb, TQDMProgressBar(refresh_rate=50), es_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, val_hist_cb] + EXTRA_CALLBACKS,
+        callbacks=[best_ckpt_cb, TQDMProgressBar(refresh_rate=50), es_cb, metrics_cb, mirror_cb, cosine_cb, lr_cb, val_hist_cb] + EXTRA_CALLBACKS,
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
         enable_progress_bar=True,
