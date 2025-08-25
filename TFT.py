@@ -577,7 +577,7 @@ class AsymmetricQuantileLoss(QuantileLoss):
     def __init__(
         self,
         quantiles,
-        underestimation_factor: float = 1.1115, #1.1115
+        underestimation_factor: float = 1.00, #1.1115
         mean_bias_weight: float = 0.0,
         tail_q: float = 0.90,         # ← was 0.85
         tail_weight: float = 0.0,
@@ -1271,7 +1271,7 @@ class BiasWarmupCallback(pl.Callback):
             alpha = (1.0 + (self.target_under - 1.0) * prog) * step
             if self._scale_ema < 0.995:  # already over-predicting
                 alpha = min(alpha, 1.0)
-        vol_loss.underestimation_factor = float(max(0.9, min(alpha, self.target_under)))
+        vol_loss.underestimation_factor = float(max(1.0, min(alpha, self.target_under)))
 
         # mean-bias gentle ramp
         if e <= self.mean_bias_ramp_until:
@@ -1704,10 +1704,10 @@ EXTRA_CALLBACKS = [
     # Gated calibration: ramps alpha/mean-bias and only enables QLIKE when scale is near 1
     BiasWarmupCallback(
         vol_loss=VOL_LOSS,
-        target_under=1.00,
+        target_under=1.10,
         target_mean_bias=0.04,
-        warmup_epochs=2,
-        qlike_target_weight=0.18,   # ramps in when mean(y)/mean(p) ~ 1
+        warmup_epochs=7,
+        qlike_target_weight=0.12,   # ramps in when mean(y)/mean(p) ~ 1
         start_mean_bias=0.0,
         mean_bias_ramp_until=10,
         guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
@@ -1715,7 +1715,7 @@ EXTRA_CALLBACKS = [
         alpha_step=0.05,
     ),
     # Gradually emphasise upper tail once training is stable → protects QLIKE
-    TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=1.15, ramp_epochs=12),
+    TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=1.2, ramp_epochs=12),
     # Safety net if QLIKE plateaus
     ReduceLROnPlateauCallback(
     monitor="val_comp_overall", factor=0.5, patience=5, min_lr=1e-5, cooldown=0, stop_after_epoch=7
@@ -1775,7 +1775,7 @@ EMBEDDING_CARDINALITY = {}
 
 BATCH_SIZE   = 256
 MAX_EPOCHS   = 5
-EARLY_STOP_PATIENCE = 12
+EARLY_STOP_PATIENCE = 15
 PERM_BLOCK_SIZE = 288
 
 # Artifacts are written locally then uploaded to GCS
@@ -2192,7 +2192,7 @@ def _evaluate_decoded_metrics(
     # decode realised_vol
     y_dec = safe_decode_vol(y_all.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
     p_dec = safe_decode_vol(p_all.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
-    floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
+    floor_val = globals().get("EVAL_VOL_FLOOR", 1e-6)
     y_dec = torch.clamp(y_dec, min=floor_val)
     p_dec = torch.clamp(p_dec, min=floor_val)
 
@@ -2972,7 +2972,7 @@ if __name__ == "__main__":
     val_hist_cb  = ValLossHistory(val_hist_csv)
 
 
-    cosine_cb = CosineLR(start_epoch=8, min_lr=5.5e-5)
+    cosine_cb = CosineLR(start_epoch=8, min_lr=1e-4)
 
 
     # ----------------------------
