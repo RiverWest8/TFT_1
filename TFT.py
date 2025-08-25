@@ -1958,193 +1958,152 @@ def _evaluate_decoded_metrics(
     num_workers: int,
     prefetch: int,
     pin_memory: bool,
-    vol_norm=None,
+    vol_norm,                 # GroupNormalizer from TRAIN (for realised_vol)
 ):
     """
-    Compute decoded MAE, RMSE, Brier and QLIKE on up to `max_batches` of ds.
-    Mirrors the validation callback path:
-      • group id extraction → [B]
-      • head extraction via `_extract_heads`
-      • decoding via `safe_decode_vol` with the SAME normalizer
-    Returns: (mae, rmse, brier, qlike, n) where val_loss == QLIKE.
+    Evaluate model on a dataset configured with predict=True, computing:
+      • MAE, RMSE, QLIKE on decoded realised_vol
+      • Brier on direction (if available)
+    Returns: (mae, rmse, brier, qlike, N)
     """
-    import torch
+    model.eval()
 
-    # -- resolve the same normalizer the dataset/model used
-    if vol_norm is None:
-        try:
-            vol_norm = _extract_norm_from_dataset(ds)
-        except Exception:
-            vol_norm = None
-
-    # -- dataloader
-    dl = ds.to_dataloader(
+    # dataloader mirrors validation loader; dataset already has predict=True
+    loader = ds.to_dataloader(
         train=False,
         batch_size=batch_size,
         num_workers=num_workers,
-        persistent_workers=(num_workers > 0),
-        prefetch_factor=prefetch,
+        shuffle=False,
+        drop_last=False,
         pin_memory=pin_memory,
+        persistent_workers=False,
+        prefetch_factor=prefetch if num_workers and num_workers > 0 else None,
     )
 
-    try:
-        model_device = next(model.parameters()).device
-    except Exception:
-        model_device = torch.device("cpu")
-
-    model.eval()
-
-    # Collect ENCODED items per-batch; decode once at the end
-    y_enc_list, p_enc_list, g_list = [], [], []
+    # accumulators (device tensors, then we'll decode at the end)
+    g_list, yv_list, pv_list = [], [], []
     yd_list, pd_list = [], []
 
-    def _groups_to_B(g):
-        """Return group ids as [B] tensor regardless of PF shape."""
-        if isinstance(g, (list, tuple)):
-            g = g[0] if g else None
-        if not torch.is_tensor(g):
-            return None
-        while g.ndim > 1:
-            g = g[:, 0]
-        return g.long()
-
-    def _extract_targets(obj):
-        """Extract (y_vol, y_dir) robustly from PF batch tensors."""
-        if torch.is_tensor(obj):
-            t = obj
-            if t.ndim == 3 and t.size(1) == 1:
-                t = t[:, 0, :]  # [B, T]
-            if t.ndim == 2 and t.size(1) >= 1:
-                yv = t[:, 0]
-                yd = t[:, 1] if t.size(1) > 1 else None
-                return yv, yd
-            return None, None
-        if isinstance(obj, (list, tuple)) and obj:
-            yv, yd = obj[0], (obj[1] if len(obj) > 1 else None)
-            if torch.is_tensor(yv):
-                if yv.ndim == 3 and yv.size(-1) == 1: yv = yv[..., 0]
-                if yv.ndim == 3 and yv.size(1) == 1: yv = yv[:, 0, :]
-                if yv.ndim == 2 and yv.size(-1) == 1: yv = yv[:, 0]
-            if torch.is_tensor(yd):
-                if yd.ndim == 3 and yd.size(-1) == 1: yd = yd[..., 0]
-                if yd.ndim == 3 and yd.size(1) == 1: yd = yd[:, 0, :]
-                if yd.ndim == 2 and yd.size(-1) == 1: yd = yd[:, 0]
-            return (yv if torch.is_tensor(yv) else None,
-                    yd if torch.is_tensor(yd) else None)
-        return None, None
-
-    for b_idx, batch in enumerate(dl):
-        if max_batches is not None and b_idx >= int(max_batches):
-            break
-
+    batches_seen = 0
+    for batch in loader:
         if isinstance(batch, (list, tuple)) and len(batch) >= 2:
-            x, y = batch[0], batch[1]
+            x = batch[0]
+            y = batch[1]
         else:
-            x, y = batch, None
+            continue
         if not isinstance(x, dict):
             continue
 
-        # groups -> [B]
-        g = _groups_to_B(x.get("groups"))
-        if g is None:
-            g = _groups_to_B(x.get("group_ids"))
-        if g is None:
+        # group ids
+        groups = None
+        for k in ("groups", "group_ids", "group_id"):
+            if k in x and x[k] is not None:
+                groups = x[k]
+                break
+        if groups is None:
+            continue
+        g = groups[0] if isinstance(groups, (list, tuple)) else groups
+        while torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
+            g = g.squeeze(-1)
+
+        # targets from decoder_target (fallback to y)
+        dec_t = x.get("decoder_target", None)
+        y_vol_t, y_dir_t = None, None
+        if torch.is_tensor(dec_t):
+            t = dec_t
+            if t.ndim == 3 and t.size(-1) == 1:
+                t = t[..., 0]
+            if t.ndim == 2 and t.size(1) >= 1:
+                y_vol_t = t[:, 0]
+                if t.size(1) > 1:
+                    y_dir_t = t[:, 1]
+        elif isinstance(dec_t, (list, tuple)) and len(dec_t) >= 1:
+            y_vol_t = dec_t[0]
+            if torch.is_tensor(y_vol_t) and y_vol_t.ndim == 3 and y_vol_t.size(-1) == 1:
+                y_vol_t = y_vol_t[..., 0]
+            if len(dec_t) > 1 and torch.is_tensor(dec_t[1]):
+                y_dir_t = dec_t[1]
+                if y_dir_t.ndim == 3 and y_dir_t.size(-1) == 1:
+                    y_dir_t = y_dir_t[..., 0]
+
+        if (y_vol_t is None) and torch.is_tensor(y):
+            yy = y
+            if yy.ndim == 3 and yy.size(1) == 1:
+                yy = yy[:, 0, :]
+            if yy.ndim == 2 and yy.size(1) >= 1:
+                y_vol_t = yy[:, 0]
+                if yy.size(1) > 1:
+                    y_dir_t = yy[:, 1]
+
+        if (y_vol_t is None) or (not torch.is_tensor(g)):
             continue
 
-        # targets (encoded)
-        dec_t = x.get("decoder_target")
-        if dec_t is None:
-            dec_t = x.get("target")
-        y_vol, y_dir = _extract_targets(dec_t)
-        if (y_vol is None or (y_dir is None and y is not None)) and torch.is_tensor(y):
-            yv2, yd2 = _extract_targets(y)
-            if y_vol is None: y_vol = yv2
-            if y_dir is None: y_dir = yd2
-        if not torch.is_tensor(y_vol):
-            continue
-
-        # forward
-        x_dev = {
-            k: (
-                v.to(model_device, non_blocking=True) if torch.is_tensor(v)
-                else [vv.to(model_device, non_blocking=True) if torch.is_tensor(vv) else vv for vv in v]
-                if isinstance(v, (list, tuple)) else v
-            )
-            for k, v in x.items()
-        }
-        y_hat = model(x_dev)
+        # forward pass and head extraction
+        y_hat = model(x)
         pred = getattr(y_hat, "prediction", y_hat)
         if isinstance(pred, dict) and "prediction" in pred:
             pred = pred["prediction"]
-
-        # extract encoded heads
         p_vol, p_dir = _extract_heads(pred)
         if p_vol is None:
             continue
 
-        # collect ENCODED tensors (cpu) and group ids
-        L = y_vol.shape[0]
-        y_enc_list.append(y_vol.reshape(L).detach().cpu())
-        p_enc_list.append(p_vol.reshape(L).detach().cpu())
-        g_list.append(g.reshape(L).detach().cpu())
+        L = g.shape[0]
+        g_list.append(g.reshape(L))
+        yv_list.append(y_vol_t.reshape(L))
+        pv_list.append(p_vol.reshape(L))
 
-        if torch.is_tensor(y_dir) and torch.is_tensor(p_dir):
-            yd_flat, pd_flat = y_dir.reshape(-1), p_dir.reshape(-1)
-            L2 = min(yd_flat.numel(), pd_flat.numel())
+        if y_dir_t is not None and p_dir is not None:
+            yd = y_dir_t.reshape(-1)
+            pd = p_dir.reshape(-1)
+            L2 = min(L, yd.numel(), pd.numel())
             if L2 > 0:
-                yd_list.append(yd_flat[:L2].detach().cpu())
-                pd_list.append(pd_flat[:L2].detach().cpu())
+                yd_list.append(yd[:L2])
+                pd_list.append(pd[:L2])
 
-    # aggregate encoded → tensors
-    if not y_enc_list:
-        return float("nan"), float("nan"), float("nan"), float("nan"), 0
+        batches_seen += 1
+        if max_batches is not None and max_batches > 0 and batches_seen >= max_batches:
+            break
 
-    y_enc = torch.cat(y_enc_list, dim=0)
-    p_enc = torch.cat(p_enc_list, dim=0)
-    g_all = torch.cat(g_list, dim=0)
+    if not g_list:
+        # empty input → return NaNs-ish but finite
+        return 1.0, 1.0, 0.25, 10.0, 0
 
-    # --- Decode realised_vol to physical scale (once, vectorised) ---
-    y_dec = safe_decode_vol(y_enc.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
-    p_dec = safe_decode_vol(p_enc.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
+    device = g_list[0].device
+    g_all  = torch.cat(g_list).to(device)
+    y_all  = torch.cat(yv_list).to(device)
+    p_all  = torch.cat(pv_list).to(device)
 
-    # guard small values
+    # decode realised_vol
+    y_dec = safe_decode_vol(y_all.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
+    p_dec = safe_decode_vol(p_all.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
     floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
     y_dec = torch.clamp(y_dec, min=floor_val)
     p_dec = torch.clamp(p_dec, min=floor_val)
 
     # metrics
-    diff = p_dec - y_dec
-    mae  = diff.abs().mean().item()
-    rmse = torch.sqrt((diff ** 2).mean()).item()
-
     eps = 1e-8
+    diff = (p_dec - y_dec)
+    mae  = diff.abs().mean().item()
+    rmse = (diff.pow(2).mean().sqrt().item())
+
     sigma2_p = torch.clamp(p_dec.abs(), min=eps) ** 2
     sigma2_y = torch.clamp(y_dec.abs(), min=eps) ** 2
-    ratio = sigma2_y / sigma2_p
-    qlike = (ratio - torch.log(ratio) - 1.0).mean().item()
+    ratio    = sigma2_y / sigma2_p
+    qlike    = (ratio - torch.log(ratio) - 1.0).mean().item()
 
-    # direction → Brier (label-smoothed as in training)
-    brier = float("nan")
+    brier = None
     if yd_list and pd_list:
-        yd = torch.cat(yd_list).float()
-        pd = torch.cat(pd_list)
+        yd = torch.cat(yd_list).to(device).float()
+        pd = torch.cat(pd_list).to(device)
         try:
             if torch.isfinite(pd).any() and (pd.min() < 0 or pd.max() > 1):
                 pd = torch.sigmoid(pd)
         except Exception:
             pd = torch.sigmoid(pd)
         pd = torch.clamp(pd, 0.0, 1.0)
-        y_smooth = yd * 0.9 + 0.05
-        brier = float(((pd - y_smooth) ** 2).mean().item())
+        brier = ((pd - yd) ** 2).mean().item()
 
-    # sanity print if scale still looks encoded
-    if mae > 0.01:
-        try:
-            print(f"[FI DEBUG] decoded MAE unusually large: MAE={mae:.6f} | mean(y)={y_dec.mean().item():.6f} | mean(p)={p_dec.mean().item():.6f}")
-        except Exception:
-            pass
-
-    return float(mae), float(rmse), float(brier), float(qlike), int(y_dec.numel())
+    return float(mae), float(rmse), (float(brier) if brier is not None else float("nan")), float(qlike), int(y_dec.numel())
 
 # --- after trainer.fit(...), before running FI ---
 def _resolve_best_model(trainer, fallback):
@@ -2190,28 +2149,43 @@ def run_permutation_importance(
     num_workers: int,
     prefetch: int,
     pin_memory: bool,
-    vol_norm,                       # 👈 must be passed explicitly from dataset
+    vol_norm,                       # 👈 pass GroupNormalizer from TRAIN
     out_csv_path: str,
     uploader,
     build_ds_fn=lambda: None,       # compatibility; unused
 ) -> None:
     """
-    Compute permutation importance by **decoded** validation loss using the same
-    composite metric as validation:
-        CompLoss = w_mae*MAE + w_rmse*RMSE + w_qlike*QLIKE (baseline‑normalised for FI).
-    We also report decoded MAE, RMSE, QLIKE (val_loss==QLIKE), and Brier for direction.
-    """
-    global COMP_WEIGHTS, composite_score
+    Permutation Feature Importance on **decoded** metrics with a **baseline-normalised composite**:
 
-    # --- Baseline dataset ---
+        Comp = w_mae*(MAE/MAE0) + w_rmse*(RMSE/RMSE0) + w_qlike*(QLIKE/QLIKE0)
+
+    We log per-feature deltas:
+        Δ_COMP = Comp_perm - Comp_base  (positive = harmful; negative = helpful)
+    """
+
+    import os
+
+    # ---------- optional RESUME ----------
+    already = set()
+    existing_rows = []
+    if out_csv_path and os.path.exists(out_csv_path):
+        try:
+            prev = pd.read_csv(out_csv_path)
+            if "feature" in prev.columns:
+                already = set(prev["feature"].astype(str).tolist())
+                existing_rows = prev.to_dict("records")
+                print(f"[FI] Resuming — {len(already)} features already in {out_csv_path}")
+        except Exception as e:
+            print(f"[FI WARN] Could not read existing FI CSV for resume: {e}")
+
+    # ---------- BASELINE (predict=True, last step) ----------
     ds_base = TimeSeriesDataSet.from_dataset(
         template_ds,
         base_df,
-        predict=False,
+        predict=True,
         stop_randomization=True,
     )
 
-    # --- Baseline metrics ---
     b_mae, b_rmse, b_brier, b_qlike, n_base = _evaluate_decoded_metrics(
         model=model,
         ds=ds_base,
@@ -2220,38 +2194,40 @@ def run_permutation_importance(
         num_workers=num_workers,
         prefetch=prefetch,
         pin_memory=pin_memory,
-        vol_norm=vol_norm,  # 👈 ensure decoded with same normalizer
+        vol_norm=vol_norm,
     )
 
-    # Baseline composite (normalised to itself → equals sum of weights)
     base_comp = composite_score(b_mae, b_rmse, b_qlike, b_mae, b_rmse, b_qlike, COMP_WEIGHTS)
 
-    print(f"[FI] Dataset size (samples): {len(base_df)} | batch_size={batch_size}")
     print(
+        f"[FI] Dataset size (samples): {len(base_df)} | batch_size={batch_size}\n"
         f"[FI] Baseline: QLIKE={b_qlike:.6f} | MAE={b_mae:.6f} | RMSE={b_rmse:.6f} | "
         f"COMPOSITE(base)={base_comp:.4f} | N={n_base}"
     )
-
     if b_mae > 0.01:
-        print(f"[FI DEBUG] WARNING: baseline decoded MAE unusually large "
-              f"(expected ~0.001–0.003). Check vol_norm and decode pipeline.")
+        print("[FI DEBUG] WARNING: baseline decoded MAE unusually large (expected ~0.001–0.003). "
+              "Check vol_norm and decode pipeline.")
 
-    rows = []
+    new_rows = []
     work_df = base_df.copy()
 
-    # --- Permutation loop ---
+    # ---------- PERMUTE LOOP ----------
     for feat in features:
+        if str(feat) in already:
+            print(f"[FI] {feat:>20s} | SKIP (already present)")
+            continue
+
         df_perm = work_df.copy()
         _permute_series_inplace(df_perm, feat, block=block_size, group_col="asset")
 
         ds_perm = TimeSeriesDataSet.from_dataset(
             template_ds,
             df_perm,
-            predict=False,
+            predict=True,
             stop_randomization=True,
         )
 
-        p_mae, p_rmse, p_dir, p_qlike, n_p = _evaluate_decoded_metrics(
+        p_mae, p_rmse, p_brier, p_qlike, n_p = _evaluate_decoded_metrics(
             model=model,
             ds=ds_perm,
             batch_size=batch_size,
@@ -2259,42 +2235,47 @@ def run_permutation_importance(
             num_workers=num_workers,
             prefetch=prefetch,
             pin_memory=pin_memory,
-            vol_norm=vol_norm,  # 👈 ensure decoded with same normalizer
+            vol_norm=vol_norm,
         )
 
-        # Individual deltas (lower is better)
-        d_mae   = float(p_mae  - b_mae)
-        d_rmse  = float(p_rmse - b_rmse)
+        # individual deltas (lower is better)
+        d_mae   = float(p_mae   - b_mae)
+        d_rmse  = float(p_rmse  - b_rmse)
         d_qlike = float(p_qlike - b_qlike)
 
-        # Baseline‑normalised composite
+        # baseline-normalised composite
         p_comp = composite_score(p_mae, p_rmse, p_qlike, b_mae, b_rmse, b_qlike, COMP_WEIGHTS)
-        d_comp = float(p_comp - base_comp)
+        d_comp = float(p_comp - base_comp)  # + = harmful (we minimise)
 
         print(
             f"[FI] {feat:>20s} | QLIKE={p_qlike:.6f} Δ_QLIKE={d_qlike:+.6f} | "
-            f"Δ_MAE={d_mae:+.6f} Δ_RMSE={d_rmse:+.6f} | COMPOSITE={p_comp:.4f} Δ_COMP={d_comp:+.4f}"
+            f"Δ_MAE={d_mae:+.6f} Δ_RMSE={d_rmse:+.6f} | "
+            f"COMPOSITE={p_comp:.4f} Δ_COMP={d_comp:+.4f} "
+            f"{'(↑ worse ⇒ useful)' if d_comp > 0 else '(↓ better ⇒ harmful/redundant)'}"
         )
 
-        rows.append({
-            "feature": feat,
-            "baseline_val_loss": float(b_qlike),
-            "permuted_val_loss": float(p_qlike),
-            "delta_qlike": float(d_qlike),
-            "mae": float(p_mae),
-            "rmse": float(p_rmse),
-            "brier": float(p_dir),
+        new_rows.append({
+            "feature": str(feat),
+            "baseline_mae": float(b_mae),
+            "baseline_rmse": float(b_rmse),
+            "baseline_qlike": float(b_qlike),
+            "permuted_mae": float(p_mae),
+            "permuted_rmse": float(p_rmse),
+            "permuted_qlike": float(p_qlike),
             "delta_mae": float(d_mae),
             "delta_rmse": float(d_rmse),
-            "composite": float(p_comp),
+            "delta_qlike": float(d_qlike),
+            "composite_base": float(base_comp),
+            "composite_perm": float(p_comp),
             "delta_composite": float(d_comp),
+            "brier": (float(p_brier) if p_brier == p_brier else None),
             "weights": f"mae={COMP_WEIGHTS[0]},rmse={COMP_WEIGHTS[1]},qlike={COMP_WEIGHTS[2]}",
             "n": int(n_p),
         })
 
-    # --- Save CSV and upload ---
+    # ---------- SAVE / UPLOAD ----------
     try:
-        out_df = pd.DataFrame(rows)
+        out_df = pd.DataFrame((existing_rows or []) + new_rows)
         out_df.to_csv(out_csv_path, index=False)
         print(f"[FI] wrote {out_csv_path}")
         if uploader is not None:
@@ -2844,7 +2825,7 @@ if __name__ == "__main__":
     val_hist_csv = LOCAL_RUN_DIR / f"tft_val_history_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv"
     val_hist_cb  = ValLossHistory(val_hist_csv)
     
-    lr_decay_cb = EpochLRDecay(gamma=0.965, start_epoch=8) 
+    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=9) 
 
     # ----------------------------
     # Trainer instance
@@ -2912,7 +2893,7 @@ if __name__ == "__main__":
         train_vol_norm = None
     # ---- Permutation Importance (decoded) ----
 if ENABLE_FEATURE_IMPORTANCE:
-    fi_csv = str(LOCAL_OUTPUT_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")
+    fi_csv = str(LOCAL_OUTPUT_DIR / f"TFTPFI_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")
     feats = time_varying_unknown_reals.copy()
     # optional: drop calendar features from FI
     feats = [f for f in feats if f not in ("sin_tod", "cos_tod", "sin_dow", "cos_dow", "Is_Weekend")]
