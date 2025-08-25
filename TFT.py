@@ -2223,7 +2223,7 @@ def run_permutation_importance(
     ds_base = TimeSeriesDataSet.from_dataset(
         template_ds,
         base_df,
-        predict=True,
+        predict=False,
         stop_randomization=True,
     )
 
@@ -2264,7 +2264,7 @@ def run_permutation_importance(
         ds_perm = TimeSeriesDataSet.from_dataset(
             template_ds,
             df_perm,
-            predict=True,
+            predict=False,
             stop_randomization=True,
         )
 
