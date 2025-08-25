@@ -152,9 +152,9 @@ import argparse
 import pytorch_forecasting as pf
 import inspect
 
-#VOL_QUANTILES = [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95] #The quantiles which yielded our best so far
+VOL_QUANTILES = [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95] #The quantiles which yielded our best so far
 #Q50_IDX = VOL_QUANTILES.index(0.50)  
-VOL_QUANTILES = [0.05, 0.15, 0.35, 0.50, 0.65, 0.85, 0.95]
+#VOL_QUANTILES = [0.05, 0.15, 0.35, 0.50, 0.65, 0.85, 0.95]
 Q50_IDX = VOL_QUANTILES.index(0.50)
 
 # Composite metric weights (override via --metric_weights "w_mae,w_rmse,w_qlike")
@@ -1710,8 +1710,8 @@ EXTRA_CALLBACKS = [
         vol_loss=VOL_LOSS,
         target_under=1.00,
         target_mean_bias=0.04,
-        warmup_epochs=4,
-        qlike_target_weight=0.1,   # ramps in when mean(y)/mean(p) ~ 1
+        warmup_epochs=2,
+        qlike_target_weight=0.18,   # ramps in when mean(y)/mean(p) ~ 1
         start_mean_bias=0.0,
         mean_bias_ramp_until=10,
         guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
@@ -1719,7 +1719,7 @@ EXTRA_CALLBACKS = [
         alpha_step=0.05,
     ),
     # Gradually emphasise upper tail once training is stable → protects QLIKE
-    TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=1.28, ramp_epochs=16),
+    TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=1.15, ramp_epochs=12),
     # Safety net if QLIKE plateaus
     ReduceLROnPlateauCallback(
     monitor="val_comp_overall", factor=0.5, patience=7, min_lr=1e-5, cooldown=0, stop_after_epoch=7
@@ -2928,7 +2928,7 @@ if __name__ == "__main__":
     pos_weight = float(n_neg / n_pos)
 
     # then build the loss with:
-    DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.03, pos_weight=pos_weight)
+    DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.02, pos_weight=pos_weight)
 
 
     FIXED_VOL_WEIGHT = 1.0
