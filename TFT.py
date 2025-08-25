@@ -820,7 +820,7 @@ class PerAssetMetrics(pl.Callback):
         yv = torch.cat(self._yv_dev).to(device)           # realised_vol (encoded)  [N]
         pv = torch.cat(self._pv_dev).to(device)           # realised_vol pred (enc) [N]
         yd = torch.cat(self._yd_dev).to(device) if self._yd_dev else None  # direction labels
-        pd = torch.cat(self._pd_dev).to(device) if self._pd_dev else None  # direction logits/probs
+        pdir = torch.cat(self._pd_dev).to(device) if self._pd_dev else None  # direction logits/probs
 
         # --- Decode realised_vol to physical scale (robust to PF version)
         yv_dec = safe_decode_vol(yv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
@@ -847,7 +847,7 @@ class PerAssetMetrics(pl.Callback):
         p_cpu  = pv_dec.detach().cpu()
         g_cpu  = g.detach().cpu()
         yd_cpu = yd.detach().cpu() if yd is not None else None
-        pd_cpu = pd.detach().cpu() if pd is not None else None
+        pdir_cpu = pdir.detach().cpu() if pdir is not None else None
 
         # Calibration diagnostic (not used in loss)
         try:
@@ -876,9 +876,9 @@ class PerAssetMetrics(pl.Callback):
         acc = None
         brier = None
         auroc = None
-        if yd_cpu is not None and pd_cpu is not None and yd_cpu.numel() > 0 and pd_cpu.numel() > 0:
+        if yd_cpu is not None and pdir_cpu is not None and yd_cpu.numel() > 0 and pdir_cpu.numel() > 0:
             # Convert logits→probs if needed
-            probs = pd_cpu
+            probs = pdir_cpu
             try:
                 if torch.isfinite(probs).any() and (probs.min() < 0 or probs.max() > 1):
                     probs = torch.sigmoid(probs)
@@ -950,9 +950,9 @@ class PerAssetMetrics(pl.Callback):
                 "y": y_cpu.numpy(),
                 "p": p_cpu.numpy(),
             })
-            if yd_cpu is not None and pd_cpu is not None and yd_cpu.numel() > 0 and pd_cpu.numel() > 0:
+            if yd_cpu is not None and pdir_cpu is not None and yd_cpu.numel() > 0 and pdir_cpu.numel() > 0:
                 # ensure probs in [0,1]
-                probs = pd_cpu
+                probs = pdir_cpu
                 try:
                     if torch.isfinite(probs).any() and (probs.min() < 0 or probs.max() > 1):
                         probs = torch.sigmoid(probs)
@@ -1000,7 +1000,7 @@ class PerAssetMetrics(pl.Callback):
             "val_loss": val_comp,
             "dir_bce": brier,   # (kept for backwards compatibility with your saver)
             "yd": yd_cpu,
-            "pd": pd_cpu,
+            "pd": pdir_cpu,
         }
 
     @torch.no_grad()
@@ -1076,7 +1076,7 @@ class PerAssetMetrics(pl.Callback):
             yv_cpu = torch.cat(self._yv_dev).detach().cpu() if self._yv_dev else None
             pv_cpu = torch.cat(self._pv_dev).detach().cpu() if self._pv_dev else None
             yd_cpu = torch.cat(self._yd_dev).detach().cpu() if self._yd_dev else None
-            pd_cpu = torch.cat(self._pd_dev).detach().cpu() if self._pd_dev else None
+            pdir_cpu = torch.cat(self._pd_dev).detach().cpu() if self._pd_dev else None
             # decode vol back to physical scale
             if g_cpu is not None and yv_cpu is not None and pv_cpu is not None:
                 yv_dec = self.vol_norm.decode(yv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
@@ -1093,9 +1093,9 @@ class PerAssetMetrics(pl.Callback):
                     "y_vol": yv_dec.numpy().tolist(),
                     "y_vol_pred": pv_dec.numpy().tolist(),
                 })
-                if yd_cpu is not None and pd_cpu is not None and yd_cpu.numel() > 0 and pd_cpu.numel() > 0:
-                    # ensure pd is probability
-                    pdp = pd_cpu
+                if yd_cpu is not None and pdir_cpu is not None and yd_cpu.numel() > 0 and pdir_cpu.numel() > 0:
+                    # ensure pdir is probability
+                    pdp = pdir_cpu
                     try:
                         if torch.isfinite(pdp).any() and (pdp.min() < 0 or pdp.max() > 1):
                             pdp = torch.sigmoid(pdp)
