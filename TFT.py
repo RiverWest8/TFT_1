@@ -2866,7 +2866,7 @@ if __name__ == "__main__":
     val_hist_csv = LOCAL_RUN_DIR / f"tft_val_history_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv"
     val_hist_cb  = ValLossHistory(val_hist_csv)
     
-    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=9) 
+    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=8) 
 
     # ----------------------------
     # Trainer instance
