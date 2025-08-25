@@ -2854,7 +2854,7 @@ if __name__ == "__main__":
 
     best_ckpt_cb = ModelCheckpoint(
         monitor="val_loss",
-        mode="max",
+        mode="min",
         save_top_k=1,
         save_last=True,
         filename=f"tft_best_e{MAX_EPOCHS}_{RUN_SUFFIX}",
