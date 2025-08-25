@@ -48,6 +48,7 @@ from typing import List
 import json
 import numpy as np
 import pandas as pd
+import math
 import pandas as _pd
 pd = _pd  # Ensure pd always refers to pandas module
 import lightning.pytorch as pl
@@ -2975,7 +2976,7 @@ if __name__ == "__main__":
     val_hist_cb  = ValLossHistory(val_hist_csv)
 
 
-    cosine_cb = CosineLR(start_epoch=8, min_lr=1e-5)
+    cosine_cb = CosineLR(start_epoch=8, min_lr=1e-4)
 
 
     # ----------------------------
