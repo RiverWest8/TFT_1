@@ -1083,7 +1083,7 @@ class PerAssetMetrics(pl.Callback):
                 yv_dec = self.vol_norm.decode(yv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
                 pv_dec = self.vol_norm.decode(pv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
                 # Apply the same calibration used in metrics so saved preds match the plots
-                #pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
+                pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
                 # map group id -> name
                 assets = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
                 # time index (may be missing)
@@ -1611,7 +1611,7 @@ class TailWeightRamp(pl.Callback):
         for cb in getattr(trainer, 'callbacks', []):
             if isinstance(cb, BiasWarmupCallback) and getattr(cb, '_frozen', False):
                 frozen = True
-                break
+                break 
         if frozen:
             print(f"[TAIL] epoch={int(getattr(trainer, 'current_epoch', 0))} frozen; tail_weight stays {self.vol_loss.tail_weight}")
             return
@@ -1657,7 +1657,7 @@ class CosineLR(pl.Callback):
             pass
 
 class ReduceLROnPlateauCallback(pl.Callback):
-    def __init__(self, monitor="val_comp_overall", factor=0.5, patience=2, min_lr=1e-5, cooldown=0, stop_after_epoch=None):
+    def __init__(self, monitor="val_comp_overall", factor=0.5, patience=5, min_lr=1e-5, cooldown=0, stop_after_epoch=None):
         self.monitor, self.factor, self.patience, self.min_lr, self.cooldown = monitor, factor, patience, min_lr, cooldown
         self.stop_after_epoch = stop_after_epoch
         self.best, self.bad, self.cool = float("inf"), 0, 0
@@ -1718,7 +1718,7 @@ EXTRA_CALLBACKS = [
     TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=1.15, ramp_epochs=12),
     # Safety net if QLIKE plateaus
     ReduceLROnPlateauCallback(
-    monitor="val_comp_overall", factor=0.5, patience=7, min_lr=1e-5, cooldown=0, stop_after_epoch=7
+    monitor="val_comp_overall", factor=0.5, patience=5, min_lr=1e-5, cooldown=0, stop_after_epoch=7
 ),
 ]
 
@@ -2897,7 +2897,7 @@ if __name__ == "__main__":
     print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.0017978}")
     
     es_cb = EarlyStopping(
-    monitor="val_loss",
+    monitor="val_qlike_overall",
     patience=EARLY_STOP_PATIENCE,
     mode="min",
     min_delta = 1e-4
@@ -2958,7 +2958,7 @@ if __name__ == "__main__":
 
 
     best_ckpt_cb = ModelCheckpoint(
-        monitor="val_loss",
+        monitor="val_qlike_overall",
         mode="min",
         save_top_k=1,
         save_last=True,
@@ -2981,7 +2981,7 @@ if __name__ == "__main__":
     checkpoint_callback = ModelCheckpoint(
         dirpath=str(LOCAL_OUTPUT_DIR),
         filename="tft-{epoch:02d}-{val_loss:.4f}",
-        monitor="val_loss",      # or val_qlike_overall if you want
+        monitor="val_qlike_overall",      # or val_qlike_overall if you want
         save_top_k=1,            # keep best only
         save_last = True,
         auto_insert_metric_name=False,
