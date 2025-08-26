@@ -988,6 +988,18 @@ class PerAssetMetrics(pl.Callback):
             rows.sort(key=lambda r: r[6], reverse=True)
             self._last_rows = rows
 
+            # --- Per-epoch per-asset snapshot (top by samples) ---
+            try:
+                k = min(5, getattr(self, "max_print", 5))
+                if rows:
+                    print("Per-asset (epoch snapshot, top by samples):")
+                    print("asset | MAE | RMSE | MSE | QLIKE | ACC | N")
+                    for r in rows[:k]:
+                        acc_str = "-" if r[5] is None else f"{r[5]:.3f}"
+                        print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {acc_str} | {r[6]}")
+            except Exception as _e:
+                print(f"[WARN] per-epoch per-asset print failed: {_e}")
+
         except Exception as e:
             print(f"[WARN] per-asset aggregation failed: {e}")
             self._last_rows = []
@@ -1594,10 +1606,36 @@ class MirrorCheckpoints(pl.Callback):
     def on_train_end(self, trainer, pl_module):
         mirror_local_ckpts_to_gcs()
 
+
 class TailWeightRamp(pl.Callback):
-    def __init__(self, vol_loss, start: float = 1.0, end: float = 1.25, ramp_epochs: int = 12):
+    def __init__(
+        self,
+        vol_loss,
+        start: float = 1.0,
+        end: float = 1.25,
+        ramp_epochs: int = 12,
+        gate_by_calibration: bool = True,
+        gate_low: float = 0.95,
+        gate_high: float = 1.05,
+        gate_patience: int = 2,
+    ):
         super().__init__()
-        self.vol_loss, self.start, self.end, self.ramp = vol_loss, float(start), float(end), int(ramp_epochs)
+        self.vol_loss = vol_loss
+        self.start = float(start)
+        self.end = float(end)
+        self.ramp = int(ramp_epochs)
+        self.gate = bool(gate_by_calibration)
+        self.gate_low = float(gate_low)
+        self.gate_high = float(gate_high)
+        self.gate_patience = int(gate_patience)
+        self._ok_streak = 0
+        self._trigger_epoch = None
+
+    def _get_scale_ema(self, trainer):
+        for cb in getattr(trainer, "callbacks", []):
+            if isinstance(cb, BiasWarmupCallback):
+                return getattr(cb, "_scale_ema", None)
+        return None
 
     def on_train_epoch_start(self, trainer, pl_module):
         # Global CLI switch: if --disable_warmups is true, hold tail_weight steady
@@ -1607,21 +1645,44 @@ class TailWeightRamp(pl.Callback):
                 return
         except Exception:
             pass
+
+        # Freeze if BiasWarmup froze things
         frozen = False
-        for cb in getattr(trainer, 'callbacks', []):
-            if isinstance(cb, BiasWarmupCallback) and getattr(cb, '_frozen', False):
+        for cb in getattr(trainer, "callbacks", []):
+            if isinstance(cb, BiasWarmupCallback) and getattr(cb, "_frozen", False):
                 frozen = True
-                break 
+                break
+        e = int(getattr(trainer, "current_epoch", 0))
         if frozen:
-            print(f"[TAIL] epoch={int(getattr(trainer, 'current_epoch', 0))} frozen; tail_weight stays {self.vol_loss.tail_weight}")
+            print(f"[TAIL] epoch={e} frozen; tail_weight stays {self.vol_loss.tail_weight}")
             return
 
-        e = int(getattr(trainer, "current_epoch", 0))
+        # Optional calibration gate
+        if self.gate:
+            scale_ema = self._get_scale_ema(trainer)
+            if (scale_ema is None) or not (self.gate_low <= float(scale_ema) <= self.gate_high):
+                self._ok_streak = 0
+                self._trigger_epoch = None
+                self.vol_loss.tail_weight = self.start
+                print(f"[TAIL] epoch={e} gated (scale_ema={scale_ema}); tail_weight={self.vol_loss.tail_weight}")
+                return
+            else:
+                self._ok_streak = min(self.gate_patience, self._ok_streak + 1)
+                if self._ok_streak < self.gate_patience:
+                    self.vol_loss.tail_weight = self.start
+                    print(f"[TAIL] epoch={e} gating warm-up {self._ok_streak}/{self.gate_patience}; tail_weight={self.vol_loss.tail_weight}")
+                    return
+                if self._trigger_epoch is None:
+                    self._trigger_epoch = e
+                    print(f"[TAIL] epoch={e} gate OPEN (scale_ema={scale_ema}); starting ramp")
+
+        # Ramping once gate is open (or immediately if gate disabled)
         eff_end = min(self.end, 1.5)
-        eff_ramp = max(self.ramp, 12)
-        prog = 1.0 if eff_ramp <= 0 else min(1.0, e / float(eff_ramp))
+        eff_ramp = max(self.ramp, 8)
+        base = self._trigger_epoch if (self.gate and self._trigger_epoch is not None) else 0
+        prog = min(1.0, max(0.0, (e - base + 1) / float(eff_ramp)))
         self.vol_loss.tail_weight = self.start + (eff_end - self.start) * prog
-        print(f"[TAIL] epoch={e} tail_weight={self.vol_loss.tail_weight}")
+        print(f"[TAIL] epoch={e} tail_weight={self.vol_loss.tail_weight:.4f} (ramp prog={prog:.2f}, gate={'on' if self.gate else 'off'})")
 
 
 
@@ -1714,12 +1775,23 @@ EXTRA_CALLBACKS = [
         guard_tol=getattr(ARGS, "warmup_guard_tol", 0.0),
         alpha_step=0.05,
     ),
-    # Gradually emphasise upper tail once training is stable → protects QLIKE
-    TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=1.2, ramp_epochs=12),
-    # Safety net if QLIKE plateaus
+    # Gradually emphasise upper tail once calibration is near 1.0
+    TailWeightRamp(
+        vol_loss=VOL_LOSS,
+        start=1.0,
+        end=1.5,
+        ramp_epochs=12,
+        gate_by_calibration=True,
+        gate_low=0.95,
+        gate_high=1.05,
+        gate_patience=2,
+    ),
+    # Safety net if QLIKE plateaus before cosine takes over
     ReduceLROnPlateauCallback(
-    monitor="val_comp_overall", factor=0.5, patience=5, min_lr=1e-5, cooldown=0, stop_after_epoch=7
-),
+        monitor="val_comp_overall", factor=0.5, patience=5, min_lr=1e-5, cooldown=0, stop_after_epoch=10
+    ),
+    # Start cosine decay later so we keep learning capacity to fix tails
+    CosineLR(start_epoch=10, min_lr=1e-4),
 ]
 
 class ValLossHistory(pl.Callback):
