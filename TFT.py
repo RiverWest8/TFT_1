@@ -1704,10 +1704,10 @@ EXTRA_CALLBACKS = [
     # Gated calibration: ramps alpha/mean-bias and only enables QLIKE when scale is near 1
     BiasWarmupCallback(
         vol_loss=VOL_LOSS,
-        target_under=1.10,
+        target_under=1.05,
         target_mean_bias=0.04,
         warmup_epochs=7,
-        qlike_target_weight=0.05,   # ramps in when mean(y)/mean(p) ~ 1
+        qlike_target_weight=0.0,   # ramps in when mean(y)/mean(p) ~ 1
         start_mean_bias=0.0,
         mean_bias_ramp_until=10,
         guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
