@@ -1428,7 +1428,6 @@ parser.add_argument("--warmup_guard_tol", type=float, default=0.0,
 parser.add_argument("--max_encoder_length", type=int, default=None, help="Max encoder length")
 parser.add_argument("--max_epochs", type=int, default=None, help="Max training epochs")
 parser.add_argument("--batch_size", type=int, default=None, help="Training batch size")
-parser.add_argument("--early_stop_patience", "--patience", type=int, default=None, help="Early stopping patience")
 parser.add_argument("--perm_len", type=int, default=None, help="Permutation block length for importance")
 parser.add_argument("--perm_block_size", type=int, default=None, help="Alias for --perm_len (permutation block length)")
 parser.add_argument(
