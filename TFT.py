@@ -1813,7 +1813,7 @@ EXTRA_CALLBACKS = [
           save_top_k=3,
           save_last=True,
       ),
-      StochasticWeightAveraging(swa_epoch_start=max(1, int(0.8 * MAX_EPOCHS))),
+      StochasticWeightAveraging(swa_lrs = 0.00091, swa_epoch_start=max(1, int(0.8 * MAX_EPOCHS))),
   ]
 
 class ValLossHistory(pl.Callback):
