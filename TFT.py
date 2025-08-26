@@ -56,6 +56,11 @@ import lightning.pytorch as pl
 
 
 
+BATCH_SIZE   = 128
+MAX_EPOCHS   = 35
+EARLY_STOP_PATIENCE = 15
+PERM_BLOCK_SIZE = 288
+
 # Extra belt-and-braces: swallow BrokenPipe errors on stdout.flush() if any other lib calls it.
 try:
     import sys
@@ -1863,7 +1868,7 @@ MAX_PRED_LENGTH    = 1
 EMBEDDING_CARDINALITY = {}
 
 BATCH_SIZE   = 128
-MAX_EPOCHS   = 5
+MAX_EPOCHS   = 35
 EARLY_STOP_PATIENCE = 15
 PERM_BLOCK_SIZE = 288
 
