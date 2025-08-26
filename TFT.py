@@ -1167,7 +1167,7 @@ class BiasWarmupCallback(pl.Callback):
         target_under: float = 1.00,
         target_mean_bias: float = 0.04,
         warmup_epochs: int = 4,
-        qlike_target_weight: float | None = 0.10,
+        qlike_target_weight: float | None = 0.05,
         start_mean_bias: float = 0.0,
         mean_bias_ramp_until: int = 8,
         guard_patience: int = 2,
