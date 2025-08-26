@@ -1803,7 +1803,6 @@ EXTRA_CALLBACKS = [
       ReduceLROnPlateauCallback(
           monitor="val_qlike_overall", factor=0.5, patience=4, min_lr=3e-5, cooldown=1, stop_after_epoch=None
       ),
-      EarlyStopping(monitor="val_qlike_overall", mode="min", patience=8),
       ModelCheckpoint(
           dirpath=str(LOCAL_CKPT_DIR),
           filename="tft-{epoch:02d}-{val_qlike_overall:.4f}",
