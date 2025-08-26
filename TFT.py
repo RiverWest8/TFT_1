@@ -1897,8 +1897,6 @@ if ARGS.max_encoder_length is not None:
     MAX_ENCODER_LENGTH = int(ARGS.max_encoder_length)
 if ARGS.max_epochs is not None:
     MAX_EPOCHS = int(ARGS.max_epochs)
-if ARGS.early_stop_patience is not None:
-    EARLY_STOP_PATIENCE = int(ARGS.early_stop_patience)
 if ARGS.perm_len is not None:
     PERM_BLOCK_SIZE = int(ARGS.perm_len)
 if ARGS.enable_perm_importance is not None:
