@@ -41,47 +41,16 @@ Adjust hyper‑parameters in the CONFIG section below.
 
 import warnings
 warnings.filterwarnings("ignore")
-from lightning.pytorch.callbacks import TQDMProgressBar
+
 import os
 from pathlib import Path
 from typing import List
 import json
 import numpy as np
 import pandas as pd
-import math
 import pandas as _pd
 pd = _pd  # Ensure pd always refers to pandas module
 import lightning.pytorch as pl
-
-
-
-
-# Extra belt-and-braces: swallow BrokenPipe errors on stdout.flush() if any other lib calls it.
-try:
-    import sys
-    _orig_flush = sys.stdout.flush
-    def _safe_flush(*a, **k):
-        try:
-            return _orig_flush(*a, **k)
-        except BrokenPipeError:
-            return None
-    sys.stdout.flush = _safe_flush
-except Exception:
-    pass
-
-# Route all prints to stderr and swallow BrokenPipe to avoid crashes during teardown
-import builtins as _builtins, sys as _sys
-__orig_print = _builtins.print
-def __safe_print(*args, **kwargs):
-    try:
-        if "file" not in kwargs or kwargs["file"] is None:
-            kwargs["file"] = _sys.stderr   # default to stderr
-        return __orig_print(*args, **kwargs)
-    except BrokenPipeError:
-        return None
-_builtins = _builtins  # keep a name bound
-_builtins.print = __safe_print
-
 from lightning.pytorch import Trainer, seed_everything
 from torchmetrics.classification import BinaryAUROC
 import torch
@@ -123,20 +92,8 @@ from pytorch_forecasting import (
 )
 from pytorch_forecasting.data import MultiNormalizer, TorchNormalizer
 
-from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint, TQDMProgressBar
 from lightning.pytorch.loggers import TensorBoardLogger
-# ---- Compatibility stub: safely neutralize TQDMProgressBar ----
-try:
-    from lightning.pytorch.callbacks import TQDMProgressBar as _RealTQDM
-    # If the real class exists but progress bars are globally disabled, alias a no-op wrapper
-    class TQDMProgressBar(pl.Callback):
-        def __init__(self, *args, **kwargs):
-            super().__init__()
-        # No methods overridden → progress bar will not be used/initialized
-except Exception:
-    class TQDMProgressBar(pl.Callback):
-        def __init__(self, *args, **kwargs):
-            super().__init__()
 
 # --- Cloud / performance helpers ---
 import fsspec
@@ -152,26 +109,9 @@ import argparse
 import pytorch_forecasting as pf
 import inspect
 
-VOL_QUANTILES = [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95] #The quantiles which yielded our best so far
-#Q50_IDX = VOL_QUANTILES.index(0.50)  
-#VOL_QUANTILES = [0.05, 0.15, 0.35, 0.50, 0.65, 0.85, 0.95]
-Q50_IDX = VOL_QUANTILES.index(0.50)
+VOL_QUANTILES = [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95]
+Q50_IDX = VOL_QUANTILES.index(0.50)  # -> 3
 
-# Composite metric weights (override via --metric_weights "w_mae,w_rmse,w_qlike")
-COMP_WEIGHTS = (1.0, 1.0, 0.333)  # default: slightly emphasise QLIKE for RV focus
-
-def composite_score(mae, rmse, qlike,
-                    b_mae=None, b_rmse=None, b_qlike=None,
-                    weights=None, eps=1e-12):
-    """If baselines are provided → normalised composite (for FI).
-       Else → absolute composite (for validation)."""
-    w_mae, w_rmse, w_qlike = (weights or COMP_WEIGHTS)
-    if b_mae is None or b_rmse is None or b_qlike is None:
-        return w_mae*float(mae) + w_rmse*float(rmse) + w_qlike*float(qlike)
-    mae_r   = float(mae)   / max(eps, float(b_mae))
-    rmse_r  = float(rmse)  / max(eps, float(b_rmse))
-    qlike_r = float(qlike) / max(eps, float(b_qlike))
-    return w_mae*mae_r + w_rmse*rmse_r + w_qlike*qlike_r
 # -----------------------------------------------------------------------
 # Ensure a robust "identity" transformation for GroupNormalizer
 # -----------------------------------------------------------------------
@@ -199,175 +139,7 @@ if hasattr(GroupNormalizer, "INVERSE_TRANSFORMATIONS"):
         lambda x: torch.expm1(x) if torch.is_tensor(x) else np.expm1(x),
     )
 
-def _extract_norm_from_dataset(ds):
-    """
-    Return the *volatility* GroupNormalizer used for the first target (realised_vol).
-    Works across PF versions where target_normalizer may be:
-      - a GroupNormalizer,
-      - a MultiNormalizer holding a list in .normalizers / .normalization,
-      - a dict mapping target name -> normalizer.
-    Preference order: GroupNormalizer for realised_vol, else first normalizer.
-    """
-    tn = getattr(ds, "target_normalizer", None)
-    if tn is None:
-        raise ValueError("TimeSeriesDataSet has no target_normalizer")
 
-    # dict mapping target name -> normalizer
-    if isinstance(tn, dict):
-        for v in tn.values():
-            if isinstance(v, GroupNormalizer):
-                return v
-        return next(iter(tn.values()))
-
-    # MultiNormalizer (PF)
-    try:
-        from pytorch_forecasting.data import MultiNormalizer as _PFMulti
-    except Exception:
-        _PFMulti = MultiNormalizer
-
-    if isinstance(tn, _PFMulti):
-        norms = getattr(tn, "normalizers", None) or getattr(tn, "normalization", None) or getattr(tn, "_normalizers", None)
-        if isinstance(norms, (list, tuple)) and norms:
-            for n in norms:
-                if isinstance(n, GroupNormalizer):
-                    return n
-            return norms[0]
-        return tn  # unknown container
-
-    # already a single normalizer
-    return tn
-
-
-def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
-    """
-    Enforce non-decreasing quantiles along last dim and return the median (q=0.5).
-    Assumes VOL_QUANTILES has q=0.50 at index 3.
-    """
-    vol_q = torch.cummax(vol_q, dim=-1).values
-    return vol_q[..., 3]  # Q50_IDX
-
-#EXTRACT HEADSSSSS
-def _extract_heads(pred):
-    """
-    Return (p_vol, p_dir) as 1D tensors [B] on DEVICE.
-
-    Handles outputs as:
-      • list/tuple: [vol(…,K=7), dir(…,K or 1)]
-      • tensor [B, 2, K]        (vol quantiles + dir replicated or single)
-      • tensor [B, 1, K]        (vol only)
-      • tensor [B, K]           (vol only)
-      • tensor [B, K+1]         (concatenated: first 7 vol, last 1 dir)
-      • tensor [B, 1, K+1]      (concatenated with a singleton middle dim)
-    """
-    import torch
-
-    K = 7         # len(VOL_QUANTILES)
-    MID = 3       # Q50 index when K=7
-
-    def _pick_median_q(vol_q: torch.Tensor) -> torch.Tensor:
-        # make sure last dim has the K quantiles
-        if vol_q.ndim == 3 and vol_q.size(1) == 1:
-            vol_q = vol_q.squeeze(1)            # [B, K]
-        if vol_q.ndim == 3 and vol_q.size(-1) == 1 and vol_q.size(1) == K:
-            vol_q = vol_q.squeeze(-1)           # [B, K]
-        if vol_q.ndim == 2 and vol_q.size(-1) >= K:
-            v = vol_q[:, :K]                    # keep exactly 7
-        elif vol_q.ndim == 2 and vol_q.size(-1) == K:
-            v = vol_q
-        else:
-            v = vol_q.reshape(vol_q.size(0), -1)[:, :K]
-        # enforce monotone and take median
-        v = torch.cummax(v, dim=-1).values
-        return v[:, MID]                        # [B]
-
-    def _pick_dir_logit(dir_t):
-        if dir_t is None:
-            return None
-        if torch.is_tensor(dir_t) and dir_t.ndim == 3 and dir_t.size(1) == 1:
-            dir_t = dir_t.squeeze(1)            # [B, K] or [B, 1]
-        if torch.is_tensor(dir_t) and dir_t.ndim == 3 and dir_t.size(-1) == 1:
-            dir_t = dir_t.squeeze(-1)           # [B, L]
-        if torch.is_tensor(dir_t) and dir_t.ndim == 2:
-            # if replicated across K, take middle; if 1, take that; else take last
-            L = dir_t.size(-1)
-            if L >= K:
-                return dir_t[:, MID]
-            return dir_t[:, -1]
-        if torch.is_tensor(dir_t) and dir_t.ndim == 1:
-            return dir_t
-        if torch.is_tensor(dir_t):
-            return dir_t.reshape(dir_t.size(0), -1)[:, -1]
-        return None
-
-    # ---------------- cases ----------------
-
-    # Case A: list/tuple from PF: [vol, dir]
-    if isinstance(pred, (list, tuple)):
-        vol_q = pred[0]
-        dir_t = pred[1] if len(pred) > 1 else None
-        if torch.is_tensor(vol_q) and vol_q.ndim == 3 and vol_q.size(1) == 1:
-            vol_q = vol_q.squeeze(1)            # [B, K]
-        p_vol = _pick_median_q(vol_q) if torch.is_tensor(vol_q) else None
-        p_dir = _pick_dir_logit(dir_t)
-        return p_vol, p_dir
-
-    if not torch.is_tensor(pred):
-        return None, None
-
-    t = pred
-
-    # Squeeze a singleton prediction-length dim if present
-    if t.ndim == 4 and t.size(1) == 1:
-        t = t.squeeze(1)                         # [B, C, D]
-    if t.ndim == 3 and t.size(1) == 1 and t.size(-1) >= 1:
-        t = t[:, 0, :]                           # [B, D]
-
-    # Case B: [B, 2, K]  → first = vol quantiles, second = dir (K or 1 replicated)
-    if t.ndim == 3 and t.size(1) == 2:
-        vol_q = t[:, 0, :]                       # [B, K] (or [B, >=K], we’ll trim)
-        dir_t = t[:, 1, :]
-        # sometimes dir_t is shape [B, 1] replicated to [B, K]; handle both
-        if dir_t.ndim == 2 and dir_t.size(-1) == 1:
-            dir_t = dir_t[:, 0]
-        p_vol = _pick_median_q(vol_q)
-        p_dir = _pick_dir_logit(dir_t)
-        return p_vol, p_dir
-
-    # Case C: [B, K, 2]  → last dim=2 (vol, dir)
-    if t.ndim == 3 and t.size(-1) == 2 and t.size(1) >= K:
-        vol_q = t[:, :K, 0]                      # [B, K]
-        dir_t = t[:, :K, 1]                      # [B, K] (or fewer)
-        p_vol = _pick_median_q(vol_q)
-        p_dir = _pick_dir_logit(dir_t)
-        return p_vol, p_dir
-
-    # Case D: [B, K+1] (concat: first K vol, last 1 dir) or [B, K] (vol-only)
-    if t.ndim == 2:
-        D = t.size(-1)
-        if D >= K + 1:
-            vol_q = t[:, :K]
-            d_log = t[:, K]
-            return _pick_median_q(vol_q), d_log
-        if D == K:
-            return _pick_median_q(t), None
-        if D == 1:
-            return t.squeeze(-1), None
-        # Unknown 2D layout → try to peel first K as vol and last as dir
-        vol_q = t[:, :K] if D > K else t
-        d_log = t[:, -1] if D > K else None
-        return _pick_median_q(vol_q), d_log
-
-    # Fallback: flatten and try our best
-    if t.ndim >= 1:
-        flat = t.reshape(t.size(0), -1)
-        vol_q = flat[:, :K]
-        d_log = flat[:, K] if flat.size(-1) > K else None
-        return _pick_median_q(vol_q), d_log
-
-    return None, None
-
-
-    
 
 
 # -----------------------------------------------------------------------
@@ -577,7 +349,7 @@ class AsymmetricQuantileLoss(QuantileLoss):
     def __init__(
         self,
         quantiles,
-        underestimation_factor: float = 1.00, #1.1115
+        underestimation_factor: float = 1.0, #1.1115
         mean_bias_weight: float = 0.0,
         tail_q: float = 0.90,         # ← was 0.85
         tail_weight: float = 0.0,
@@ -699,7 +471,6 @@ class PerAssetMetrics(pl.Callback):
     @torch.no_grad()
     def on_validation_epoch_start(self, trainer, pl_module):
         self.reset()
-        print(f"[VAL HOOK] start epoch {getattr(trainer,'current_epoch',-1)+1}")
 
     @torch.no_grad()
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx: int = 0):
@@ -709,19 +480,13 @@ class PerAssetMetrics(pl.Callback):
         x = batch[0]
         if not isinstance(x, dict):
             return
-        groups = None
-        for k in ("groups", "group_ids", "group_id"):
-            if k in x and x[k] is not None:
-                groups = x[k]
-                break
+        groups = x.get("groups")
         dec_t = x.get("decoder_target")
-
         # optional time index for plotting/joining later
         dec_time = x.get("decoder_time_idx", None)
         if dec_time is None:
             # some PF versions may expose relative index or time via different keys; try a few
             dec_time = x.get("decoder_relative_idx", None)
-
         # also fetch explicit targets from batch[1] as a fallback
         y_batch = batch[1] if isinstance(batch, (list, tuple)) and len(batch) >= 2 else None
         if groups is None:
@@ -760,7 +525,6 @@ class PerAssetMetrics(pl.Callback):
                         y_dir_t = y_dir_t[..., 0]
                     if y_dir_t.ndim == 2 and y_dir_t.size(-1) == 1:
                         y_dir_t = y_dir_t[:, 0]
-
         # Fallback: PF sometimes provides targets in batch[1] as [B, pred_len, n_targets]
         if (y_vol_t is None or y_dir_t is None) and torch.is_tensor(y_batch):
             yb = y_batch
@@ -771,27 +535,91 @@ class PerAssetMetrics(pl.Callback):
                     y_vol_t = yb[:, 0]
                 if y_dir_t is None and yb.size(1) > 1:
                     y_dir_t = yb[:, 1]
-
         if y_vol_t is None:
             return
-
+      
         # Forward pass to get predictions for this batch
         y_hat = pl_module(x)
         pred = getattr(y_hat, "prediction", y_hat)
         if isinstance(pred, dict) and "prediction" in pred:
             pred = pred["prediction"]
 
-        # --- NEW: use shared head extractor ---
+        def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
+            # Enforce non-decreasing quantiles along the last dim and take pure median (q=0.5)
+            vol_q = torch.cummax(vol_q, dim=-1).values
+            return vol_q[..., 3]
+
+        def _extract_heads(pred):
+            """Return (p_vol, p_dir) as 1D tensors [B] on DEVICE.
+            Handles outputs as:
+              • list/tuple: [vol(…,7), dir(…,7 or 1/2)]
+              • tensor [B, 2, 7] (after our predict_step squeeze)
+              • tensor [B, 1, 7] (vol only)
+              • tensor [B, 7] (vol only)
+            """
+            import torch
+            def _to_median_q(t):
+                if t is None:
+                    return None
+                if t.ndim == 3 and t.size(1) == 1:
+                    t = t.squeeze(1)       # [B, K]
+                if t.ndim == 2 and t.size(-1) >= 4:
+                    return t[:, 3]         # index of 0.50 in VOL_QUANTILES
+                if t.ndim == 1:
+                    return t
+                return t.reshape(t.size(0), -1)[:, 0]  # last-ditch fallback
+
+            def _to_dir_logit(t):
+                if t is None:
+                    return None
+                if t.ndim == 3 and t.size(1) == 1:
+                    t = t.squeeze(1)  # [B,7] or [B,1]
+                # if replicated across 7, take middle slot; if single, squeeze
+                if t.ndim == 2 and t.size(-1) >= 1:
+                    return t[:, t.size(-1) // 2]
+                if t.ndim == 1:
+                    return t
+                return t.reshape(t.size(0), -1)[:, 0]
+
+            # Case 1: PF-style list/tuple per target
+            if isinstance(pred, (list, tuple)):
+                p_vol_t = pred[0]
+                p_dir_t = pred[1] if len(pred) > 1 else None
+                return _point_from_quantiles(p_vol_t), _to_dir_logit(p_dir_t)
+
+
+
+            # Case 2: PF TFT with MultiLoss → concatenated last-dim: [B, 1, 7+1] or [B, 7+1]
+            if torch.is_tensor(pred):
+                t = pred
+                # squeeze prediction-length dim if present → [B, D]
+                if t.ndim == 4 and t.size(1) == 1:
+                    t = t.squeeze(1)          # [B, 2, K]? or [B, 1, D]
+                if t.ndim == 3 and t.size(1) == 1:
+                    t = t[:, 0, :]            # [B, D]
+                if t.ndim == 2:
+                    D = t.size(-1)
+                    if D >= 2:
+                        vol_q = t[:, : D-1]   # first K columns = volatility quantiles
+                        d_log = t[:, D-1]     # last column = direction logit
+                        return _point_from_quantiles(vol_q), d_log
+                    elif D == 1:
+                        # unlikely for vol head, but handle gracefully
+                        return t.squeeze(-1), None
+                # fallback (t not in an expected shape)
+                return _to_median_q(t), None
+            # Fallback: treat as vol-only
+            return _to_median_q(pred), None
+
         p_vol, p_dir = _extract_heads(pred)
         if p_vol is None:
-            return  # nothing usable in this batch
+            return
 
         # Store device tensors; no decode/CPU here
         L = g.shape[0]
         self._g_dev.append(g.reshape(L))
         self._yv_dev.append(y_vol_t.reshape(L))
         self._pv_dev.append(p_vol.reshape(L))
-
         # capture time index if available and shape-compatible
         if dec_time is not None and torch.is_tensor(dec_time):
             tvec = dec_time
@@ -817,38 +645,41 @@ class PerAssetMetrics(pl.Callback):
 
         # Gather device tensors accumulated during validation
         device = self._g_dev[0].device
-        g  = torch.cat(self._g_dev).to(device)            # [N]
-        yv = torch.cat(self._yv_dev).to(device)           # realised_vol (encoded)  [N]
-        pv = torch.cat(self._pv_dev).to(device)           # realised_vol pred (enc) [N]
+        g  = torch.cat(self._g_dev).to(device)
+        yv = torch.cat(self._yv_dev).to(device)            # realised_vol (encoded)
+        pv = torch.cat(self._pv_dev).to(device)            # realised_vol pred (encoded)
         yd = torch.cat(self._yd_dev).to(device) if self._yd_dev else None  # direction labels
-        pdir = torch.cat(self._pd_dev).to(device) if self._pd_dev else None  # direction logits/probs
+        pd = torch.cat(self._pd_dev).to(device) if self._pd_dev else None  # direction logits/probs
 
         # --- Decode realised_vol to physical scale (robust to PF version)
         yv_dec = safe_decode_vol(yv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
         pv_dec = safe_decode_vol(pv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
 
         # Guard against near-zero decoded vols (use global floor if defined)
-        floor_val = float(globals().get("EVAL_VOL_FLOOR", 1e-8))
+        floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
         yv_dec = torch.clamp(yv_dec, min=floor_val)
         pv_dec = torch.clamp(pv_dec, min=floor_val)
 
-        # Debug prints (helpful sanity checks)
-        try:
-            print("DEBUG transformation:", getattr(self.vol_norm, "transformation", None))
-            print("DEBUG mean after decode:", float(yv_dec.mean().item()))
-            ratio_dbg = float((yv_dec.mean() / (pv_dec.mean() + 1e-12)).item())
-            print("DEBUG: mean(yv_dec)=", float(yv_dec.mean().item()),
-                  "mean(pv_dec)=", float(pv_dec.mean().item()),
-                  "ratio=", ratio_dbg)
-        except Exception:
-            pass
+
+        # Debug prints
+        print("DEBUG transformation:", getattr(self.vol_norm, "transformation", None))
+        print("DEBUG mean after decode:", yv_dec.mean().item())
+        print(
+            "DEBUG: mean(yv_dec)=",
+            yv_dec.mean().item(),
+            "mean(pv_dec)=",
+            pv_dec.mean().item(),
+            "ratio=",
+            (yv_dec.mean() / pv_dec.mean()).item() if float(pv_dec.mean()) != 0.0 else float("inf"),
+        )
+
+        # --- Regime-dependent calibration (stretches tails) ---
 
         # Move to CPU for metric computation
         y_cpu  = yv_dec.detach().cpu()
         p_cpu  = pv_dec.detach().cpu()
-        g_cpu  = g.detach().cpu()
         yd_cpu = yd.detach().cpu() if yd is not None else None
-        pdir_cpu = pdir.detach().cpu() if pdir is not None else None
+        pd_cpu = pd.detach().cpu() if pd is not None else None
 
         # Calibration diagnostic (not used in loss)
         try:
@@ -861,70 +692,68 @@ class PerAssetMetrics(pl.Callback):
         except Exception:
             pass
 
-        # --- Decoded regression metrics (overall) ---
+        # --- Decoded regression metrics ---
         eps = 1e-8
-        diff = (p_cpu - y_cpu)
-        overall_mae  = float(diff.abs().mean().item())
-        overall_mse  = float((diff ** 2).mean().item())
-        overall_rmse = float(overall_mse ** 0.5)
+        overall_mae  = (p_cpu - y_cpu).abs().mean().item()
+        overall_mse  = ((p_cpu - y_cpu) ** 2).mean().item()
+        overall_rmse = overall_mse ** 0.5
 
         sigma2_p = torch.clamp(p_cpu.abs(), min=eps) ** 2
         sigma2_y = torch.clamp(y_cpu.abs(), min=eps) ** 2
         ratio    = sigma2_y / sigma2_p
-        overall_qlike = float((ratio - torch.log(ratio) - 1.0).mean().item())
+        overall_qlike = (ratio - torch.log(ratio) - 1.0).mean().item()
 
-        # --- Optional direction metrics (overall) ---
+        # --- Optional direction accuracy ---
         acc = None
+        if yd_cpu is not None and pd_cpu is not None and yd_cpu.numel() > 0 and pd_cpu.numel() > 0:
+            pt = pd_cpu
+            try:
+                if torch.isfinite(pt).any() and (pt.min() < 0 or pt.max() > 1):
+                    pt = torch.sigmoid(pt)  # logits → probs
+            except Exception:
+                pt = torch.sigmoid(pt)
+            pt = torch.clamp(pt, 0.0, 1.0)
+            acc = ((pt >= 0.5).int() == yd_cpu.int()).float().mean().item()
+
+           
         brier = None
+        if yd_cpu is not None and pd_cpu is not None and yd_cpu.numel() > 0 and pd_cpu.numel() > 0:
+            pt_b = pd_cpu
+            try:
+                if torch.isfinite(pt_b).any() and (pt_b.min() < 0 or pt_b.max() > 1):
+                    pt_b = torch.sigmoid(pt_b)  # logits → probs
+            except Exception:
+                pt_b = torch.sigmoid(pt_b)
+            pt_b = torch.clamp(pt_b, 0.0, 1.0)
+            brier = ((pt_b - yd_cpu.float()) ** 2).mean().item()
+            trainer.callback_metrics["val_brier_overall"] = torch.tensor(float(brier))
+
         auroc = None
-        if yd_cpu is not None and pdir_cpu is not None and yd_cpu.numel() > 0 and pdir_cpu.numel() > 0:
-            # Convert logits→probs if needed
-            probs = pdir_cpu
+        if yd_cpu is not None and pd_cpu is not None and yd_cpu.numel() > 0 and pd_cpu.numel() > 0:
+            probs = pd_cpu
             try:
                 if torch.isfinite(probs).any() and (probs.min() < 0 or probs.max() > 1):
-                    probs = torch.sigmoid(probs)
+                    probs = torch.sigmoid(probs)  # logits → probs
             except Exception:
                 probs = torch.sigmoid(probs)
             probs = torch.clamp(probs, 0.0, 1.0)
 
-            acc = float(((probs >= 0.5).int() == yd_cpu.int()).float().mean().item())
-            brier = float(((probs - yd_cpu.float()) ** 2).mean().item())
             try:
                 au = BinaryAUROC()
-                auroc = float(au(probs, yd_cpu).item())
+                auroc = float(au(probs.detach().cpu(), yd_cpu.detach().cpu()).item())
+                trainer.callback_metrics["val_auroc_overall"] = torch.tensor(float(auroc))
             except Exception as e:
                 print(f"[WARN] AUROC failed: {e}")
 
-            # stash for later printing/saving
-            try:
-                trainer.callback_metrics["val_brier_overall"] = torch.tensor(brier)
-                trainer.callback_metrics["val_auroc_overall"] = torch.tensor(auroc) if auroc is not None else None
-                trainer.callback_metrics["val_acc_overall"]   = torch.tensor(acc)
-            except Exception:
-                pass
-
-        # --- Epoch summary / val loss ---
+        # --- Epoch summary ---
         N = int(y_cpu.numel())
         try:
             epoch_num = int(getattr(trainer, "current_epoch", -1)) + 1
         except Exception:
             epoch_num = None
 
-        # Composite loss (absolute form for validation)
-        val_comp = float(composite_score(overall_mae, overall_rmse, overall_qlike))
-        # Preferred monitor key
-        trainer.callback_metrics["val_comp_overall"]      = torch.tensor(val_comp)
-        # Backward-compat alias (some monitors used this)
-        trainer.callback_metrics["val_composite_overall"] = torch.tensor(val_comp)
-        trainer.callback_metrics["val_loss_source"]       = "composite(MAE,RMSE,QLIKE)"
-        # Lightning's default early-stopping key
-        trainer.callback_metrics["val_loss"]              = torch.tensor(val_comp)
-        trainer.callback_metrics["val_loss_decoded"]      = torch.tensor(val_comp)
-        trainer.callback_metrics["val_mae_overall"]       = torch.tensor(overall_mae)
-        trainer.callback_metrics["val_rmse_overall"]      = torch.tensor(overall_rmse)
-        trainer.callback_metrics["val_mse_overall"]       = torch.tensor(overall_mse)
-        trainer.callback_metrics["val_qlike_overall"]     = torch.tensor(overall_qlike)
-        trainer.callback_metrics["val_N_overall"]         = torch.tensor(float(N))
+        # 🔑 Use QLIKE as the validation loss
+        val_loss_value = overall_qlike
 
         msg = (
             f"[VAL EPOCH {epoch_num}] "
@@ -932,89 +761,36 @@ class PerAssetMetrics(pl.Callback):
             f"RMSE={overall_rmse:.6f} "
             f"MSE={overall_mse:.6f} "
             f"QLIKE={overall_qlike:.6f} "
-            f"CompLoss = {val_comp:.6f}"
-            + (f" | ACC={acc:.3f}"   if acc   is not None else "")
-            + (f" | Brier={brier:.4f}" if brier is not None else "")
-            + (f" | AUROC={auroc:.3f}" if auroc is not None else "")
-            + f" | N={N}"
+            + (f"| ACC={acc:.3f} " if acc is not None else "")
+            + (f"| Brier={brier:.4f} " if brier is not None else "")
+            + (f"| AUROC={auroc:.3f} " if auroc is not None else "")
+            + f"| N={N} | VAL_LOSS={val_loss_value:.6f}"
         )
         print(msg)
 
-        # --- Per-asset metrics table (so on_fit_end can print it) ---
-        self._last_rows = []
-        try:
-            # map group id -> human name
-            asset_names = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
-            # compute per-asset aggregates
-            dfm = pd.DataFrame({
-                "asset": asset_names,
-                "y": y_cpu.numpy(),
-                "p": p_cpu.numpy(),
-            })
-            if yd_cpu is not None and pdir_cpu is not None and yd_cpu.numel() > 0 and pdir_cpu.numel() > 0:
-                # ensure probs in [0,1]
-                probs = pdir_cpu
-                try:
-                    if torch.isfinite(probs).any() and (probs.min() < 0 or probs.max() > 1):
-                        probs = torch.sigmoid(probs)
-                except Exception:
-                    probs = torch.sigmoid(probs)
-                probs = torch.clamp(probs, 0.0, 1.0)
-                dfm["yd"] = yd_cpu.numpy()
-                dfm["pd"] = probs.numpy()
+        # --- Log metrics for checkpoints/early stopping ---
+        trainer.callback_metrics["val_mae_overall"]   = torch.tensor(float(overall_mae))
+        trainer.callback_metrics["val_rmse_overall"]  = torch.tensor(float(overall_rmse))
+        trainer.callback_metrics["val_mse_overall"]   = torch.tensor(float(overall_mse))
+        trainer.callback_metrics["val_qlike_overall"] = torch.tensor(float(overall_qlike))
+        trainer.callback_metrics["val_loss"]          = torch.tensor(float(val_loss_value))
+        trainer.callback_metrics["val_loss_decoded"]  = torch.tensor(float(val_loss_value))
+        if acc is not None:
+            trainer.callback_metrics["val_acc_overall"] = torch.tensor(float(acc))
+        if auroc is not None:  # 👈 ADD HERE
+            trainer.callback_metrics["val_auroc_overall"] = torch.tensor(float(auroc))
+        trainer.callback_metrics["val_N_overall"]     = torch.tensor(float(N))
 
-            rows = []
-            for a, gdf in dfm.groupby("asset", sort=False):
-                y_a = torch.tensor(gdf["y"].values)
-                p_a = torch.tensor(gdf["p"].values)
-                n_a = int(len(gdf))
-                mae_a = float((p_a - y_a).abs().mean().item())
-                mse_a = float(((p_a - y_a) ** 2).mean().item())
-                rmse_a = float(mse_a ** 0.5)
-
-                s2p = torch.clamp(torch.tensor(np.abs(gdf["p"].values)), min=eps) ** 2
-                s2y = torch.clamp(torch.tensor(np.abs(gdf["y"].values)), min=eps) ** 2
-                ratio_a = s2y / s2p
-                qlike_a = float((ratio_a - torch.log(ratio_a) - 1.0).mean().item())
-
-                acc_a = None
-                if "yd" in gdf.columns and "pd" in gdf.columns:
-                    acc_a = float(((torch.tensor(gdf["pd"].values) >= 0.5).int() ==
-                                   torch.tensor(gdf["yd"].values).int()).float().mean().item())
-
-                rows.append((a, mae_a, rmse_a, mse_a, qlike_a, acc_a, n_a))
-
-            # sort by sample count (desc) so “top by samples” prints nicely
-            rows.sort(key=lambda r: r[6], reverse=True)
-            self._last_rows = rows
-
-            # --- Per-epoch per-asset snapshot (top by samples) ---
-            try:
-                k = min(5, getattr(self, "max_print", 5))
-                if rows:
-                    print("Per-asset (epoch snapshot, top by samples):")
-                    print("asset | MAE | RMSE | MSE | QLIKE | ACC | N")
-                    for r in rows[:k]:
-                        acc_str = "-" if r[5] is None else f"{r[5]:.3f}"
-                        print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {acc_str} | {r[6]}")
-            except Exception as _e:
-                print(f"[WARN] per-epoch per-asset print failed: {_e}")
-
-        except Exception as e:
-            print(f"[WARN] per-asset aggregation failed: {e}")
-            self._last_rows = []
-
-        # stash overall for on_fit_end
         self._last_overall = {
             "mae": overall_mae,
             "rmse": overall_rmse,
             "mse": overall_mse,
             "qlike": overall_qlike,
-            "val_loss": val_comp,
-            "dir_bce": brier,   # (kept for backwards compatibility with your saver)
-            "yd": yd_cpu,
-            "pd": pdir_cpu,
+            "val_loss": val_loss_value,
+            "dir_bce": brier,
         }
+        self._last_rows = []
+
 
     @torch.no_grad()
     def on_fit_end(self, trainer, pl_module):
@@ -1089,7 +865,7 @@ class PerAssetMetrics(pl.Callback):
             yv_cpu = torch.cat(self._yv_dev).detach().cpu() if self._yv_dev else None
             pv_cpu = torch.cat(self._pv_dev).detach().cpu() if self._pv_dev else None
             yd_cpu = torch.cat(self._yd_dev).detach().cpu() if self._yd_dev else None
-            pdir_cpu = torch.cat(self._pd_dev).detach().cpu() if self._pd_dev else None
+            pd_cpu = torch.cat(self._pd_dev).detach().cpu() if self._pd_dev else None
             # decode vol back to physical scale
             if g_cpu is not None and yv_cpu is not None and pv_cpu is not None:
                 yv_dec = self.vol_norm.decode(yv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
@@ -1106,9 +882,9 @@ class PerAssetMetrics(pl.Callback):
                     "y_vol": yv_dec.numpy().tolist(),
                     "y_vol_pred": pv_dec.numpy().tolist(),
                 })
-                if yd_cpu is not None and pdir_cpu is not None and yd_cpu.numel() > 0 and pdir_cpu.numel() > 0:
-                    # ensure pdir is probability
-                    pdp = pdir_cpu
+                if yd_cpu is not None and pd_cpu is not None and yd_cpu.numel() > 0 and pd_cpu.numel() > 0:
+                    # ensure pd is probability
+                    pdp = pd_cpu
                     try:
                         if torch.isfinite(pdp).any() and (pdp.min() < 0 or pdp.max() > 1):
                             pdp = torch.sigmoid(pdp)
@@ -1176,10 +952,10 @@ class BiasWarmupCallback(pl.Callback):
     def __init__(
         self,
         vol_loss=None,
-        target_under: float = 1.00,
+        target_under: float = 1.12,
         target_mean_bias: float = 0.04,
         warmup_epochs: int = 4,
-        qlike_target_weight: float | None = 0.05,
+        qlike_target_weight: float | None = 0.04,
         start_mean_bias: float = 0.0,
         mean_bias_ramp_until: int = 8,
         guard_patience: int = 2,
@@ -1283,7 +1059,7 @@ class BiasWarmupCallback(pl.Callback):
             alpha = (1.0 + (self.target_under - 1.0) * prog) * step
             if self._scale_ema < 0.995:  # already over-predicting
                 alpha = min(alpha, 1.0)
-        vol_loss.underestimation_factor = float(max(1.0, min(alpha, self.target_under)))
+        vol_loss.underestimation_factor = float(max(0.9, min(alpha, self.target_under)))
 
         # mean-bias gentle ramp
         if e <= self.mean_bias_ramp_until:
@@ -1311,23 +1087,6 @@ class BiasWarmupCallback(pl.Callback):
             f"guard={'ON' if self._frozen else 'off'} "
             f"lr={lr0 if lr0 is not None else 'n/a'}"
         )
-
-import sys
-
-class SafeTQDMProgressBar(TQDMProgressBar):
-    """Write tqdm to stderr to avoid BrokenPipe on stdout; reduce flush frequency."""
-    def __init__(self, refresh_rate: int = 50):
-        super().__init__(refresh_rate=refresh_rate)
-        if not hasattr(self, "_tqdm_kwargs") or self._tqdm_kwargs is None:
-            self._tqdm_kwargs = {}
-        self._tqdm_kwargs.update({
-            "file": sys.stderr,
-            "mininterval": 0.5,      # fewer flushes
-            "dynamic_ncols": True,
-            "leave": True,
-        })
-
-
 
 class MedianMSELoss(nn.Module):
     def forward(self, y_hat_quantiles, y_true):
@@ -1432,12 +1191,7 @@ parser.add_argument("--prefetch_factor", type=int, default=8, help="DataLoader p
 parser.add_argument("--check_val_every_n_epoch", type=int, default=1, help="Validate every N epochs")
 parser.add_argument("--log_every_n_steps", type=int, default=200, help="How often to log train steps")
 parser.add_argument("--learning_rate", type=float, default=None, help="Override model learning rate")
-parser.add_argument(
-    "--resume",
-    type=lambda s: str(s).lower() in ("1","true","t","yes","y","on"),
-    default=False,                       # <— make default False
-    help="Resume from latest checkpoint if available"
-)
+parser.add_argument("--resume", type=lambda s: str(s).lower() in ("1","true","t","yes","y","on"), default=True, help="Resume from latest checkpoint if available")
 # Quick-run subsetting for speed
 parser.add_argument("--train_max_rows", type=int, default=None, help="Limit number of rows in TRAIN for fast iterations")
 parser.add_argument("--val_max_rows", type=int, default=None, help="Limit number of rows in VAL (optional; default full)")
@@ -1555,9 +1309,7 @@ else:
     )
 
 def get_resume_ckpt_path():
-    if not RESUME_ENABLED:
-        return None
-
+    # Prefer newest local checkpoint
     try:
         local_ckpts = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
         if local_ckpts:
@@ -1606,36 +1358,10 @@ class MirrorCheckpoints(pl.Callback):
     def on_train_end(self, trainer, pl_module):
         mirror_local_ckpts_to_gcs()
 
-
 class TailWeightRamp(pl.Callback):
-    def __init__(
-        self,
-        vol_loss,
-        start: float = 1.0,
-        end: float = 1.25,
-        ramp_epochs: int = 12,
-        gate_by_calibration: bool = True,
-        gate_low: float = 0.95,
-        gate_high: float = 1.05,
-        gate_patience: int = 2,
-    ):
+    def __init__(self, vol_loss, start: float = 1.0, end: float = 1.25, ramp_epochs: int = 12):
         super().__init__()
-        self.vol_loss = vol_loss
-        self.start = float(start)
-        self.end = float(end)
-        self.ramp = int(ramp_epochs)
-        self.gate = bool(gate_by_calibration)
-        self.gate_low = float(gate_low)
-        self.gate_high = float(gate_high)
-        self.gate_patience = int(gate_patience)
-        self._ok_streak = 0
-        self._trigger_epoch = None
-
-    def _get_scale_ema(self, trainer):
-        for cb in getattr(trainer, "callbacks", []):
-            if isinstance(cb, BiasWarmupCallback):
-                return getattr(cb, "_scale_ema", None)
-        return None
+        self.vol_loss, self.start, self.end, self.ramp = vol_loss, float(start), float(end), int(ramp_epochs)
 
     def on_train_epoch_start(self, trainer, pl_module):
         # Global CLI switch: if --disable_warmups is true, hold tail_weight steady
@@ -1645,88 +1371,28 @@ class TailWeightRamp(pl.Callback):
                 return
         except Exception:
             pass
-
-        # Freeze if BiasWarmup froze things
         frozen = False
-        for cb in getattr(trainer, "callbacks", []):
-            if isinstance(cb, BiasWarmupCallback) and getattr(cb, "_frozen", False):
+        for cb in getattr(trainer, 'callbacks', []):
+            if isinstance(cb, BiasWarmupCallback) and getattr(cb, '_frozen', False):
                 frozen = True
                 break
-        e = int(getattr(trainer, "current_epoch", 0))
         if frozen:
-            print(f"[TAIL] epoch={e} frozen; tail_weight stays {self.vol_loss.tail_weight}")
+            print(f"[TAIL] epoch={int(getattr(trainer, 'current_epoch', 0))} frozen; tail_weight stays {self.vol_loss.tail_weight}")
             return
 
-        # Optional calibration gate
-        if self.gate:
-            scale_ema = self._get_scale_ema(trainer)
-            if (scale_ema is None) or not (self.gate_low <= float(scale_ema) <= self.gate_high):
-                self._ok_streak = 0
-                self._trigger_epoch = None
-                self.vol_loss.tail_weight = self.start
-                print(f"[TAIL] epoch={e} gated (scale_ema={scale_ema}); tail_weight={self.vol_loss.tail_weight}")
-                return
-            else:
-                self._ok_streak = min(self.gate_patience, self._ok_streak + 1)
-                if self._ok_streak < self.gate_patience:
-                    self.vol_loss.tail_weight = self.start
-                    print(f"[TAIL] epoch={e} gating warm-up {self._ok_streak}/{self.gate_patience}; tail_weight={self.vol_loss.tail_weight}")
-                    return
-                if self._trigger_epoch is None:
-                    self._trigger_epoch = e
-                    print(f"[TAIL] epoch={e} gate OPEN (scale_ema={scale_ema}); starting ramp")
-
-        # Ramping once gate is open (or immediately if gate disabled)
-        eff_end = min(self.end, 1.5)
-        eff_ramp = max(self.ramp, 8)
-        base = self._trigger_epoch if (self.gate and self._trigger_epoch is not None) else 0
-        prog = min(1.0, max(0.0, (e - base + 1) / float(eff_ramp)))
-        self.vol_loss.tail_weight = self.start + (eff_end - self.start) * prog
-        print(f"[TAIL] epoch={e} tail_weight={self.vol_loss.tail_weight:.4f} (ramp prog={prog:.2f}, gate={'on' if self.gate else 'off'})")
-
-
-
-class CosineLR(pl.Callback):
-    def __init__(self, start_epoch=8, min_lr=5.5e-5):
-        super().__init__()
-        self.start_epoch = int(start_epoch)
-        self.min_lr = float(min_lr)
-        self._schedulers = None
-        self._tmax = None
-
-    def on_fit_start(self, trainer, pl_module):
-        # Create a CosineAnnealingLR for each optimizer, but only step it from start_epoch onwards
-        max_epochs = int(getattr(trainer, "max_epochs", 0))
-        self._tmax = max(1, max_epochs - self.start_epoch)
-        self._schedulers = []
-        for opt in trainer.optimizers:
-            sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self._tmax, eta_min=self.min_lr)
-            self._schedulers.append(sched)
-
-    def on_train_epoch_start(self, trainer, pl_module):
-        # Smooth cosine decay starting from start_epoch (inclusive)
         e = int(getattr(trainer, "current_epoch", 0))
-        if (self._schedulers is None) or (e < self.start_epoch):
-            return
-        # Map epoch e -> scheduler step index (1-based so we actually decay at start_epoch)
-        step_idx = (e - self.start_epoch) + 1
-        for sched in self._schedulers:
-            sched.step(step_idx)
-        try:
-            print(f"[LR CosineBuiltin] epoch={e} lr={trainer.optimizers[0].param_groups[0]['lr']:.6g}")
-        except Exception:
-            pass
+        eff_end = min(self.end, 1.5)
+        eff_ramp = max(self.ramp, 12)
+        prog = 1.0 if eff_ramp <= 0 else min(1.0, e / float(eff_ramp))
+        self.vol_loss.tail_weight = self.start + (eff_end - self.start) * prog
+        print(f"[TAIL] epoch={e} tail_weight={self.vol_loss.tail_weight}")
 
 class ReduceLROnPlateauCallback(pl.Callback):
-    def __init__(self, monitor="val_comp_overall", factor=0.5, patience=5, min_lr=1e-5, cooldown=0, stop_after_epoch=None):
+    def __init__(self, monitor="val_qlike_overall", factor=0.5, patience=3, min_lr=1e-5, cooldown=0):
         self.monitor, self.factor, self.patience, self.min_lr, self.cooldown = monitor, factor, patience, min_lr, cooldown
-        self.stop_after_epoch = stop_after_epoch
         self.best, self.bad, self.cool = float("inf"), 0, 0
 
     def on_validation_end(self, trainer, pl_module):
-        e = int(getattr(trainer, "current_epoch", 0))
-        if (self.stop_after_epoch is not None) and (e >= int(self.stop_after_epoch)):
-            return  # hand over to cosine
         if self.cool:
             self.cool -= 1
             return
@@ -1749,50 +1415,6 @@ class ReduceLROnPlateauCallback(pl.Callback):
                 new_lr = trainer.optimizers[0].param_groups[0]["lr"]
                 print(f"[LR Plateau] ↓ lr → {new_lr:.6g}")
                 self.bad, self.cool = 0, self.cooldown
-
-
-VOL_LOSS = AsymmetricQuantileLoss(
-    quantiles=VOL_QUANTILES,
-    underestimation_factor=1.00,  # managed by BiasWarmupCallback
-    mean_bias_weight=0.01,        # small centering on the median for MAE
-    tail_q=0.85,
-    tail_weight=1.0,              # will be ramped by TailWeightRamp
-    qlike_weight=0.0,             # QLIKE weight is ramped safely in BiasWarmupCallback
-    reduction="mean",
-)
-# ---------------- Callback bundle (bias warm-up, tail ramp, LR control) ----------------
-EXTRA_CALLBACKS = [
-    # Gated calibration: ramps alpha/mean-bias and only enables QLIKE when scale is near 1
-    BiasWarmupCallback(
-        vol_loss=VOL_LOSS,
-        target_under=1.05,
-        target_mean_bias=0.04,
-        warmup_epochs=7,
-        qlike_target_weight=0.0,   # ramps in when mean(y)/mean(p) ~ 1
-        start_mean_bias=0.0,
-        mean_bias_ramp_until=10,
-        guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
-        guard_tol=getattr(ARGS, "warmup_guard_tol", 0.0),
-        alpha_step=0.05,
-    ),
-    # Gradually emphasise upper tail once calibration is near 1.0
-    TailWeightRamp(
-        vol_loss=VOL_LOSS,
-        start=1.0,
-        end=1.5,
-        ramp_epochs=12,
-        gate_by_calibration=True,
-        gate_low=0.95,
-        gate_high=1.05,
-        gate_patience=2,
-    ),
-    # Safety net if QLIKE plateaus before cosine takes over
-    ReduceLROnPlateauCallback(
-        monitor="val_comp_overall", factor=0.5, patience=5, min_lr=1e-5, cooldown=0, stop_after_epoch=10
-    ),
-    # Start cosine decay later so we keep learning capacity to fix tails
-    CosineLR(start_epoch=10, min_lr=1e-4),
-]
 
 class ValLossHistory(pl.Callback):
     """
@@ -1847,7 +1469,7 @@ EMBEDDING_CARDINALITY = {}
 
 BATCH_SIZE   = 256
 MAX_EPOCHS   = 5
-EARLY_STOP_PATIENCE = 15
+EARLY_STOP_PATIENCE = 12
 PERM_BLOCK_SIZE = 288
 
 # Artifacts are written locally then uploaded to GCS
@@ -1855,14 +1477,7 @@ from datetime import datetime, timezone, timedelta
 RUN_SUFFIX = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 MODEL_SAVE_PATH = (LOCAL_CKPT_DIR / f"tft_realised_vol_e{MAX_EPOCHS}_{RUN_SUFFIX}.ckpt")
 
-SEED = 8
-# Full-run determinism for reproducible validation metrics
-try:
-    seed_everything(SEED, workers=True)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-except Exception:
-    pass
+SEED = 50
 WEIGHT_DECAY = 0.0001 #0.00578350719515325     # weight decay for AdamW
 GRADIENT_CLIP_VAL = 0.78 #0.78    # gradient clipping value for Trainer
 # Feature-importance controls
@@ -1888,7 +1503,6 @@ if getattr(ARGS, "fi_max_batches", None) is not None:
 # ---- Learning rate and resume CLI overrides ----
 LR_OVERRIDE = float(ARGS.learning_rate) if getattr(ARGS, "learning_rate", None) is not None else None
 RESUME_ENABLED = bool(getattr(ARGS, "resume", True))
-RESUME_CKPT = get_resume_ckpt_path() if RESUME_ENABLED else None
 
 # -----------------------------------------------------------------------
 # Utility functions
@@ -2089,14 +1703,27 @@ def subset_time_series(df: pd.DataFrame, max_rows: int | None, mode: str = "per_
 # -----------------------------------------------------------------------
 
 
-# NOTE: If you explicitly instantiate a TQDMProgressBar in your callbacks, remove it or comment it out.
-# For example, if you see:
-# callbacks.append(TQDMProgressBar(...))
-# or
-# callbacks = [TQDMProgressBar(...), ...]
-# remove the TQDMProgressBar from the list.
+def _extract_norm_from_dataset(ds: TimeSeriesDataSet):
+    """Return the GroupNormalizer used for realised_vol in our MultiNormalizer."""
+    try:
+        norm = ds.get_parameters()["target_normalizer"]
+        if hasattr(norm, "normalizers") and len(norm.normalizers) >= 1:
+            return norm.normalizers[0]
+    except Exception:
+        pass
+    return None
 
-@torch.no_grad()
+def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
+    """
+    Use the 0.5 quantile (median) to compute a point forecast.
+    Enforces monotonic quantiles first to prevent crossing.
+    """
+    # Enforce non-decreasing quantiles
+    vol_q = torch.cummax(vol_q, dim=-1).values
+    # Take median (index 3 in VOL_QUANTILES)
+    return vol_q[..., 3]
+
+
 def _evaluate_decoded_metrics(
     model,
     ds: TimeSeriesDataSet,
@@ -2105,230 +1732,181 @@ def _evaluate_decoded_metrics(
     num_workers: int,
     prefetch: int,
     pin_memory: bool,
-    vol_norm,                 # GroupNormalizer from TRAIN (for realised_vol)
+    vol_norm=None,
 ):
     """
-    Evaluate model on a dataset configured with predict=True, computing:
-      • MAE, RMSE, QLIKE on decoded realised_vol
-      • Brier on direction (if available)
-    Returns: (mae, rmse, brier, qlike, N)
+    Compute decoded MAE, RMSE, DirBCE and QLIKE on up to `max_batches`.
+    Returns: (mae, rmse, dir_bce, val_loss, n) with `val_loss == QLIKE`.
     """
-    model.eval()
-    model_device = next(model.parameters()).device  # <<< NEW
+    if vol_norm is None:
+        vol_norm = _extract_norm_from_dataset(ds)
 
-    # dataloader mirrors validation loader; dataset already has predict=True
-    loader = ds.to_dataloader(
+    dl = ds.to_dataloader(
         train=False,
         batch_size=batch_size,
         num_workers=num_workers,
-        shuffle=False,
-        drop_last=False,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=prefetch,
         pin_memory=pin_memory,
-        persistent_workers=False,
-        prefetch_factor=prefetch if num_workers and num_workers > 0 else None,
     )
 
-    # --- helper to move nested batch dicts to model_device ---
-    def _move_to_device(x):
-        if torch.is_tensor(x):
-            return x.to(model_device, non_blocking=True)
-        if isinstance(x, dict):
-            return {k: _move_to_device(v) for k, v in x.items()}
-        if isinstance(x, (list, tuple)):
-            t = [_move_to_device(v) for v in x]
-            return type(x)(t) if not isinstance(x, tuple) else tuple(t)
-        return x
+    try:
+        model_device = next(model.parameters()).device
+    except Exception:
+        model_device = torch.device("cpu")
 
-    g_list, yv_list, pv_list = [], [], []
-    yd_list, pd_list = [], []
+    model.eval()
+    y_all, p_all, yd_all, pd_all = [], [], [], []
 
-    batches_seen = 0
-    for batch in loader:
-        if isinstance(batch, (list, tuple)) and len(batch) >= 2:
-            x = batch[0]
-            y = batch[1]
-        else:
-            continue
-        if not isinstance(x, dict):
-            continue
-
-        # --- MOVE EVERYTHING to the model's device BEFORE forward ---
-        x_dev = _move_to_device(x)
-
-        # group ids (taken from x_dev so same device)
-        groups = None
-        for k in ("groups", "group_ids", "group_id"):
-            if k in x_dev and x_dev[k] is not None:
-                groups = x_dev[k]
+    with torch.no_grad():
+        for b_idx, batch in enumerate(dl):
+            if max_batches is not None and b_idx >= int(max_batches):
                 break
-        if groups is None:
-            continue
-        g = groups[0] if isinstance(groups, (list, tuple)) else groups
-        while torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
-            g = g.squeeze(-1)
 
-        # targets from decoder_target (fallback to y)
-        dec_t = x_dev.get("decoder_target", None)
-        y_vol_t, y_dir_t = None, None
-        if torch.is_tensor(dec_t):
-            t = dec_t
-            if t.ndim == 3 and t.size(-1) == 1:
-                t = t[..., 0]
-            if t.ndim == 2 and t.size(1) >= 1:
-                y_vol_t = t[:, 0]
-                if t.size(1) > 1:
-                    y_dir_t = t[:, 1]
-        elif isinstance(dec_t, (list, tuple)) and len(dec_t) >= 1:
-            y_vol_t = dec_t[0]
-            if torch.is_tensor(y_vol_t) and y_vol_t.ndim == 3 and y_vol_t.size(-1) == 1:
-                y_vol_t = y_vol_t[..., 0]
-            if len(dec_t) > 1 and torch.is_tensor(dec_t[1]):
-                y_dir_t = dec_t[1]
-                if y_dir_t.ndim == 3 and y_dir_t.size(-1) == 1:
-                    y_dir_t = y_dir_t[..., 0]
+            if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                x, y = batch[0], batch[1]
+            else:
+                x, y = batch, None
 
-        if (y_vol_t is None) and torch.is_tensor(y):
-            yy = y.to(model_device, non_blocking=True)  # <<< ensure same device if used
-            if yy.ndim == 3 and yy.size(1) == 1:
-                yy = yy[:, 0, :]
-            if yy.ndim == 2 and yy.size(1) >= 1:
-                y_vol_t = yy[:, 0]
-                if yy.size(1) > 1:
-                    y_dir_t = yy[:, 1]
+            if not isinstance(x, dict):
+                continue
 
-        if (y_vol_t is None) or (not torch.is_tensor(g)):
-            continue
+            # groups
+            g = x.get("groups")
+            if g is None:
+                g = x.get("group_ids")
+            if isinstance(g, (list, tuple)):
+                g = g[0] if g else None
+            if torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
+                g = g.squeeze(-1)
+            if not torch.is_tensor(g):
+                continue
 
-        # forward pass and head extraction
-        y_hat = model(x_dev)  # <<< CUDA-safe now
-        pred = getattr(y_hat, "prediction", y_hat)
-        if isinstance(pred, dict) and "prediction" in pred:
-            pred = pred["prediction"]
+            # targets
+            def _extract(obj):
+                if torch.is_tensor(obj):
+                    t = obj
+                    if t.ndim == 3 and t.size(-1) == 1:
+                        t = t[..., 0]
+                    if t.ndim == 3 and t.size(1) == 1:
+                        t = t[:, 0, :]
+                    if t.ndim == 2 and t.size(1) >= 1:
+                        return t[:, 0], (t[:, 1] if t.size(1) > 1 else None)
+                    return None, None
+                if isinstance(obj, (list, tuple)) and obj:
+                    yv, yd = obj[0], (obj[1] if len(obj) > 1 else None)
+                    for ref in ("yv", "yd"):
+                        v = locals()[ref]
+                        if torch.is_tensor(v):
+                            if v.ndim == 3 and v.size(-1) == 1:
+                                v = v[..., 0]
+                            if v.ndim == 3 and v.size(1) == 1:
+                                v = v[:, 0, :]
+                            if v.ndim == 2 and v.size(-1) == 1:
+                                v = v[:, 0]
+                            locals()[ref] = v
+                    return (yv if torch.is_tensor(yv) else None, yd if torch.is_tensor(yd) else None)
+                return None, None
 
-        # split heads (same logic as before)
-        def _extract_heads(prediction):
-            if isinstance(prediction, (list, tuple)):
-                vol_q = prediction[0]
-                d_log = prediction[1] if len(prediction) > 1 else None
-                return vol_q, d_log
-            t = prediction
-            if torch.is_tensor(t):
-                if t.ndim >= 4 and t.size(1) == 1:
-                    t = t.squeeze(1)
-                if t.ndim == 3 and t.size(1) == 1:
-                    t = t[:, 0, :]
-                if t.ndim == 2:
-                    vol_q = t[:, :-1]
-                    d_log = t[:, -1]
-                    return vol_q, d_log
-            return None, None
+            dec_t = x.get("decoder_target")
+            if dec_t is None:
+                dec_t = x.get("target")
+            y_vol, y_dir = _extract(dec_t)
+            if (y_vol is None or (y_dir is None and y is not None)) and y is not None:
+                yv2, yd2 = _extract(y)
+                if y_vol is None: y_vol = yv2
+                if y_dir is None: y_dir = yd2
+            if not torch.is_tensor(y_vol):
+                continue
 
-        p_vol, p_dir = _extract_heads(pred)
-        if p_vol is None:
-            continue
+            # forward
+            x_dev = {k: (v.to(model_device, non_blocking=True) if torch.is_tensor(v)
+                         else [vv.to(model_device, non_blocking=True) if torch.is_tensor(vv) else vv for vv in v]
+                         if isinstance(v, (list, tuple)) else v)
+                     for k, v in x.items()}
 
-        # take median quantile for vol
-        def _median_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
-            vol_q = torch.cummax(vol_q, dim=-1).values
-            # assumes 7 quantiles with 0.50 at index 3
-            return vol_q[..., 3]
+            y_hat = model(x_dev)
+            pred = getattr(y_hat, "prediction", y_hat)
+            if isinstance(pred, dict) and "prediction" in pred:
+                pred = pred["prediction"]
 
-        p_vol_med = _median_from_quantiles(p_vol)
+            def _q50(t):
+                if torch.is_tensor(t):
+                    if t.ndim >= 4 and t.size(1) == 1: t = t.squeeze(1)
+                    if t.ndim == 3 and t.size(1) == 1: t = t.squeeze(1)
+                    if t.ndim == 2 and t.size(-1) >= 4: return t[:, 3]
+                return t
+            def _dir_logit(t):
+                if torch.is_tensor(t):
+                    if t.ndim >= 4 and t.size(1) == 1: t = t.squeeze(1)
+                    if t.ndim == 3 and t.size(1) == 1: t = t.squeeze(1)
+                    if t.ndim == 2: return t[:, t.size(-1)//2] if t.size(-1) > 1 else t.squeeze(-1)
+                return t
 
-        L = g.shape[0]
-        g_list.append(g.reshape(L))
-        yv_list.append(y_vol_t.reshape(L))
-        pv_list.append(p_vol_med.reshape(L))
+            if isinstance(pred, (list, tuple)):
+                p_vol = _q50(pred[0])
+                p_dir = _dir_logit(pred[1] if len(pred) > 1 else None)
+            else:
+                t = pred
+                if t.ndim >= 4 and t.size(1) == 1: t = t.squeeze(1)
+                if t.ndim == 3 and t.size(1) == 1: t = t[:, 0, :]
+                vol_q, p_dir = t[:, : t.size(-1)-1], t[:, -1]
+                p_vol = vol_q[:, 3] if vol_q.size(-1) >= 4 else vol_q.mean(dim=-1)
 
-        if y_dir_t is not None and p_dir is not None:
-            yd = y_dir_t.reshape(-1)
-            pd = p_dir.reshape(-1)
-            L2 = min(L, yd.numel(), pd.numel())
-            if L2 > 0:
-                yd_list.append(yd[:L2])
-                pd_list.append(pd[:L2])
+            y_dec = safe_decode_vol(y_vol.to(model_device).unsqueeze(-1), vol_norm, g.to(model_device).unsqueeze(-1)).squeeze(-1)
+            p_dec = safe_decode_vol(p_vol.to(model_device).unsqueeze(-1), vol_norm, g.to(model_device).unsqueeze(-1)).squeeze(-1)
 
-        batches_seen += 1
-        if max_batches is not None and max_batches > 0 and batches_seen >= max_batches:
-            break
+            # Guard against near-zero decoded vols that can explode QLIKE
+            floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
+            y_dec = torch.clamp(y_dec, min=floor_val)
+            p_dec = torch.clamp(p_dec, min=floor_val)
 
-    if not g_list:
-        # empty input → return NaNs-ish but finite
-        return 1.0, 1.0, 0.25, 10.0, 0
+            # Optional: light calibration to correct residual scale bias
+            p_dec = calibrate_vol_predictions(y_dec, p_dec)
 
-    device = g_list[0].device
-    g_all  = torch.cat(g_list).to(device)
-    y_all  = torch.cat(yv_list).to(device)
-    p_all  = torch.cat(pv_list).to(device)
+            y_all.append(y_dec.detach().cpu())
+            p_all.append(p_dec.detach().cpu())
+            if torch.is_tensor(y_dir) and torch.is_tensor(p_dir):
+                yd_flat, pd_flat = y_dir.reshape(-1), p_dir.reshape(-1)
+                L2 = min(yd_flat.numel(), pd_flat.numel())
+                if L2 > 0:
+                    yd_all.append(yd_flat[:L2].detach().cpu())
+                    pd_all.append(pd_flat[:L2].detach().cpu())
 
-    # decode realised_vol
-    y_dec = safe_decode_vol(y_all.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
-    p_dec = safe_decode_vol(p_all.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
-    floor_val = globals().get("EVAL_VOL_FLOOR", 1e-6)
-    y_dec = torch.clamp(y_dec, min=floor_val)
-    p_dec = torch.clamp(p_dec, min=floor_val)
+    if not y_all:
+        return float("nan"), float("nan"), float("nan"), float("nan"), 0
 
-    # metrics
+    y, p = torch.cat(y_all), torch.cat(p_all)
+    mae  = (p - y).abs().mean().item()
+    rmse = torch.sqrt(((p - y) ** 2).mean()).item()
+
     eps = 1e-8
-    diff = (p_dec - y_dec)
-    mae  = diff.abs().mean().item()
-    rmse = (diff.pow(2).mean().sqrt().item())
+    sigma2_p = torch.clamp(p.abs(), min=eps) ** 2
+    sigma2_y = torch.clamp(y.abs(), min=eps) ** 2
+    ratio = sigma2_y / sigma2_p
+    qlike = (ratio - torch.log(ratio) - 1.0).mean().item()
 
-    sigma2_p = torch.clamp(p_dec.abs(), min=eps) ** 2
-    sigma2_y = torch.clamp(y_dec.abs(), min=eps) ** 2
-    ratio    = sigma2_y / sigma2_p
-    qlike    = (ratio - torch.log(ratio) - 1.0).mean().item()
-
-    brier = None
-    if yd_list and pd_list:
-        yd = torch.cat(yd_list).to(device).float()
-        pd = torch.cat(pd_list).to(device)
+    dir_bce = float("nan")  # actually Brier score
+    if yd_all and pd_all:
+        yd, pd = torch.cat(yd_all).float(), torch.cat(pd_all)
         try:
             if torch.isfinite(pd).any() and (pd.min() < 0 or pd.max() > 1):
-                pd = torch.sigmoid(pd)
-        except Exception:
-            pd = torch.sigmoid(pd)
-        pd = torch.clamp(pd, 0.0, 1.0)
-        brier = ((pd - yd) ** 2).mean().item()
-
-    return float(mae), float(rmse), (float(brier) if brier is not None else float("nan")), float(qlike), int(y_dec.numel())
-
-# --- after trainer.fit(...), before running FI ---
-def _resolve_best_model(trainer, fallback):
-    # try any ModelCheckpoint attached to the trainer
-    best_path = None
-    try:
-        for cb in getattr(trainer, "callbacks", []):
-            if isinstance(cb, ModelCheckpoint) and getattr(cb, "best_model_path", ""):
-                best_path = cb.best_model_path
-                if best_path:
-                    break
-    except Exception:
-        pass
-
-    # fallback to newest local ckpt
-    if not best_path:
-        try:
-            ckpts = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"),
-                           key=lambda p: p.stat().st_mtime, reverse=True)
-            if ckpts:
-                best_path = str(ckpts[0])
+                pd = torch.sigmoid(pd)  # logits → probs
+            pd = torch.clamp(pd, 0.0, 1.0)
+            # same smoothing used in training, for stability
+            y_smooth = yd * 0.9 + 0.05
+            dir_bce_t = ((pd - y_smooth) ** 2).mean()
+            dir_bce = float(dir_bce_t.item())
         except Exception:
             pass
 
-    # load or return the in-memory model
-    if best_path:
-        try:
-            print(f"Best checkpoint: {best_path}")
-            return TemporalFusionTransformer.load_from_checkpoint(best_path)
-        except Exception as e:
-            print(f"[WARN] load_from_checkpoint failed: {e}")
-    return fallback
+    # return QLIKE as val_loss
+    return float(mae), float(rmse), float(dir_bce), float(qlike), int(y.numel())
 
-@torch.no_grad()
+
 def run_permutation_importance(
     model,
-    template_ds,
+    template_ds : TimeSeriesDataSet,
     base_df: pd.DataFrame,
     features: List[str],
     block_size: int,
@@ -2337,367 +1915,147 @@ def run_permutation_importance(
     num_workers: int,
     prefetch: int,
     pin_memory: bool,
-    vol_norm,                       # 👈 pass GroupNormalizer from TRAIN
     out_csv_path: str,
     uploader,
-    build_ds_fn=lambda: None,       # compatibility; unused
+    build_ds_fn = lambda: validation_dataset,
 ) -> None:
     """
-    Permutation Feature Importance on **decoded** metrics with a **baseline-normalised composite**:
-
-        Comp = w_mae*(MAE/MAE0) + w_rmse*(RMSE/RMSE0) + w_qlike*(QLIKE/QLIKE0)
-
-    We log per-feature deltas:
-        Δ_COMP = Comp_perm - Comp_base  (positive = harmful; negative = helpful)
+    Compute FI by permuting each feature and measuring Δ(val_loss) where
+    val_loss = MAE + RMSE + 0.05 * DirBCE (decoded scale).
+    Saves CSV with: feature, baseline_val_loss, permuted_val_loss, delta, mae, rmse, dir_bce, n.
     """
-
-    import os
-
-    # ---------- optional RESUME ----------
-    already = set()
-    existing_rows = []
-    if out_csv_path and os.path.exists(out_csv_path):
-        try:
-            prev = pd.read_csv(out_csv_path)
-            if "feature" in prev.columns:
-                already = set(prev["feature"].astype(str).tolist())
-                existing_rows = prev.to_dict("records")
-                print(f"[FI] Resuming — {len(already)} features already in {out_csv_path}")
-        except Exception as e:
-            print(f"[FI WARN] Could not read existing FI CSV for resume: {e}")
-
-    # ---------- BASELINE (predict=True, last step) ----------
-    ds_base = TimeSeriesDataSet.from_dataset(
-        template_ds,
-        base_df,
-        predict=False,
-        stop_randomization=True,
+    ds_base = TimeSeriesDataSet.from_dataset(template_ds, base_df, predict=False, stop_randomization=True)
+    train_vol_norm = _extract_norm_from_dataset(template_ds)
+    max_batches = 50
+    try:
+        print(f"[FI] Dataset size (samples): {len(ds_base)} | batch_size={batch_size}")
+    except Exception:
+        pass
+    b_mae, b_rmse, b_dir, b_val, n = _evaluate_decoded_metrics(
+        model, ds_base, batch_size, max_batches, num_workers, prefetch, pin_memory, vol_norm = train_vol_norm
     )
+    print(f"[FI] Baseline val_loss = {b_val:.6f} (MAE={b_mae:.6f}, RMSE={b_rmse:.6f}, Brier={b_dir:.6f}) | N={n}")
 
-    b_mae, b_rmse, b_brier, b_qlike, n_base = _evaluate_decoded_metrics(
-        model=model,
-        ds=ds_base,
-        batch_size=batch_size,
-        max_batches=max_batches,
-        num_workers=num_workers,
-        prefetch=prefetch,
-        pin_memory=pin_memory,
-        vol_norm=vol_norm,
-    )
-
-    base_comp = composite_score(b_mae, b_rmse, b_qlike, b_mae, b_rmse, b_qlike, COMP_WEIGHTS)
-
-
-
-    print(
-        f"[FI] Dataset size (samples): {len(base_df)} | batch_size={batch_size}\n"
-        f"[FI] Baseline: QLIKE={b_qlike:.6f} | MAE={b_mae:.6f} | RMSE={b_rmse:.6f} | "
-        f"COMPOSITE(base)={base_comp:.4f} | N={n_base}"
-    )
-    if b_mae > 0.01:
-        print("[FI DEBUG] WARNING: baseline decoded MAE unusually large (expected ~0.001–0.003). "
-              "Check vol_norm and decode pipeline.")
-
-    new_rows = []
-    work_df = base_df.copy()
-
-    # ---------- PERMUTE LOOP ----------
+    rows = []
     for feat in features:
-        if str(feat) in already:
-            print(f"[FI] {feat:>20s} | SKIP (already present)")
+        if feat not in base_df.columns:
+            print(f"[FI] Skipping missing feature: {feat}")
             continue
-
-        df_perm = work_df.copy()
-        _permute_series_inplace(df_perm, feat, block=block_size, group_col="asset")
-
-        ds_perm = TimeSeriesDataSet.from_dataset(
-            template_ds,
-            df_perm,
-            predict=False,
-            stop_randomization=True,
+        df_p = base_df.copy()
+        _permute_series_inplace(df_p, feat, block=block_size, group_col=GROUP_ID[0] if GROUP_ID else "asset")
+        ds_p = TimeSeriesDataSet.from_dataset(template_ds, df_p, predict=False, stop_randomization=True)
+        p_mae, p_rmse, p_dir, p_val, n_p = _evaluate_decoded_metrics(
+            model, ds_p, batch_size, max_batches, num_workers, prefetch, pin_memory, vol_norm = train_vol_norm
         )
-
-        p_mae, p_rmse, p_brier, p_qlike, n_p = _evaluate_decoded_metrics(
-            model=model,
-            ds=ds_perm,
-            batch_size=batch_size,
-            max_batches=max_batches,
-            num_workers=num_workers,
-            prefetch=prefetch,
-            pin_memory=pin_memory,
-            vol_norm=vol_norm,
-        )
-
-        # individual deltas (lower is better)
-        d_mae   = float(p_mae   - b_mae)
-        d_rmse  = float(p_rmse  - b_rmse)
-        d_qlike = float(p_qlike - b_qlike)
-
-        # baseline-normalised composite
-        p_comp = composite_score(p_mae, p_rmse, p_qlike, b_mae, b_rmse, b_qlike, COMP_WEIGHTS)
-        d_comp = float(p_comp - base_comp)  # + = harmful (we minimise)
-
-        print(
-            f"[FI] {feat:>20s} | QLIKE={p_qlike:.6f} Δ_QLIKE={d_qlike:+.6f} | "
-            f"Δ_MAE={d_mae:+.6f} Δ_RMSE={d_rmse:+.6f} | "
-            f"COMPOSITE={p_comp:.4f} Δ_COMP={d_comp:+.4f} "
-            f"{'(↑ worse ⇒ useful)' if d_comp > 0 else '(↓ better ⇒ harmful/redundant)'}"
-        )
-
-        new_rows.append({
-            "feature": str(feat),
-            "baseline_mae": float(b_mae),
-            "baseline_rmse": float(b_rmse),
-            "baseline_qlike": float(b_qlike),
-            "permuted_mae": float(p_mae),
-            "permuted_rmse": float(p_rmse),
-            "permuted_qlike": float(p_qlike),
-            "delta_mae": float(d_mae),
-            "delta_rmse": float(d_rmse),
-            "delta_qlike": float(d_qlike),
-            "composite_base": float(base_comp),
-            "composite_perm": float(p_comp),
-            "delta_composite": float(d_comp),
-            "brier": (float(p_brier) if p_brier == p_brier else None),
-            "weights": f"mae={COMP_WEIGHTS[0]},rmse={COMP_WEIGHTS[1]},qlike={COMP_WEIGHTS[2]}",
-            "n": int(n_p),
+        delta = (p_val - b_val) if (np.isfinite(p_val) and np.isfinite(b_val)) else float("nan")
+        print(f"[FI] {feat:>20} | val_p={p_val:.6f} | Δ={delta:.6f} | (MAE={p_mae:.6f}, RMSE={p_rmse:.6f}, Brier={p_dir:.6f})")
+        rows.append({
+            "feature": feat,
+            "baseline_val_loss": b_val,
+            "permuted_val_loss": p_val,
+            "delta": delta,
+            "mae": p_mae,
+            "rmse": p_rmse,
+            "dir_bce": p_dir,
+            "brier" : p_dir,
+            "n": n_p,
         })
 
-    # ---------- SAVE / UPLOAD ----------
     try:
-        out_df = pd.DataFrame((existing_rows or []) + new_rows)
-        out_df.to_csv(out_csv_path, index=False)
-        print(f"[FI] wrote {out_csv_path}")
-        if uploader is not None:
-            try:
-                uploader(out_csv_path, f"{GCS_OUTPUT_PREFIX}/{Path(out_csv_path).name}")
-            except Exception as e:
-                print(f"[FI WARN] upload failed: {e}")
+        _df = pd.DataFrame(rows).sort_values("delta", ascending=False)
+        _df.to_csv(out_csv_path, index=False)
+        print(f"✓ Saved FI → {out_csv_path}")
+        try:
+            uploader(out_csv_path, f"{GCS_OUTPUT_PREFIX}/" + os.path.basename(out_csv_path))
+        except Exception as e:
+            print(f"[WARN] Could not upload FI CSV: {e}")
     except Exception as e:
-        print(f"[FI WARN] could not save FI CSV: {e}")
-
+        print(f"[WARN] Failed to save FI: {e}")
+# 
+# 
 # -----------------------------------------------------------------------
 # Standard Variable Importance (SVI) via TFT.interpret_output
 # -----------------------------------------------------------------------
 
-@torch.no_grad()
 def save_standard_variable_importance(
     model,
-    dataloader,
-    ds,                                # pass your validation_dataset here
-    out_csv_path="standard_variable_importance.csv",
-    uploader=None,
-    min_samples: int = 10_000,         # target number of samples to aggregate
-    max_batches: int | None = None     # optional hard cap on batches
+    val_dataloader,
+    out_csv_path: str,
+    uploader,
+    feature_names: list[str] | None = None,
 ):
     """
-    Compute Standard Variable Importance (SVI) by averaging PyTorch-Forecasting's
-    `interpret_output` across many batches until at least `min_samples` examples
-    are seen (or the dataloader is exhausted). Robust to PF versions that return
-    dicts or tuples, and to runs where certain keys are missing.
-
-    We aggregate three groups when available:
-      • encoder variable importance
-      • decoder variable importance
-      • static variable importance
+    Computes TFT's built-in standard variable importance (encoder/decoder/static)
+    using `interpret_output` and saves a tidy CSV with columns:
+      variable, encoder_importance, decoder_importance, static_importance, total
+    Also uploads to GCS via `uploader`.
     """
-    import numpy as _np
-    import pandas as _pd
-    import torch as _torch
-    from pathlib import Path as _Path
-
-    model.eval()
-
-    # ---- helpers ----
-    def _move_to_device(x, device):
-        if isinstance(x, dict):
-            out = {}
-            for k, v in x.items():
-                if _torch.is_tensor(v):
-                    out[k] = v.to(device, non_blocking=True)
-                elif isinstance(v, (list, tuple)):
-                    out[k] = [vv.to(device, non_blocking=True) if _torch.is_tensor(vv) else vv for vv in v]
-                else:
-                    out[k] = v
-            return out
-        return x
-
-    def _get_any(d, keys, default=None):
-        for k in keys:
-            if isinstance(d, dict) and k in d and d[k] is not None:
-                return d[k]
-        return default
-
-    def _norm_out(out_obj):
-        # normalise PF interpret_output return to a dict
-        if isinstance(out_obj, dict):
-            return out_obj
-        if isinstance(out_obj, (list, tuple)):
-            for o in out_obj:
-                if isinstance(o, dict):
-                    return o
-            # fallback: wrap positional outputs (rare)
-            return {"attention": out_obj}
-        return {}
-
-    def _to_numpy_1d(a):
-        if a is None:
-            return None
-        if isinstance(a, _torch.Tensor):
-            a = a.detach().cpu()
-        a = _np.asarray(a)
-        # PF often returns [B, n_vars] for reduction='none' → average over B
-        if a.ndim == 2:
-            a = a.mean(axis=0)
-        elif a.ndim > 2:
-            a = a.reshape(-1, a.shape[-1]).mean(axis=0)
-        return a.astype(float).ravel()
-
-    # names from the dataset (never rely on model.dataset)
-    enc_names = list(getattr(ds, "encoder_variables", []) or [])
-    dec_names = list(getattr(ds, "decoder_variables", []) or [])
-    stat_names = list(
-        getattr(ds, "static_categoricals", []) or
-        getattr(ds, "static_variables", []) or []
-    )
-
-    device = next(model.parameters()).device
-    n_seen = 0
-
-    # running sums and counters
-    enc_sum = None
-    dec_sum = None
-    stat_sum = None
-    batch_count = 0
-
-    it = iter(dataloader)
-    while True:
-        if max_batches is not None and batch_count >= int(max_batches):
-            break
-        try:
-            batch = next(it)
-        except StopIteration:
-            break
-
-        # x only; interpret_output will run forward internally
-        x = batch[0] if isinstance(batch, (list, tuple)) else batch
-        if not isinstance(x, dict):
-            continue
-
-        x_dev = _move_to_device(x, device)
-
-        # Prefer reduction='none' so we can average across many batches ourselves.
-        # If PF version errors on that, fall back to 'mean'.
-        try:
-            out = model.interpret_output(x_dev, reduction="none")
-        except KeyError:
-            # PF version/config did not return attentions (e.g., 'decoder_attention' missing)
-            # Exit SVI quietly; nothing to aggregate.
-            return
-        except Exception:
-            try:
-                out = model.interpret_output(x_dev, reduction="mean")
-            except KeyError:
-                return
-            except Exception:
-                # Skip this batch quietly
-                continue
-
-        res = _norm_out(out)
-
-        enc_imp = _get_any(res, [
-            "encoder_variables", "encoder_variable_importance", "encoder_importance"
-        ])
-        dec_imp = _get_any(res, [
-            "decoder_variables", "decoder_variable_importance", "decoder_importance"
-        ])
-        stat_imp = _get_any(res, [
-            "static_variables", "static_variable_importance", "static_importance"
-        ])
-
-        enc_vec = _to_numpy_1d(enc_imp)
-        dec_vec = _to_numpy_1d(dec_imp)
-        stat_vec = _to_numpy_1d(stat_imp)
-
-        # Determine how many samples this batch contributed. With reduction='none'
-        # encoder/decoder often come back as [B, n_vars]; otherwise assume batch size.
-        contrib = 0
-        try:
-            rep = None
-            for cand in (enc_imp, dec_imp, stat_imp):
-                if isinstance(cand, _torch.Tensor) and cand.ndim >= 2:
-                    rep = cand
-                    break
-            if rep is None:
-                # fallback to batch size if we can find it in x
-                for k, v in x.items():
-                    if _torch.is_tensor(v) and v.shape[0] > 0:
-                        rep = v
-                        break
-            if isinstance(rep, _torch.Tensor):
-                contrib = int(rep.shape[0])
-        except Exception:
-            contrib = 0
-
-        # accumulate; align length to names if needed
-        if enc_vec is not None:
-            if enc_sum is None:
-                enc_sum = _np.zeros_like(enc_vec, dtype=float)
-            if len(enc_vec) == len(enc_sum):
-                enc_sum += enc_vec
-        if dec_vec is not None:
-            if dec_sum is None:
-                dec_sum = _np.zeros_like(dec_vec, dtype=float)
-            if len(dec_vec) == len(dec_sum):
-                dec_sum += dec_vec
-        if stat_vec is not None:
-            if stat_sum is None:
-                stat_sum = _np.zeros_like(stat_vec, dtype=float)
-            if len(stat_vec) == len(stat_sum):
-                stat_sum += stat_vec
-
-        n_seen += int(contrib)
-        batch_count += 1
-
-        if n_seen >= int(min_samples):
-            break
-
-    if (enc_sum is None) and (stat_sum is None) and (dec_sum is None):
+    try:
+        # Run prediction in raw mode to get interpretable outputs
+        raw_predictions, x = model.predict(val_dataloader, mode="raw", return_x=True)
+        interp = model.interpret_output(raw_predictions, reduction="mean")
+    except Exception as e:
+        print(f"[SVI] Failed to compute interpret_output: {e}")
         return
 
-    # average the sums across batches processed
-    denom = max(1, batch_count)
-    enc_avg = None if enc_sum is None else (enc_sum / denom)
-    dec_avg = None if dec_sum is None else (dec_sum / denom)
-    stat_avg = None if stat_sum is None else (stat_sum / denom)
+    # PyTorch Forecasting sometimes nests under "variable_importance", other times top-level
+    vi = interp.get("variable_importance", interp)
 
-    rows = []
-    if enc_avg is not None and len(enc_names) == enc_avg.shape[0]:
-        rows += [{"group": "encoder", "feature": n, "importance": float(v)}
-                 for n, v in zip(enc_names, enc_avg)]
-    if dec_avg is not None and len(dec_names) == dec_avg.shape[0]:
-        rows += [{"group": "decoder", "feature": n, "importance": float(v)}
-                 for n, v in zip(dec_names, dec_avg)]
-    if stat_avg is not None and len(stat_names) == stat_avg.shape[0]:
-        rows += [{"group": "static", "feature": n, "importance": float(v)}
-                 for n, v in zip(stat_names, stat_avg)]
-
-    if not rows:
-        print("[SVI] Parsed no variable importances (shape/name mismatch?).")
+    try:
+        import numpy as np
+        import pandas as pd
+    except Exception as e:
+        print(f"[SVI] pandas/numpy import error: {e}")
         return
 
-    df = _pd.DataFrame(rows).sort_values(["group", "importance"], ascending=[True, False])
-    df.to_csv(out_csv_path, index=False)
-    print(f"[SVI] wrote {out_csv_path} | batches={batch_count} | aggregated_samples≈{n_seen}")
+    # Get names from model dataset if available
+    names = getattr(model.dataset, "encoder_variables", None)
+    if names is None and isinstance(vi, dict) and "variable_names" in vi:
+        names = vi["variable_names"]
+    if names is None and feature_names is not None:
+        names = feature_names
 
-    # optional upload
-    if uploader is not None:
+    enc = np.array(vi.get("encoder_variable_importance", [])) if isinstance(vi, dict) else np.array([])
+    dec = np.array(vi.get("decoder_variable_importance", [])) if isinstance(vi, dict) else np.array([])
+    sta = np.array(vi.get("static_variable_importance", [])) if isinstance(vi, dict) else np.array([])
+
+    # Align arrays
+    max_len = max(len(enc), len(dec), len(sta))
+    if names is None:
+        names = [f"var_{i}" for i in range(max_len)]
+
+    def _fix(arr, L):
+        arr = np.array(arr, dtype=float).flatten()
+        if len(arr) < L:
+            arr = np.pad(arr, (0, L - len(arr)), mode="constant")
+        elif len(arr) > L:
+            arr = arr[:L]
+        return arr
+
+    L = max(max_len, len(names))
+    enc, dec, sta = (_fix(enc, L), _fix(dec, L), _fix(sta, L))
+    if len(names) < L:
+        names = names + [f"var_{i}" for i in range(len(names), L)]
+
+    total = enc + dec + sta
+
+    df_vi = pd.DataFrame({
+        "variable": names,
+        "encoder_importance": enc,
+        "decoder_importance": dec,
+        "static_importance": sta,
+        "total": total,
+    }).sort_values("total", ascending=False)
+
+    try:
+        df_vi.to_csv(out_csv_path, index=False)
+        print(f"✓ Saved Standard Variable Importance → {out_csv_path}")
         try:
-            uploader(out_csv_path, f"{GCS_OUTPUT_PREFIX}/{_Path(out_csv_path).name}")
+            uploader(out_csv_path, f"{GCS_OUTPUT_PREFIX}/" + os.path.basename(out_csv_path))
         except Exception as e:
-            print(f"[SVI] upload failed: {e}")
-
-
+            print(f"[WARN] Could not upload SVI CSV: {e}")
+    except Exception as e:
+        print(f"[SVI] Failed to save CSV: {e}")
         
 # Data preparation
 # -----------------------------------------------------------------------
@@ -2789,6 +2147,7 @@ if __name__ == "__main__":
         print(f"[FILTER] TEST relaxed to overlap-only: {len(test_df)} rows")
 
 
+       
     # -----------------------------------------------------------------------
     # Feature definitions
     # -----------------------------------------------------------------------
@@ -2896,17 +2255,12 @@ if __name__ == "__main__":
 
     batch_size = min(BATCH_SIZE, len(training_dataset))
 
-    # DataLoader performance knobs — prefer multi-worker, fall back to single-process
+    # DataLoader performance knobs
     default_workers = max(2, (os.cpu_count() or 4) - 1)
-    _cli_workers = int(ARGS.num_workers) if getattr(ARGS, "num_workers", None) is not None else default_workers
+    worker_cnt = int(ARGS.num_workers) if getattr(ARGS, "num_workers", None) is not None else default_workers
     prefetch = int(getattr(ARGS, "prefetch_factor", 8))
     pin = torch.cuda.is_available()
-
-    # Use CLI/default worker count; only disable when explicitly set to 0
-    worker_cnt = max(0, _cli_workers)
     use_persist = worker_cnt > 0
-    # Only pass prefetch_factor when num_workers > 0
-    prefetch_kw = ({"prefetch_factor": prefetch} if worker_cnt > 0 else {})
 
     test_loader = test_dataset.to_dataloader(
         train=False,
@@ -2914,7 +2268,7 @@ if __name__ == "__main__":
         num_workers=worker_cnt,
         pin_memory=pin,
         persistent_workers=use_persist,
-        **prefetch_kw,
+        prefetch_factor=prefetch,
     )
 
     train_dataloader = training_dataset.to_dataloader(
@@ -2922,16 +2276,16 @@ if __name__ == "__main__":
         batch_size=batch_size,
         num_workers=worker_cnt,
         persistent_workers=use_persist,
+        prefetch_factor=prefetch,
         pin_memory=pin,
-        **prefetch_kw,
     )
     val_dataloader = validation_dataset.to_dataloader(
         train=False,
         batch_size=batch_size,
         num_workers=worker_cnt,
         persistent_workers=use_persist,
+        prefetch_factor=prefetch,
         pin_memory=pin,
-        **prefetch_kw,
     )
     # --- Test dataset ---
     test_dataset = TimeSeriesDataSet.from_dataset(
@@ -2946,9 +2300,9 @@ if __name__ == "__main__":
         train=False,
         batch_size=batch_size,
         num_workers=worker_cnt,
+        prefetch_factor=prefetch,
         persistent_workers=use_persist,
         pin_memory=pin,
-        **prefetch_kw,
     )
 
     # ---- derive id→asset-name mapping for callbacks ----
@@ -2975,7 +2329,7 @@ if __name__ == "__main__":
     min_delta = 1e-4
     )
 
-
+    bar_cb = TQDMProgressBar()
 
     metrics_cb = PerAssetMetrics(
         id_to_name=rev_asset,
@@ -2988,6 +2342,15 @@ if __name__ == "__main__":
 
 
 
+    VOL_LOSS = AsymmetricQuantileLoss(
+        quantiles=VOL_QUANTILES,
+        underestimation_factor=1.00, #1.1115   # you can keep your scheduler on this
+        mean_bias_weight=0.0,          # or small value if you want median centering
+        tail_q=0.85,
+        tail_weight=1.0,               # set >0 if you want extra tail emphasis
+        qlike_weight=0.25,             # << QLIKE back in (tune 0.1–0.3)
+        reduction="mean",
+    )
     from pytorch_forecasting.metrics import MultiLoss
     # one-off in your data prep (TRAIN split)
     counts = train_df["direction"].value_counts()
@@ -2996,11 +2359,11 @@ if __name__ == "__main__":
     pos_weight = float(n_neg / n_pos)
 
     # then build the loss with:
-    DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.02, pos_weight=pos_weight)
+    DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.03, pos_weight=pos_weight)
 
 
     FIXED_VOL_WEIGHT = 1.0
-    FIXED_DIR_WEIGHT = 0.1
+    FIXED_DIR_WEIGHT = 0.15
  
 
     tft = TemporalFusionTransformer.from_dataset(
@@ -3028,10 +2391,9 @@ if __name__ == "__main__":
 
     lr_cb = LearningRateMonitor(logging_interval="step")
 
-
     best_ckpt_cb = ModelCheckpoint(
-        monitor="val_qlike_overall",
-        mode="min",
+        monitor="val_auroc_overall",
+        mode="max",
         save_top_k=1,
         save_last=True,
         filename=f"tft_best_e{MAX_EPOCHS}_{RUN_SUFFIX}",
@@ -3042,10 +2404,8 @@ if __name__ == "__main__":
 
     val_hist_csv = LOCAL_RUN_DIR / f"tft_val_history_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv"
     val_hist_cb  = ValLossHistory(val_hist_csv)
-
-
-    cosine_cb = CosineLR(start_epoch=8, min_lr=1e-4)
-
+    
+    lr_decay_cb = EpochLRDecay(gamma=0.95, start_epoch=10) 
 
     # ----------------------------
     # Trainer instance
@@ -3053,7 +2413,7 @@ if __name__ == "__main__":
     checkpoint_callback = ModelCheckpoint(
         dirpath=str(LOCAL_OUTPUT_DIR),
         filename="tft-{epoch:02d}-{val_loss:.4f}",
-        monitor="val_qlike_overall",      # or val_qlike_overall if you want
+        monitor="val_loss",      # or val_qlike_overall if you want
         save_top_k=1,            # keep best only
         save_last = True,
         auto_insert_metric_name=False,
@@ -3067,10 +2427,9 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[best_ckpt_cb, TQDMProgressBar(refresh_rate=50), es_cb, metrics_cb, mirror_cb, cosine_cb, lr_cb, val_hist_cb] + EXTRA_CALLBACKS,
+        callbacks=[best_ckpt_cb, es_cb, bar_cb, metrics_cb, mirror_cb, lr_decay_cb, lr_cb, val_hist_cb],
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
-        enable_progress_bar=True,
     )
 
 
@@ -3096,50 +2455,30 @@ if __name__ == "__main__":
     resume_ckpt = get_resume_ckpt_path() if RESUME_ENABLED else None
     if resume_ckpt:
         print(f"↩️  Resuming from checkpoint: {resume_ckpt}")
-    else:
-        print("▶ Starting a fresh run (no resume)")
 
     # Train the model
     trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
 
-    # Resolve the best checkpoint
-    model_for_fi = _resolve_best_model(trainer, fallback=tft)
-
-    # Extract the same normalizer used for volatility during training
-    try:
-        train_vol_norm = _extract_norm_from_dataset(training_dataset)
-    except Exception as e:
-        print(f"[WARN] could not extract vol_norm from training dataset: {e}")
-        train_vol_norm = None
-    # ---- Permutation Importance (decoded) ----
-if ENABLE_FEATURE_IMPORTANCE:
-    fi_csv = str(LOCAL_OUTPUT_DIR / f"TFTPFI_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")
-    feats = time_varying_unknown_reals.copy()
-    # optional: drop calendar features from FI
-    feats = [f for f in feats if f not in ("sin_tod", "cos_tod", "sin_dow", "cos_dow", "Is_Weekend")]
-
-    # Prefer TRAIN dataset as template → guarantees same encoders & normalizers
-    try:
-        train_vol_norm = _extract_norm_from_dataset(training_dataset)
-    except Exception:
-        # fallback to validation dataset if needed
-        train_vol_norm = _extract_norm_from_dataset(validation_dataset)
-
-    run_permutation_importance(
-        model=model_for_fi,
-        template_ds=training_dataset,          # 👈 use TRAIN template
-        base_df=val_df,
-        features=feats,
-        block_size=int(PERM_BLOCK_SIZE) if PERM_BLOCK_SIZE else 1,
-        batch_size=256,
-        max_batches=int(FI_MAX_BATCHES) if FI_MAX_BATCHES else 40,
-        num_workers=4,
-        prefetch=2,
-        pin_memory=pin,
-        vol_norm=train_vol_norm,               # 👈 ensure decoded metrics
-        out_csv_path=fi_csv,
-        uploader=upload_file_to_gcs,
-    )
+    # Run FI permutation testing if enabled
+    if ENABLE_FEATURE_IMPORTANCE:
+        fi_csv = str(LOCAL_OUTPUT_DIR / f"tft_perm_importance_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")
+        feats = time_varying_unknown_reals.copy()
+        # (optional) drop calendar features from FI to focus on learned signals
+        feats = [f for f in feats if f not in ("sin_tod", "cos_tod", "sin_dow", "cos_dow", "Is_Weekend")]
+        run_permutation_importance(
+            model=tft,
+            template_ds = training_dataset,            # << use train template
+            base_df=val_df,
+            features=feats,
+            block_size=int(PERM_BLOCK_SIZE) if PERM_BLOCK_SIZE else 1,
+            batch_size=256,
+            max_batches=int(FI_MAX_BATCHES) if FI_MAX_BATCHES else 20,
+            num_workers=4,
+            prefetch=2,
+            pin_memory=pin,
+            out_csv_path=fi_csv,
+            uploader=upload_file_to_gcs,
+        )
     # --- Safe plotting/logging: deep-cast any nested tensors to CPU float32 ---
     # --- Safe plotting/logging: class-level patch to handle bf16 + integer lengths robustly ---
 
@@ -3266,23 +2605,14 @@ print(f"Best checkpoint (local or remote): {best_model_path}")
 # -----------------------------------------------------------------------
 # Save Standard Variable Importance
 # -----------------------------------------------------------------------
-try:
-    feature_names = (
-        training_dataset.encoder_variables
-        + training_dataset.decoder_variables
-        + training_dataset.static_categoricals
-    )
-except Exception:
-    feature_names = None
-
 save_standard_variable_importance(
     best_model,
     val_dataloader,
-    ds=validation_dataset,                                # names come from dataset
-    out_csv_path=str(LOCAL_OUTPUT_DIR / "standard_variable_importance.csv"),
+    out_csv_path="standard_variable_importance.csv",
     uploader=upload_file_to_gcs,
-    min_samples=10_000,                                   # ← your requirement
-    max_batches=None                                      # or set e.g. 60 as a guard
+    feature_names=best_model.dataset.encoder_variables
+                  + best_model.dataset.decoder_variables
+                  + best_model.dataset.static_categoricals
 )
 
 
@@ -3467,4 +2797,3 @@ try:
 
 except Exception as e:
     print(f"[WARN] Failed to save test predictions: {e}")
-    
