@@ -2825,14 +2825,7 @@ if __name__ == "__main__":
     lr_cb = LearningRateMonitor(logging_interval="step")
 
 
-    best_ckpt_cb = ModelCheckpoint(
-        monitor="val_qlike_overall",
-        mode="min",
-        save_top_k=1,
-        save_last=True,
-        filename=f"tft_best_e{MAX_EPOCHS}_{RUN_SUFFIX}",
-        dirpath=str(LOCAL_CKPT_DIR),
-    )
+
 
   
 
@@ -2863,7 +2856,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[best_ckpt_cb, TQDMProgressBar(refresh_rate=50), es_cb, metrics_cb, mirror_cb, lr_cb, val_hist_cb] + EXTRA_CALLBACKS,
+        callbacks=[TQDMProgressBar(refresh_rate=50), es_cb, metrics_cb, mirror_cb, lr_cb, val_hist_cb] + EXTRA_CALLBACKS,
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
         enable_progress_bar=True,
