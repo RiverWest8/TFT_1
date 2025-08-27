@@ -2729,7 +2729,7 @@ if __name__ == "__main__":
         batch_size=batch_size,
         num_workers=worker_cnt,
         persistent_workers=use_persist,
-        pin_memory=pin,
+        pin_memory=False,
         **prefetch_kw,
     )
     # --- Test dataset ---
@@ -2746,7 +2746,7 @@ if __name__ == "__main__":
         batch_size=batch_size,
         num_workers=worker_cnt,
         persistent_workers=use_persist,
-        pin_memory=pin,
+        pin_memory=False,
         **prefetch_kw,
     )
 
