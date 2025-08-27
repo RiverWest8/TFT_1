@@ -3493,5 +3493,4 @@ try:
         test_pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_best_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
         _save_predictions_from_best(trainer, test_dataloader, "test", test_pred_path)
     except Exception as e:
-        print(f"[WARN] Failed to save test predictions: {e}")
-        
+        print(f"[WARN] Failed to save test predictions: {e}") 
