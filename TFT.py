@@ -482,7 +482,7 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dic
     Decode vol using `vol_normalizer`, clamp floors, and save to Parquet.
     """
     import pandas as pd
-        # Accept alias vol_norm from legacy call-sites
+    # Accept alias vol_norm from legacy call-sites
     if vol_normalizer is None:
         vol_normalizer = kwargs.get("vol_norm", None)
     if vol_normalizer is None:
