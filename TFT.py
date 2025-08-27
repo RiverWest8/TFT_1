@@ -474,7 +474,7 @@ def _get_best_ckpt_path(trainer) -> str | None:
 
 
 @torch.no_grad()
-def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dict | None = None, out_path: Path | str | None = None, **kwargs):
+def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dict | None = None, out_path: Path | str | None = None, cal_scale: float | None = None, per_asset_scales: dict | None = None, **kwargs):
     """
     Iterate a dataloader, run model in eval, extract:
       • realised_vol median prediction (q=0.50) & target
@@ -578,6 +578,30 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dic
     yv_dec = torch.clamp(yv_dec, min=floor_val)
     pv_dec = torch.clamp(pv_dec, min=floor_val)
 
+    # Optional global multiplicative calibration (derived from validation only)
+    if cal_scale is None:
+        cal_scale = kwargs.get("calibration_scale", None)
+    if cal_scale is not None:
+        try:
+            pv_dec = pv_dec * float(cal_scale)
+        except Exception:
+            pass
+        # Optional per-asset multiplicative calibration (derived from validation only)
+        
+    if per_asset_scales is None:
+        per_asset_scales = kwargs.get("per_asset_calibration", None)
+
+    id_to_name = id_to_name or {}
+    assets = [id_to_name.get(int(i), str(int(i))) for i in g_cpu.numpy().tolist()]
+
+    if isinstance(per_asset_scales, dict) and len(per_asset_scales) > 0:
+        try:
+            _map = {str(k): float(v) for k, v in per_asset_scales.items()}
+            scales_vec = torch.tensor([_map.get(str(a), 1.0) for a in assets], dtype=pv_dec.dtype)
+            pv_dec = pv_dec * scales_vec
+        except Exception as _e:
+            print(f"[WARN] per-asset calibration failed, skipping: {_e}")
+
     id_to_name = id_to_name or {}
     assets = [id_to_name.get(int(i), str(int(i))) for i in g_cpu.numpy().tolist()]
     t_cpu = torch.cat(all_t) if all_t else None
@@ -614,17 +638,79 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dic
 
 @torch.no_grad()
 def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: Path | str, id_to_name: dict | None = None):
-    """Load the best checkpoint (min val_qlike_overall) and write predictions for `dataloader`."""
+    """Load the best checkpoint (min val_qlike_overall) and write predictions for `dataloader`.
+    Writes two files when a validation calibration scale is available:
+      • out_path  → uncalibrated predictions
+      • calibrated_<basename> → predictions scaled by validation-derived scalar (no look-ahead)
+    """
     ckpt = _get_best_ckpt_path(trainer)
     if ckpt is None:
         raise RuntimeError("Could not resolve best checkpoint path.")
     print(f"Loading best checkpoint for {split_name}: {ckpt}")
+
+    # Load model and normalizer from the dataloader's dataset
     model = TemporalFusionTransformer.load_from_checkpoint(ckpt)
     try:
         vol_norm = _extract_norm_from_dataset(dataloader.dataset)
     except Exception as e:
         raise RuntimeError(f"Could not resolve normalizer from dataset: {e}")
-    return _collect_predictions(model, dataloader, vol_normalizer=vol_norm, id_to_name=id_to_name, out_path=out_path)
+
+    # 1) Save the uncalibrated predictions to out_path
+    out_uncal = _collect_predictions(
+        model,
+        dataloader,
+        vol_normalizer=vol_norm,
+        id_to_name=id_to_name,
+        out_path=out_path,
+        cal_scale=None,
+    )
+
+    # 2) Optionally save a calibrated copy using the validation-derived global scale
+    try:
+        s = GLOBAL_CAL_SCALE if (GLOBAL_CAL_SCALE is not None) else _load_val_cal_scale()
+    except Exception:
+        s = None
+
+    if s is not None:
+        out_path = Path(out_path)
+        cal_name = f"calibrated_{out_path.name}"
+        cal_path = out_path.with_name(cal_name)
+        print(f"Saving calibrated predictions for {split_name} with s={float(s):.6g} → {cal_path}")
+        _collect_predictions(
+            model,
+            dataloader,
+            vol_normalizer=vol_norm,
+            id_to_name=id_to_name,
+            out_path=cal_path,
+            cal_scale=float(s),
+        )
+    else:
+        print("[WARN] No validation calibration scale available; skipping calibrated parquet for",
+              split_name)
+
+    # Load per-asset scales (if available) and save a per-asset calibrated parquet
+    try:
+        per_asset = _load_val_per_asset_scales()
+    except Exception:
+        per_asset = None
+    if isinstance(per_asset, dict) and len(per_asset) > 0:
+        out_path = Path(out_path)
+        pa_name = f"calibrated_pa_{out_path.name}"
+        pa_path = out_path.with_name(pa_name)
+        print(f"Saving per-asset calibrated predictions for {split_name} → {pa_path}")
+        _collect_predictions(
+            model,
+            dataloader,
+            vol_normalizer=vol_norm,
+            id_to_name=id_to_name,
+            out_path=pa_path,
+            cal_scale=None,                 # don't double-apply the global scale
+            per_asset_scales=per_asset,
+        )
+    else:
+        print(f"[WARN] No per-asset scales available; skipping per-asset calibrated parquet for {split_name}")
+
+    return out_uncal
 @torch.no_grad()
 
 def safe_decode_vol(y: torch.Tensor, normalizer, group_ids: torch.Tensor | None):
@@ -719,6 +805,82 @@ if not hasattr(GroupNormalizer, "decode"):
 
     GroupNormalizer.decode = _gn_decode
 
+# --- Global storage + helpers for a single, leakage-free validation scale ---
+GLOBAL_CAL_SCALE = None  # set on validation end; reused for parquet exports
+# Per-asset QLIKE-optimal multiplicative calibration scales (computed on validation)
+PER_ASSET_CAL_SCALES = None  # dict: {asset_name(str): float}
+
+def _save_val_per_asset_scales(scales: dict):
+    """Persist per-asset validation scales to disk for later reuse (e.g., test)."""
+    try:
+        path = LOCAL_RUN_DIR / f"val_per_asset_scales_e{MAX_EPOCHS}_{RUN_SUFFIX}.json"
+        with open(path, "w") as f:
+            _json.dump(scales, f, indent=2)
+        print(f"✓ Saved per-asset validation scales → {path}")
+    except Exception as e:
+        print(f"[WARN] Could not save per-asset validation scales: {e}")
+
+def _load_val_per_asset_scales() -> dict | None:
+    """Load most recent saved per-asset validation scales if available."""
+    try:
+        path = LOCAL_RUN_DIR / f"val_per_asset_scales_e{MAX_EPOCHS}_{RUN_SUFFIX}.json"
+        if path.exists():
+            with open(path, "r") as f:
+                d = _json.load(f)
+                return {str(k): float(v) for k, v in d.items()}
+        files = sorted(LOCAL_RUN_DIR.glob("val_per_asset_scales_*.json"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        if files:
+            with open(files[0], "r") as f:
+                d = _json.load(f)
+                return {str(k): float(v) for k, v in d.items()}
+    except Exception as e:
+        print(f"[WARN] Could not load per-asset validation scales: {e}")
+    return None
+@torch.no_grad()
+def compute_global_scale(y_true_dec: torch.Tensor, y_pred_dec: torch.Tensor, eps: float = 1e-12) -> float:
+    """Return QLIKE-optimal multiplicative scale s for decoded vols.
+    s^2 = E[y^2] / E[p^2]. Works on any device/dtype; returns python float.
+    """
+    if y_true_dec is None or y_pred_dec is None:
+        return 1.0
+    y = y_true_dec.reshape(-1)
+    p = y_pred_dec.reshape(-1)
+    if y.numel() == 0 or p.numel() == 0:
+        return 1.0
+    y32 = y.to(dtype=torch.float32)
+    p32 = p.to(dtype=torch.float32)
+    s2 = torch.clamp((torch.clamp(y32.abs(), min=eps) ** 2).mean() /
+                     (torch.clamp(p32.abs(), min=eps) ** 2).mean(), min=eps)
+    return float(torch.sqrt(s2).item())
+
+import json as _json
+
+def _save_val_cal_scale(scale: float):
+    """Persist the validation calibration scale to disk for later reuse (e.g., test)."""
+    try:
+        path = LOCAL_RUN_DIR / f"val_cal_scale_e{MAX_EPOCHS}_{RUN_SUFFIX}.json"
+        with open(path, "w") as f:
+            _json.dump({"scale": float(scale)}, f)
+        print(f"✓ Saved validation calibration scale s={scale:.6g} → {path}")
+    except Exception as e:
+        print(f"[WARN] Could not save validation calibration scale: {e}")
+
+def _load_val_cal_scale() -> float | None:
+    """Load the most recent saved validation calibration scale if available."""
+    try:
+        cand = LOCAL_RUN_DIR / f"val_cal_scale_e{MAX_EPOCHS}_{RUN_SUFFIX}.json"
+        if cand.exists():
+            with open(cand, "r") as f:
+                return float(_json.load(f).get("scale", 1.0))
+        files = sorted(LOCAL_RUN_DIR.glob("val_cal_scale_*.json"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        if files:
+            with open(files[0], "r") as f:
+                return float(_json.load(f).get("scale", 1.0))
+    except Exception as e:
+        print(f"[WARN] Could not load validation calibration scale: {e}")
+    return None
 
 
 from pytorch_forecasting.metrics import QuantileLoss, MultiLoss
@@ -744,7 +906,7 @@ class LabelSmoothedBCEWithBrier(nn.Module):
     targets as the BCE term for consistency. Set brier_weight=0 to
     recover plain label-smoothed BCE.
     """
-    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.001, brier_weight: float = 0.18):
+    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.001, brier_weight: float = 0.15):
         super().__init__()
         self.smoothing = float(smoothing)
         self.register_buffer("pos_weight", torch.tensor(pos_weight))
@@ -1067,6 +1229,16 @@ class PerAssetMetrics(pl.Callback):
         g_cpu  = g.detach().cpu()
         yd_cpu = yd.detach().cpu() if yd is not None else None
         pdir_cpu = pdir.detach().cpu() if pdir is not None else None
+    
+
+        # Compute and persist global validation calibration scale (QLIKE-optimal)
+        try:
+            s = compute_global_scale(y_cpu, p_cpu)
+            global GLOBAL_CAL_SCALE
+            GLOBAL_CAL_SCALE = float(s)
+            _save_val_cal_scale(GLOBAL_CAL_SCALE)
+        except Exception as _e:
+            print(f"[WARN] Could not compute/save validation calibration scale: {_e}")
 
         # Calibration diagnostic (not used in loss)
         try:
@@ -1078,6 +1250,27 @@ class PerAssetMetrics(pl.Callback):
             trainer.callback_metrics["val_mean_scale"] = torch.tensor(mean_scale)
         except Exception:
             pass
+
+        # --- Compute & save per-asset QLIKE-optimal scales s_a (validation only) ---
+        try:
+            assets = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
+            df_pa = pd.DataFrame({"asset": assets, "y": y_cpu.numpy(), "p": p_cpu.numpy()})
+            scales = {}
+            eps = 1e-12
+            for a, gdf in df_pa.groupby("asset", sort=False):
+                y_a = torch.tensor(gdf["y"].values, dtype=torch.float32)
+                p_a = torch.tensor(gdf["p"].values, dtype=torch.float32)
+                if len(gdf) == 0:
+                    continue
+                s2 = torch.clamp((torch.clamp(y_a.abs(), min=eps) ** 2).mean() /
+                                (torch.clamp(p_a.abs(), min=eps) ** 2).mean(), min=eps)
+                scales[str(a)] = float(torch.sqrt(s2).item())
+            if scales:
+                global PER_ASSET_CAL_SCALES
+                PER_ASSET_CAL_SCALES = scales
+                _save_val_per_asset_scales(scales)
+        except Exception as e:
+            print(f"[WARN] per-asset scale computation failed: {e}")
 
         # --- Decoded regression metrics (overall) ---
         eps = 1e-8
@@ -1091,13 +1284,21 @@ class PerAssetMetrics(pl.Callback):
         ratio    = sigma2_y / sigma2_p
         overall_qlike = float((ratio - torch.log(ratio) - 1.0).mean().item())
 
-        # Calibrated QLIKE (diagnostic only; not used for scheduling)
+        # --- Calibrated regression metrics (overall) ---
+        overall_mae_cal = None
+        overall_mse_cal = None
+        overall_rmse_cal = None
+        overall_qlike_cal = None if 'overall_qlike_cal' not in locals() else overall_qlike_cal
         try:
-            p_cal = calibrate_vol_predictions(y_cpu, p_cpu)
+            if 'p_cal' not in locals():
+                p_cal = calibrate_vol_predictions(y_cpu, p_cpu)
+            diff_cal = (p_cal - y_cpu)
+            overall_mae_cal  = float(diff_cal.abs().mean().item())
+            overall_mse_cal  = float((diff_cal ** 2).mean().item())
+            overall_rmse_cal = float(overall_mse_cal ** 0.5)
             sigma2_pc = torch.clamp(p_cal.abs(), min=eps) ** 2
             ratio_cal = sigma2_y / sigma2_pc
             overall_qlike_cal = float((ratio_cal - torch.log(ratio_cal) - 1.0).mean().item())
-            trainer.callback_metrics["val_qlike_cal"] = torch.tensor(overall_qlike_cal)
         except Exception as _e:
             pass
 
@@ -1152,8 +1353,15 @@ class PerAssetMetrics(pl.Callback):
         trainer.callback_metrics["val_rmse_overall"]      = torch.tensor(overall_rmse)
         trainer.callback_metrics["val_mse_overall"]       = torch.tensor(overall_mse)
         trainer.callback_metrics["val_qlike_overall"]     = torch.tensor(overall_qlike)
-        trainer.callback_metrics["val_qlike_cal"]     = torch.tensor(overall_qlike_cal)
+        trainer.callback_metrics["val_qlike_cal"]         = torch.tensor(overall_qlike_cal)
         trainer.callback_metrics["val_N_overall"]         = torch.tensor(float(N))
+        # Add calibrated metrics to callback_metrics if available
+        if overall_mae_cal is not None:
+            trainer.callback_metrics['val_mae_cal']   = torch.tensor(overall_mae_cal)
+            trainer.callback_metrics['val_mse_cal']   = torch.tensor(overall_mse_cal)
+            trainer.callback_metrics['val_rmse_cal']  = torch.tensor(overall_rmse_cal)
+        if overall_qlike_cal is not None:
+            trainer.callback_metrics['val_qlike_cal'] = torch.tensor(overall_qlike_cal)
 
         msg = (
             f"[VAL EPOCH {epoch_num}] "
@@ -1161,7 +1369,7 @@ class PerAssetMetrics(pl.Callback):
             f"RMSE={overall_rmse:.6f} "
             f"MSE={overall_mse:.6f} "
             f"QLIKE={overall_qlike:.6f} "
-            f"CompLoss = {val_comp:.6f}"
+            f"CompLoss = {val_comp:.6f} "
             + (f"QLIKE_CAL={overall_qlike_cal:.6f} " if overall_qlike_cal is not None else "")
             + (f" | ACC={acc:.3f}"   if acc   is not None else "")
             + (f" | Brier={brier:.4f}" if brier is not None else "")
@@ -1169,6 +1377,17 @@ class PerAssetMetrics(pl.Callback):
             + f" | N={N}"
         )
         print(msg)
+        # Print calibrated summary on a separate line for clarity
+        if overall_mae_cal is not None and overall_qlike_cal is not None:
+            msg_cal = (
+                f"[VAL EPOCH {epoch_num}] CALIBRATED "
+                f"MAE={overall_mae_cal:.6f} "
+                f"RMSE={overall_rmse_cal:.6f} "
+                f"MSE={overall_mse_cal:.6f} "
+                f"QLIKE={overall_qlike_cal:.6f} "
+                f"| N={N}"
+            )
+            print(msg_cal)
 
         # --- Per-asset metrics table (so on_fit_end can print it) ---
         self._last_rows = []
@@ -1214,6 +1433,26 @@ class PerAssetMetrics(pl.Callback):
 
                 rows.append((a, mae_a, rmse_a, mse_a, qlike_a, acc_a, n_a))
 
+            # --- Compute per-asset QLIKE-optimal multiplicative scales and persist ---
+            try:
+                pa_scales = {}
+                for a, gdf in dfm.groupby("asset", sort=False):
+                    y_a = torch.tensor(gdf["y"].values, dtype=torch.float32)
+                    p_a = torch.tensor(gdf["p"].values, dtype=torch.float32)
+                    if y_a.numel() == 0 or p_a.numel() == 0:
+                        continue
+                    s2y = torch.clamp(y_a.abs(), min=eps) ** 2
+                    s2p = torch.clamp(p_a.abs(), min=eps) ** 2
+                    s2  = s2y.mean() / s2p.mean()
+                    s   = float(torch.sqrt(torch.clamp(s2, min=eps)).item())
+                    pa_scales[str(a)] = s
+                if pa_scales:
+                    global PER_ASSET_CAL_SCALES
+                    PER_ASSET_CAL_SCALES = pa_scales
+                    _save_val_per_asset_scales(pa_scales)
+            except Exception as _e:
+                print(f"[WARN] Could not compute/save per-asset scales: {_e}")
+
             # sort by sample count (desc) so “top by samples” prints nicely
             rows.sort(key=lambda r: r[6], reverse=True)
             self._last_rows = rows
@@ -1244,6 +1483,11 @@ class PerAssetMetrics(pl.Callback):
             "dir_bce": brier,   # (kept for backwards compatibility with your saver)
             "yd": yd_cpu,
             "pd": pdir_cpu,
+            # calibrated (if available)
+            "mae_cal": overall_mae_cal,
+            "rmse_cal": overall_rmse_cal,
+            "mse_cal": overall_mse_cal,
+            "qlike_cal": overall_qlike_cal,
         }
 
     @torch.no_grad()
@@ -1253,7 +1497,14 @@ class PerAssetMetrics(pl.Callback):
         rows = self._last_rows
         overall = self._last_overall
         print("\nOverall decoded metrics (final):")
-        print(f"MAE: {overall['mae']:.6f} | RMSE: {overall['rmse']:.6f} | MSE: {overall['mse']:.6f} | QLIKE: {overall['qlike']:.6f}")
+        print(f"UNCAL — MAE: {overall['mae']:.6f} | RMSE: {overall['rmse']:.6f} | MSE: {overall['mse']:.6f} | QLIKE: {overall['qlike']:.6f}")
+        # If calibrated fields were stored in overall dict by on_validation_epoch_end, print them too
+        mae_cal  = overall.get('mae_cal', None)
+        rmse_cal = overall.get('rmse_cal', None)
+        mse_cal  = overall.get('mse_cal', None)
+        ql_cal   = overall.get('qlike_cal', None)
+        if mae_cal is not None and ql_cal is not None:
+            print(f"CALIB — MAE: {mae_cal:.6f} | RMSE: {rmse_cal:.6f} | MSE: {mse_cal:.6f} | QLIKE: {ql_cal:.6f}")
 
         print("\nPer-asset validation metrics (top by samples):")
         print("asset | MAE | RMSE | MSE | QLIKE | ACC | N")
@@ -1325,7 +1576,6 @@ class PerAssetMetrics(pl.Callback):
                 yv_dec = self.vol_norm.decode(yv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
                 pv_dec = self.vol_norm.decode(pv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
                 # Apply the same calibration used in metrics so saved preds match the plots
-                pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
                 # map group id -> name
                 assets = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
                 # time index (may be missing)
@@ -1390,6 +1640,26 @@ class PerAssetMetrics(pl.Callback):
                     upload_file_to_gcs(str(pred_path), f"{GCS_OUTPUT_PREFIX}/{pred_path.name}")
                 except Exception as e:
                     print(f"[WARN] Could not upload validation predictions: {e}")
+                # Also save a calibrated version (no look-ahead; uses validation-derived scale)
+                try:
+                    s = GLOBAL_CAL_SCALE if (GLOBAL_CAL_SCALE is not None) else _load_val_cal_scale()
+                    if s is not None:
+                        df_cal = df_out.copy()
+                        # apply scalar to predicted vols only
+                        df_cal["y_vol_pred"] = (
+                            torch.tensor(df_cal["y_vol_pred"].values) * float(s)
+                        ).numpy().tolist()
+                        cal_path = LOCAL_OUTPUT_DIR / f"calibrated_validation_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+                        df_cal.to_parquet(cal_path, index=False)
+                        print(f"✓ Saved calibrated validation predictions (Parquet) → {cal_path}")
+                        try:
+                            upload_file_to_gcs(str(cal_path), f"{GCS_OUTPUT_PREFIX}/{cal_path.name}")
+                        except Exception as e:
+                            print(f"[WARN] Could not upload calibrated validation predictions: {e}")
+                    else:
+                        print("[WARN] No validation calibration scale available; skipping calibrated_validation parquet.")
+                except Exception as e:
+                    print(f"[WARN] Could not save calibrated validation predictions: {e}")
         except Exception as e:
             print(f"[WARN] Could not save validation predictions: {e}")
 
@@ -2089,7 +2359,7 @@ class ReduceLROnPlateauCallback(pl.Callback):
 
 VOL_LOSS = AsymmetricQuantileLoss(
     quantiles=VOL_QUANTILES,
-    underestimation_factor=1.00,  # managed by BiasWarmupCallback
+    underestimation_factor=1.0,  # managed by BiasWarmupCallback
     mean_bias_weight=0.01,        # small centering on the median for MAE
     tail_q=0.85,
     tail_weight=1.0,              # will be ramped by TailWeightRamp
@@ -2100,13 +2370,13 @@ VOL_LOSS = AsymmetricQuantileLoss(
 EXTRA_CALLBACKS = [
       BiasWarmupCallback(
           vol_loss=VOL_LOSS,
-          target_under=1.03,
-          target_mean_bias=0.04,
-          warmup_epochs=6,
-          qlike_target_weight=0.03,   # keep out of the loss; diagnostics only
+          target_under=1.0,
+          target_mean_bias=0.0,
+          warmup_epochs=9,
+          qlike_target_weight=0.0,   # keep out of the loss; diagnostics only
           start_mean_bias=0.0,
           mean_bias_ramp_until=12,
-          guard_patience=getattr(ARGS, "warmup_guard_patience", 1),
+          guard_patience=getattr(ARGS, "warmup_guard_patience", 100),
           guard_tol=getattr(ARGS, "warmup_guard_tol", 0.0),
           alpha_step=0.02,
       ),
@@ -3149,7 +3419,7 @@ if __name__ == "__main__":
     pos_weight = float(n_neg / n_pos)
 
     # then build the loss with:
-    DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.02, pos_weight=pos_weight)
+    DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.1, pos_weight=pos_weight)
 
 
     FIXED_VOL_WEIGHT = 1.0
