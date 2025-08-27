@@ -941,6 +941,7 @@ class PerAssetMetrics(pl.Callback):
         trainer.callback_metrics["val_rmse_overall"]      = torch.tensor(overall_rmse)
         trainer.callback_metrics["val_mse_overall"]       = torch.tensor(overall_mse)
         trainer.callback_metrics["val_qlike_overall"]     = torch.tensor(overall_qlike)
+        trainer.callback_metrics["val_qlike_overall"]     = torch.tensor(overall_qlike_cal)
         trainer.callback_metrics["val_N_overall"]         = torch.tensor(float(N))
 
         msg = (
@@ -1842,6 +1843,7 @@ class ValLossHistory(pl.Callback):
             "epoch": int(getattr(trainer, "current_epoch", -1)) + 1,
             "val_loss":            self._as_float(m.get("val_loss", float("nan"))),
             "val_qlike_overall":   self._as_float(m.get("val_qlike_overall", float("nan"))),
+            "val_qlike_cal":      self._as_float(m.get("val_qlike_cal", float("nan"))),
             "val_mae_overall":     self._as_float(m.get("val_mae_overall", float("nan"))),
             "val_rmse_overall":    self._as_float(m.get("val_rmse_overall", float("nan"))),
             "val_acc_overall":     self._as_float(m.get("val_acc_overall", float("nan"))),
