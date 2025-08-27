@@ -647,38 +647,44 @@ def safe_decode_vol(y: torch.Tensor, normalizer, group_ids: torch.Tensor | None)
     return manual_inverse_transform_groupnorm(normalizer, y, group_ids)
 
 
-# ---------------- Regime-dependent calibration helper ----------------
+# ---------------- Global QLIKE‑optimal calibration helper ----------------
 @torch.no_grad()
 def calibrate_vol_predictions(y_true_dec: torch.Tensor, y_pred_dec: torch.Tensor) -> torch.Tensor:
     """
-    Simple 2‑regime multiplicative calibration computed on validation targets.
-    We match the mean in the bottom and top terciles separately to stretch tails
-    (helps when predictions are cramped at the low end).
+    Global QLIKE‑optimal multiplicative calibration.
+
+    Given decoded targets y and predictions p, choose a single scalar s that minimises
+        E[ (σ_y^2 / (s^2 σ_p^2)) - log(σ_y^2 / (s^2 σ_p^2)) - 1 ].
+    The optimum satisfies s^2 = E[σ_y^2] / E[σ_p^2], where σ_x^2 ≡ |x|^2.
+
+    Returns p * s with shape preserved. No piece‑wise/tercile scaling.
     """
-    # ensure 1D
+    # Basic guards
+    if y_true_dec is None or y_pred_dec is None:
+        return y_pred_dec
+
+    # Flatten to 1D on a working dtype; keep device
     y = y_true_dec.reshape(-1)
-    p = y_pred_dec.reshape(-1).clone()
+    p = y_pred_dec.reshape(-1)
     if y.numel() == 0 or p.numel() == 0:
         return y_pred_dec
 
-    # compute terciles
-    q33, q66 = torch.quantile(y, torch.tensor([0.33, 0.66], device=y.device))
-    low_mask = y <= q33
-    high_mask = y >= q66
+    # Work in float32 for numerical stability, keep device
+    device = y.device
+    y32 = y.to(dtype=torch.float32, device=device)
+    p32 = p.to(dtype=torch.float32, device=device)
 
-    def _apply(mask: torch.Tensor):
-        if mask is None or mask.sum() == 0:
-            return
-        yp = p[mask].mean()
-        yt = y[mask].mean()
-        if torch.isfinite(yp) and torch.isfinite(yt) and float(torch.abs(yp)) > 1e-12:
-            s = (yt / yp).clamp(0.5, 2.0)
-            p[mask] = p[mask] * s
+    # QLIKE‑optimal global scale: s^2 = E[|y|^2] / E[|p|^2]
+    eps = 1e-12
+    sigma2_y = torch.clamp(y32.abs(), min=eps) ** 2
+    sigma2_p = torch.clamp(p32.abs(), min=eps) ** 2
+    s2_opt = sigma2_y.mean() / sigma2_p.mean()
+    s = torch.sqrt(torch.clamp(s2_opt, min=eps))
 
-    _apply(low_mask)
-    _apply(high_mask)
-
-    return p.view_as(y_pred_dec)
+    # Apply and restore original shape/dtype
+    p_cal32 = p32 * s
+    p_cal = p_cal32.to(dtype=y_pred_dec.dtype)
+    return p_cal.view_as(y_pred_dec)
 
 if not hasattr(GroupNormalizer, "decode"):
     def _gn_decode(self, y, group_ids=None, **kwargs):
