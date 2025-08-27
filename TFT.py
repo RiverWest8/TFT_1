@@ -941,7 +941,7 @@ class PerAssetMetrics(pl.Callback):
         trainer.callback_metrics["val_rmse_overall"]      = torch.tensor(overall_rmse)
         trainer.callback_metrics["val_mse_overall"]       = torch.tensor(overall_mse)
         trainer.callback_metrics["val_qlike_overall"]     = torch.tensor(overall_qlike)
-        trainer.callback_metrics["val_qlike_overall"]     = torch.tensor(overall_qlike_cal)
+        trainer.callback_metrics["val_qlike_cal"]     = torch.tensor(overall_qlike_cal)
         trainer.callback_metrics["val_N_overall"]         = torch.tensor(float(N))
 
         msg = (
