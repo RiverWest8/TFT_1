@@ -2842,15 +2842,11 @@ if __name__ == "__main__":
     # ----------------------------
     # Trainer instance
     # ----------------------------
-    checkpoint_callback = ModelCheckpoint(
-            dirpath=str(LOCAL_OUTPUT_DIR),
-            filename="tft-{epoch:02d}-val_qlike_overall={val_qlike_overall:.4f}",
-            monitor="val_qlike_overall",      # or val_qlike_overall if you want
-            save_top_k=1,            # keep best only
-            save_last = True,
-            auto_insert_metric_name=False,
-            mode="min",              # because lower val_loss is better
-        )
+        # Reuse the ModelCheckpoint created in EXTRA_CALLBACKS to avoid duplicates
+    from lightning.pytorch.callbacks import ModelCheckpoint as _LC_ModelCheckpoint
+    primary_ckpt_cb = next((cb for cb in EXTRA_CALLBACKS if isinstance(cb, _LC_ModelCheckpoint)), None)
+    checkpoint_callback = primary_ckpt_cb
+
     trainer = Trainer(
         accelerator=ACCELERATOR,
         devices=DEVICES,
@@ -2859,7 +2855,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[TQDMProgressBar(refresh_rate=50), es_cb, metrics_cb, mirror_cb, lr_cb, val_hist_cb, checkpoint_callback] + EXTRA_CALLBACKS,
+        callbacks=[TQDMProgressBar(refresh_rate=50), es_cb, metrics_cb, mirror_cb,checkpoint_callback, lr_cb, val_hist_cb] + EXTRA_CALLBACKS,
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
         enable_progress_bar=True,
