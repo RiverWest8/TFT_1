@@ -1396,6 +1396,7 @@ class BiasWarmupCallback(pl.Callback):
     • EMA of mean(y)/mean(p) steers underestimation bias (alpha).
     • Warm-ups are frozen if validation worsens for `guard_patience` epochs.
     • QLIKE ramps only when scale is near 1 to avoid fighting calibration.
+    scale_ema_alpha (default 0.6) controls how quickly the EMA of mean(y)/mean(p) adapts; higher values react faster.
     """
     def __init__(
         self,
@@ -1409,6 +1410,7 @@ class BiasWarmupCallback(pl.Callback):
         guard_patience: int = 2,
         guard_tol: float = 0.0,
         alpha_step: float = 0.05,
+        scale_ema_alpha: float = 0.6,
     ):
         super().__init__()
         self._vol_loss_hint = vol_loss
@@ -1421,6 +1423,7 @@ class BiasWarmupCallback(pl.Callback):
         self.guard_patience = int(max(1, guard_patience))
         self.guard_tol = float(guard_tol)
         self.alpha_step = float(alpha_step)
+        self.scale_ema_alpha = float(max(1e-6, min(1.0, scale_ema_alpha)))
 
         self._scale_ema = None
         self._prev_val = None
@@ -1462,6 +1465,16 @@ class BiasWarmupCallback(pl.Callback):
         if self._worse_streak == 0:  # improved or equal
             self._frozen = False
 
+        # Fast EMA update using the latest validation mean scale (speeds convergence)
+        try:
+            vms = trainer.callback_metrics.get("val_mean_scale", None)
+            if vms is not None:
+                s = float(vms.item() if hasattr(vms, "item") else vms)
+                a = getattr(self, "scale_ema_alpha", 0.6)
+                self._scale_ema = s if (self._scale_ema is None) else (1.0 - a) * self._scale_ema + a * s
+        except Exception:
+            pass
+
     def on_train_epoch_start(self, trainer, pl_module):
         # Global CLI switch: if --disable_warmups is true, do nothing
         try:
@@ -1485,7 +1498,8 @@ class BiasWarmupCallback(pl.Callback):
             pass
 
         if scale is not None:
-            self._scale_ema = scale if self._scale_ema is None else 0.8 * self._scale_ema + 0.2 * scale
+            a = getattr(self, "scale_ema_alpha", 0.7)
+            self._scale_ema = scale if self._scale_ema is None else (1.0 - a) * self._scale_ema + a * scale
 
         e = int(getattr(trainer, "current_epoch", 0))
         prog = min(1.0, float(e) / float(max(self.warm, 1)))
@@ -1520,7 +1534,7 @@ class BiasWarmupCallback(pl.Callback):
         if hasattr(vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
             q_target = float(self.qlike_target_weight)
             q_prog = min(1.0, float(e) / float(max(self.warm, 8)))
-            near_ok = (self._scale_ema is None) or (0.9 <= self._scale_ema <= 1.1)
+            near_ok = (self._scale_ema is None) or (0.85 <= self._scale_ema <= 1.15)
             vol_loss.qlike_weight = (q_target * q_prog) if near_ok else 0.0
 
         try:
@@ -2080,15 +2094,15 @@ VOL_LOSS = AsymmetricQuantileLoss(
 EXTRA_CALLBACKS = [
       BiasWarmupCallback(
           vol_loss=VOL_LOSS,
-          target_under=1.09,
+          target_under=1.03,
           target_mean_bias=0.04,
           warmup_epochs=6,
-          qlike_target_weight=0.0,   # keep out of the loss; diagnostics only
+          qlike_target_weight=0.03,   # keep out of the loss; diagnostics only
           start_mean_bias=0.0,
           mean_bias_ramp_until=12,
-          guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
+          guard_patience=getattr(ARGS, "warmup_guard_patience", 1),
           guard_tol=getattr(ARGS, "warmup_guard_tol", 0.0),
-          alpha_step=0.03,
+          alpha_step=0.02,
       ),
       TailWeightRamp(
           vol_loss=VOL_LOSS,
@@ -2112,7 +2126,7 @@ EXTRA_CALLBACKS = [
           save_last=True,
       ),
       StochasticWeightAveraging(swa_lrs = 0.00091, swa_epoch_start=max(1, int(0.8 * MAX_EPOCHS))),
-      CosineLR(start_epoch=8, eta_min_ratio=1e-5, hold_last_epochs=2, warmup_steps=0),
+      CosineLR(start_epoch=8, eta_min_ratio=5e-6, hold_last_epochs=2, warmup_steps=0),
   ]
 
 class ValLossHistory(pl.Callback):
@@ -2584,7 +2598,7 @@ def _evaluate_decoded_metrics(
     # decode realised_vol
     y_dec = safe_decode_vol(y_all.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
     p_dec = safe_decode_vol(p_all.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
-    floor_val = globals().get("EVAL_VOL_FLOOR", 1e-6)
+    floor_val = globals().get("EVAL_VOL_FLOOR", 2e-6)
     y_dec = torch.clamp(y_dec, min=floor_val)
     p_dec = torch.clamp(p_dec, min=floor_val)
 
