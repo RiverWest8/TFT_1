@@ -3488,15 +3488,10 @@ try:
     pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
     df_test_preds.to_parquet(pred_path, index=False)
     print(f"✓ Saved TEST predictions → {pred_path}")
+    print("Generating test predictions from best checkpoint …")
     try:
-        upload_file_to_gcs(str(pred_path), f"{GCS_OUTPUT_PREFIX}/{pred_path.name}")
+        test_pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_best_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+        _save_predictions_from_best(trainer, test_dataloader, "test", test_pred_path)
     except Exception as e:
-        print(f"[WARN] Could not upload test predictions: {e}")
-
-print("Generating test predictions from best checkpoint …")
-try:
-    test_pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_best_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
-    _save_predictions_from_best(trainer, test_dataloader, "test", test_pred_path)
-except Exception as e:
-    print(f"[WARN] Failed to save test predictions: {e}")
-    
+        print(f"[WARN] Failed to save test predictions: {e}")
+        
