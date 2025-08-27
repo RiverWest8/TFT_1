@@ -1266,7 +1266,6 @@ class PerAssetMetrics(pl.Callback):
                                 (torch.clamp(p_a.abs(), min=eps) ** 2).mean(), min=eps)
                 scales[str(a)] = float(torch.sqrt(s2).item())
             if scales:
-                global PER_ASSET_CAL_SCALES
                 PER_ASSET_CAL_SCALES = scales
                 _save_val_per_asset_scales(scales)
         except Exception as e:
@@ -1447,15 +1446,58 @@ class PerAssetMetrics(pl.Callback):
                     s   = float(torch.sqrt(torch.clamp(s2, min=eps)).item())
                     pa_scales[str(a)] = s
                 if pa_scales:
-                    global PER_ASSET_CAL_SCALES
                     PER_ASSET_CAL_SCALES = pa_scales
                     _save_val_per_asset_scales(pa_scales)
             except Exception as _e:
                 print(f"[WARN] Could not compute/save per-asset scales: {_e}")
 
+            # --- Calibrated per-asset metrics (use per-asset s_a if available, else global s) ---
+            rows_cal = []
+            try:
+                # Load scales computed earlier this epoch or from disk
+                s_global = None
+                try:
+                    s_global = GLOBAL_CAL_SCALE if (GLOBAL_CAL_SCALE is not None) else _load_val_cal_scale()
+                except Exception:
+                    s_global = None
+                try:
+                    pa_scales_loaded = PER_ASSET_CAL_SCALES if (PER_ASSET_CAL_SCALES is not None) else _load_val_per_asset_scales()
+                except Exception:
+                    pa_scales_loaded = None
+                if pa_scales_loaded is not None:
+                    pa_scales_loaded = {str(k): float(v) for k, v in pa_scales_loaded.items()}
+
+                eps_local = 1e-8
+                for a, gdf in dfm.groupby("asset", sort=False):
+                    y_a = torch.tensor(gdf["y"].values)
+                    p_a = torch.tensor(gdf["p"].values)
+                    n_a = int(len(gdf))
+                    # Choose scale: per-asset first, else global, else 1.0
+                    s_a = 1.0
+                    if pa_scales_loaded is not None and str(a) in pa_scales_loaded:
+                        s_a = float(pa_scales_loaded[str(a)])
+                    elif s_global is not None:
+                        s_a = float(s_global)
+                    p_ac = p_a * s_a
+                    diff_c = (p_ac - y_a)
+                    mae_c = float(diff_c.abs().mean().item())
+                    mse_c = float((diff_c ** 2).mean().item())
+                    rmse_c = float(mse_c ** 0.5)
+
+                    s2pc = torch.clamp(torch.tensor(np.abs(p_ac.numpy())), min=eps_local) ** 2
+                    s2yc = torch.clamp(torch.tensor(np.abs(y_a.numpy())),  min=eps_local) ** 2
+                    ratio_c = s2yc / s2pc
+                    qlike_c = float((ratio_c - torch.log(ratio_c) - 1.0).mean().item())
+
+                    rows_cal.append((a, mae_c, rmse_c, mse_c, qlike_c, n_a))
+            except Exception as _e:
+                print(f"[WARN] per-asset calibrated metrics failed: {_e}")
+
             # sort by sample count (desc) so “top by samples” prints nicely
             rows.sort(key=lambda r: r[6], reverse=True)
+            # Store both uncalibrated and calibrated for on_fit_end
             self._last_rows = rows
+            self._last_rows_cal = rows_cal if 'rows_cal' in locals() else []
 
             # --- Per-epoch per-asset snapshot (top by samples) ---
             try:
@@ -1468,6 +1510,18 @@ class PerAssetMetrics(pl.Callback):
                         print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {acc_str} | {r[6]}")
             except Exception as _e:
                 print(f"[WARN] per-epoch per-asset print failed: {_e}")
+
+            # --- Calibrated per-epoch per-asset snapshot (top by samples) ---
+            try:
+                if rows_cal:
+                    rows_cal.sort(key=lambda r: r[5], reverse=True)
+                    k = min(5, getattr(self, "max_print", 5))
+                    print("Per-asset (CALIBRATED snapshot, top by samples):")
+                    print("asset | MAE | RMSE | MSE | QLIKE | N")
+                    for r in rows_cal[:k]:
+                        print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {r[5]}")
+            except Exception as _e:
+                print(f"[WARN] per-epoch per-asset calibrated print failed: {_e}")
 
         except Exception as e:
             print(f"[WARN] per-asset aggregation failed: {e}")
@@ -1511,6 +1565,17 @@ class PerAssetMetrics(pl.Callback):
         for r in rows[: self.max_print]:
             acc_str = "-" if r[5] is None else f"{r[5]:.3f}"
             print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {acc_str} | {r[6]}")
+
+        # Calibrated per-asset table at fit end (if available)
+        try:
+            rows_cal = getattr(self, "_last_rows_cal", [])
+            if rows_cal:
+                print("\nPer-asset validation metrics (CALIBRATED, top by samples):")
+                print("asset | MAE | RMSE | MSE | QLIKE | N")
+                for r in rows_cal[: self.max_print]:
+                    print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {r[5]}")
+        except Exception as _e:
+            print(f"[WARN] Could not print calibrated per-asset metrics at end: {_e}")
 
         dir_overall = None
         yd = overall.get("yd", None)
