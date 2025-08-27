@@ -740,7 +740,7 @@ def calibrate_vol_predictions(y_true_dec: torch.Tensor, y_pred_dec: torch.Tensor
 
     Given decoded targets y and predictions p, choose a single scalar s that minimises
         E[ (σ_y^2 / (s^2 σ_p^2)) - log(σ_y^2 / (s^2 σ_p^2)) - 1 ].
-    The optimum satisfies s^2 = E[σ_y^2] / E[σ_p^2], where σ_x^2 ≡ |x|^2.
+    QLIKE-optimal constant scale satisfies E[y^2/(s^2 p^2)] = 1 ⇒ s^2 = E[y^2/p^2].
 
     Returns p * s with shape preserved. No piece‑wise/tercile scaling.
     """
@@ -759,11 +759,14 @@ def calibrate_vol_predictions(y_true_dec: torch.Tensor, y_pred_dec: torch.Tensor
     y32 = y.to(dtype=torch.float32, device=device)
     p32 = p.to(dtype=torch.float32, device=device)
 
-    # QLIKE‑optimal global scale: s^2 = E[|y|^2] / E[|p|^2]
+    # QLIKE‑optimal global scale: s^2 = E[ |y|^2 / |p|^2 ]
     eps = 1e-12
     sigma2_y = torch.clamp(y32.abs(), min=eps) ** 2
     sigma2_p = torch.clamp(p32.abs(), min=eps) ** 2
-    s2_opt = sigma2_y.mean() / sigma2_p.mean()
+    ratio = sigma2_y / sigma2_p
+    # Robustify with mild winsorization to avoid exploding scales early in training
+    r_clamped = torch.clamp(ratio, min=1e-6, max=1e6)
+    s2_opt = r_clamped.mean()
     s = torch.sqrt(torch.clamp(s2_opt, min=eps))
 
     # Apply and restore original shape/dtype
@@ -839,7 +842,8 @@ def _load_val_per_asset_scales() -> dict | None:
 @torch.no_grad()
 def compute_global_scale(y_true_dec: torch.Tensor, y_pred_dec: torch.Tensor, eps: float = 1e-12) -> float:
     """Return QLIKE-optimal multiplicative scale s for decoded vols.
-    s^2 = E[y^2] / E[p^2]. Works on any device/dtype; returns python float.
+    For constant scaling, the optimum satisfies E[y^2/(s^2 p^2)] = 1 ⇒ s^2 = E[y^2/p^2].
+    Works on any device/dtype; returns python float.
     """
     if y_true_dec is None or y_pred_dec is None:
         return 1.0
@@ -849,8 +853,11 @@ def compute_global_scale(y_true_dec: torch.Tensor, y_pred_dec: torch.Tensor, eps
         return 1.0
     y32 = y.to(dtype=torch.float32)
     p32 = p.to(dtype=torch.float32)
-    s2 = torch.clamp((torch.clamp(y32.abs(), min=eps) ** 2).mean() /
-                     (torch.clamp(p32.abs(), min=eps) ** 2).mean(), min=eps)
+    sigma2_y = torch.clamp(y32.abs(), min=eps) ** 2
+    sigma2_p = torch.clamp(p32.abs(), min=eps) ** 2
+    ratio = sigma2_y / sigma2_p
+    r_clamped = torch.clamp(ratio, min=1e-6, max=1e6)
+    s2 = torch.clamp(r_clamped.mean(), min=eps)
     return float(torch.sqrt(s2).item())
 
 import json as _json
@@ -1247,6 +1254,12 @@ class PerAssetMetrics(pl.Callback):
             mean_scale = float("nan")
         print(f"[CAL DEBUG] mean(y)/mean(p)={mean_scale:.4f} (1==perfect)")
         try:
+            import math
+            ratio_y2_p2 = float(((y_cpu.abs()**2) / (torch.clamp(p_cpu.abs(), min=1e-12)**2)).mean().item())
+            print(f"[CAL DEBUG] mean(y^2/p^2)={ratio_y2_p2:.4f}  → s* = sqrt(mean(y^2/p^2))={math.sqrt(ratio_y2_p2):.4f}")
+        except Exception:
+            pass
+        try:
             trainer.callback_metrics["val_mean_scale"] = torch.tensor(mean_scale)
         except Exception:
             pass
@@ -1262,8 +1275,11 @@ class PerAssetMetrics(pl.Callback):
                 p_a = torch.tensor(gdf["p"].values, dtype=torch.float32)
                 if len(gdf) == 0:
                     continue
-                s2 = torch.clamp((torch.clamp(y_a.abs(), min=eps) ** 2).mean() /
-                                (torch.clamp(p_a.abs(), min=eps) ** 2).mean(), min=eps)
+                s2y = torch.clamp(y_a.abs(), min=eps) ** 2
+                s2p = torch.clamp(p_a.abs(), min=eps) ** 2
+                ratio = s2y / s2p
+                ratio = torch.clamp(ratio, min=1e-6, max=1e6)
+                s2 = torch.clamp(ratio.mean(), min=eps)
                 scales[str(a)] = float(torch.sqrt(s2).item())
             if scales:
                 PER_ASSET_CAL_SCALES = scales
@@ -1442,8 +1458,10 @@ class PerAssetMetrics(pl.Callback):
                         continue
                     s2y = torch.clamp(y_a.abs(), min=eps) ** 2
                     s2p = torch.clamp(p_a.abs(), min=eps) ** 2
-                    s2  = s2y.mean() / s2p.mean()
-                    s   = float(torch.sqrt(torch.clamp(s2, min=eps)).item())
+                    ratio = s2y / s2p
+                    ratio = torch.clamp(ratio, min=1e-6, max=1e6)
+                    s2 = torch.clamp(ratio.mean(), min=eps)
+                    s  = float(torch.sqrt(s2).item())
                     pa_scales[str(a)] = s
                 if pa_scales:
                     PER_ASSET_CAL_SCALES = pa_scales
@@ -1472,7 +1490,7 @@ class PerAssetMetrics(pl.Callback):
                     y_a = torch.tensor(gdf["y"].values)
                     p_a = torch.tensor(gdf["p"].values)
                     n_a = int(len(gdf))
-                    # Choose scale: per-asset first, else global, else 1.0
+                    # Choose scale: per-asset first, else global, else 1.0 (s computed from mean(y^2/p^2))
                     s_a = 1.0
                     if pa_scales_loaded is not None and str(a) in pa_scales_loaded:
                         s_a = float(pa_scales_loaded[str(a)])
