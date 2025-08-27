@@ -2314,33 +2314,68 @@ def _evaluate_decoded_metrics(
 
     return float(mae), float(rmse), (float(brier) if brier is not None else float("nan")), float(qlike), int(y_dec.numel())
 
-# --- after trainer.fit(...), before running FI ---
 def _resolve_best_model(trainer, fallback):
-    # try any ModelCheckpoint attached to the trainer
+    """
+    Return the model loaded from the *best* checkpoint as determined by the
+    minimum `val_qlike_overall` recorded by a ModelCheckpoint callback.
+
+    Preference order:
+      1) ModelCheckpoint with monitor == 'val_qlike_overall' and a best_model_path
+      2) Any ModelCheckpoint that has a best_model_path
+      3) Newest local .ckpt in LOCAL_CKPT_DIR
+      4) GCS 'last.ckpt' or lexicographically latest in CKPT_GCS_PREFIX
+      5) Fallback to the in-memory model
+    """
     best_path = None
+    # ---- Prefer the val_qlike_overall monitor explicitly ----
     try:
         for cb in getattr(trainer, "callbacks", []):
-            if isinstance(cb, ModelCheckpoint) and getattr(cb, "best_model_path", ""):
-                best_path = cb.best_model_path
-                if best_path:
+            if isinstance(cb, ModelCheckpoint):
+                mon = getattr(cb, "monitor", None)
+                bmp = getattr(cb, "best_model_path", "")
+                if mon == "val_qlike_overall" and bmp:
+                    best_path = bmp
+                    break
+        # ---- Otherwise any checkpoint with a best path ----
+        if not best_path:
+            for cb in getattr(trainer, "callbacks", []):
+                if isinstance(cb, ModelCheckpoint) and getattr(cb, "best_model_path", ""):
+                    best_path = cb.best_model_path
                     break
     except Exception:
         pass
 
-    # fallback to newest local ckpt
+    # ---- Fallbacks: newest local ckpt, then GCS, else None ----
     if not best_path:
         try:
-            ckpts = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"),
-                           key=lambda p: p.stat().st_mtime, reverse=True)
+            ckpts = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
             if ckpts:
                 best_path = str(ckpts[0])
         except Exception:
             pass
+    if not best_path:
+        try:
+            if fs is not None:
+                last_uri = f"{CKPT_GCS_PREFIX}/last.ckpt"
+                if fs.exists(last_uri):
+                    dst = LOCAL_CKPT_DIR / "last.ckpt"
+                    with fsspec.open(last_uri, "rb") as f_in, open(dst, "wb") as f_out:
+                        shutil.copyfileobj(f_in, f_out)
+                    best_path = str(dst)
+                else:
+                    entries = fs.glob(f"{CKPT_GCS_PREFIX}/*.ckpt") or []
+                    if entries:
+                        latest = sorted(entries)[-1]
+                        dst = LOCAL_CKPT_DIR / Path(latest).name
+                        with fsspec.open(latest, "rb") as f_in, open(dst, "wb") as f_out:
+                            shutil.copyfileobj(f_in, f_out)
+                        best_path = str(dst)
+        except Exception as e:
+            print(f"[WARN] Could not fetch resume checkpoint from GCS: {e}")
 
-    # load or return the in-memory model
     if best_path:
         try:
-            print(f"Best checkpoint: {best_path}")
+            print(f"Best checkpoint (min val_qlike_overall): {best_path}")
             return TemporalFusionTransformer.load_from_checkpoint(best_path)
         except Exception as e:
             print(f"[WARN] load_from_checkpoint failed: {e}")
@@ -2842,10 +2877,6 @@ if __name__ == "__main__":
     # ----------------------------
     # Trainer instance
     # ----------------------------
-        # Reuse the ModelCheckpoint created in EXTRA_CALLBACKS to avoid duplicates
-    from lightning.pytorch.callbacks import ModelCheckpoint as _LC_ModelCheckpoint
-    primary_ckpt_cb = next((cb for cb in EXTRA_CALLBACKS if isinstance(cb, _LC_ModelCheckpoint)), None)
-    checkpoint_callback = primary_ckpt_cb
 
     trainer = Trainer(
         accelerator=ACCELERATOR,
@@ -2855,7 +2886,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[TQDMProgressBar(refresh_rate=50), es_cb, metrics_cb, mirror_cb,checkpoint_callback, lr_cb, val_hist_cb] + EXTRA_CALLBACKS,
+        callbacks=[TQDMProgressBar(refresh_rate=50), es_cb, metrics_cb, mirror_cb, lr_cb, val_hist_cb] + EXTRA_CALLBACKS,
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
         enable_progress_bar=True,
@@ -2889,6 +2920,18 @@ if __name__ == "__main__":
 
     # Train the model
     trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
+    # --- Evaluate using the best checkpoint (min val_qlike_overall) ---
+    try:
+        trainer.validate(ckpt_path="best", dataloaders=val_dataloader)
+    except Exception as _e:
+        print(f"[WARN] validate(ckpt_path='best') failed: {_e}; validating current weights instead.")
+        trainer.validate(dataloaders=val_dataloader)
+
+    try:
+        trainer.test(ckpt_path="best", dataloaders=test_dataloader)
+    except Exception as _e:
+        print(f"[WARN] test(ckpt_path='best') failed: {_e}; testing current weights instead.")
+        trainer.test(dataloaders=test_dataloader)
 
     # Resolve the best checkpoint
     model_for_fi = _resolve_best_model(trainer, fallback=tft)
