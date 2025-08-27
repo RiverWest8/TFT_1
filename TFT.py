@@ -423,6 +423,187 @@ def manual_inverse_transform_groupnorm(normalizer, y: torch.Tensor, group_ids: t
     return x.view_as(y)
 
 @torch.no_grad()
+def _get_best_ckpt_path(trainer) -> str | None:
+    """Return path to the best checkpoint chosen by `val_qlike_overall` if available.
+    Fallback to any `best_model_path`, else newest local .ckpt in LOCAL_CKPT_DIR.
+    """
+    best_path = None
+    try:
+        for cb in getattr(trainer, "callbacks", []):
+            if isinstance(cb, ModelCheckpoint):
+                mon = getattr(cb, "monitor", None)
+                bmp = getattr(cb, "best_model_path", "")
+                if mon == "val_qlike_overall" and bmp:
+                    return bmp
+        if not best_path:
+            for cb in getattr(trainer, "callbacks", []):
+                if isinstance(cb, ModelCheckpoint):
+                    bmp = getattr(cb, "best_model_path", "")
+                    if bmp:
+                        best_path = bmp
+                        break
+    except Exception:
+        pass
+    if best_path:
+        return best_path
+    try:
+        ckpts = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if ckpts:
+            return str(ckpts[0])
+    except Exception:
+        pass
+    return None
+
+
+@torch.no_grad()
+def _collect_predictions(model, dataloader, vol_normalizer, id_to_name: dict | None, out_path: Path | str | None):
+    """
+    Iterate a dataloader, run model in eval, extract:
+      • realised_vol median prediction (q=0.50) & target
+      • optional direction probability
+    Decode vol using `vol_normalizer`, clamp floors, and save to Parquet.
+    """
+    import pandas as pd
+
+    model.eval()
+    all_g, all_yv, all_pv, all_yd, all_pd, all_t = [], [], [], [], [], []
+
+    for batch in dataloader:
+        if not isinstance(batch, (list, tuple)):
+            continue
+        x = batch[0]
+        yb = batch[1] if len(batch) > 1 else None
+        if not isinstance(x, dict):
+            continue
+
+        # asset group ids
+        groups = None
+        for k in ("groups", "group_ids", "group_id"):
+            if k in x and x[k] is not None:
+                groups = x[k]; break
+        if groups is None:
+            continue
+        g = groups[0] if isinstance(groups, (list, tuple)) else groups
+        while torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
+            g = g.squeeze(-1)
+        if not torch.is_tensor(g):
+            continue
+
+        # targets from decoder or fallback batch[1]
+        dec_t = x.get("decoder_target")
+        y_vol_t, y_dir_t = None, None
+        if torch.is_tensor(dec_t):
+            y = dec_t
+            if y.ndim == 3 and y.size(-1) == 1: y = y[..., 0]
+            if y.ndim == 2 and y.size(1) >= 1:
+                y_vol_t = y[:, 0]
+                if y.size(1) > 1: y_dir_t = y[:, 1]
+        elif isinstance(dec_t, (list, tuple)) and len(dec_t) >= 1:
+            y_vol_t = dec_t[0]
+            if torch.is_tensor(y_vol_t):
+                if y_vol_t.ndim == 3 and y_vol_t.size(-1) == 1: y_vol_t = y_vol_t[..., 0]
+                if y_vol_t.ndim == 2 and y_vol_t.size(-1) == 1: y_vol_t = y_vol_t[:, 0]
+            if len(dec_t) > 1 and torch.is_tensor(dec_t[1]):
+                y_dir_t = dec_t[1]
+                if y_dir_t.ndim == 3 and y_dir_t.size(-1) == 1: y_dir_t = y_dir_t[..., 0]
+                if y_dir_t.ndim == 2 and y_dir_t.size(-1) == 1: y_dir_t = y_dir_t[:, 0]
+        if (y_vol_t is None) and torch.is_tensor(yb):
+            yy = yb
+            if yy.ndim == 3 and yy.size(1) == 1: yy = yy[:, 0, :]
+            if yy.ndim == 2 and yy.size(1) >= 1:
+                y_vol_t = yy[:, 0]
+                if yy.size(1) > 1: y_dir_t = yy[:, 1]
+        if y_vol_t is None:
+            continue
+
+        # forward
+        y_hat = model(x)
+        pred = getattr(y_hat, "prediction", y_hat)
+        if isinstance(pred, dict) and "prediction" in pred:
+            pred = pred["prediction"]
+        p_vol, p_dir = _extract_heads(pred)
+        if p_vol is None:
+            continue
+
+        L = g.shape[0]
+        all_g.append(g.reshape(L).detach().cpu())
+        all_yv.append(y_vol_t.reshape(L).detach().cpu())
+        all_pv.append(p_vol.reshape(L).detach().cpu())
+        if y_dir_t is not None and p_dir is not None:
+            all_yd.append(y_dir_t.reshape(-1)[:L].detach().cpu())
+            all_pd.append(p_dir.reshape(-1)[:L].detach().cpu())
+
+        dec_time = x.get("decoder_time_idx", None) or x.get("decoder_relative_idx", None)
+        if dec_time is not None and torch.is_tensor(dec_time):
+            tvec = dec_time
+            while tvec.ndim > 1 and tvec.size(-1) == 1:
+                tvec = tvec.squeeze(-1)
+            all_t.append(tvec.reshape(-1)[:L].detach().cpu())
+
+    if not all_g:
+        raise RuntimeError("No predictions collected — dataloader yielded no usable batches.")
+
+    g_cpu  = torch.cat(all_g)
+    yv_cpu = torch.cat(all_yv)
+    pv_cpu = torch.cat(all_pv)
+
+    # decode to physical scale (robust)
+    yv_dec = safe_decode_vol(yv_cpu.unsqueeze(-1), vol_normalizer, g_cpu.unsqueeze(-1)).squeeze(-1)
+    pv_dec = safe_decode_vol(pv_cpu.unsqueeze(-1), vol_normalizer, g_cpu.unsqueeze(-1)).squeeze(-1)
+
+    floor_val = float(globals().get("EVAL_VOL_FLOOR", 1e-6))
+    yv_dec = torch.clamp(yv_dec, min=floor_val)
+    pv_dec = torch.clamp(pv_dec, min=floor_val)
+
+    id_to_name = id_to_name or {}
+    assets = [id_to_name.get(int(i), str(int(i))) for i in g_cpu.numpy().tolist()]
+    t_cpu = torch.cat(all_t) if all_t else None
+
+    df = pd.DataFrame({
+        "asset": assets,
+        "time_idx": t_cpu.numpy().tolist() if t_cpu is not None else [None] * len(assets),
+        "y_vol": yv_dec.numpy().tolist(),
+        "y_vol_pred": pv_dec.numpy().tolist(),
+    })
+
+    if all_yd and all_pd:
+        yd_all = torch.cat(all_yd)
+        pd_all = torch.cat(all_pd)
+        try:
+            if torch.isfinite(pd_all).any() and (pd_all.min() < 0 or pd_all.max() > 1):
+                pd_all = torch.sigmoid(pd_all)
+        except Exception:
+            pd_all = torch.sigmoid(pd_all)
+        pd_all = torch.clamp(pd_all, 0.0, 1.0)
+        Lm = min(len(df), yd_all.numel(), pd_all.numel())
+        df = df.iloc[:Lm].copy()
+        df["y_dir"] = yd_all[:Lm].numpy().tolist()
+        df["y_dir_prob"] = pd_all[:Lm].numpy().tolist()
+
+    if out_path is not None:
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(out_path, index=False)
+        print(f"✓ Saved {len(df)} predictions → {out_path}")
+        return out_path
+    return df
+
+
+@torch.no_grad()
+def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: Path | str, id_to_name: dict | None = None):
+    """Load the best checkpoint (min val_qlike_overall) and write predictions for `dataloader`."""
+    ckpt = _get_best_ckpt_path(trainer)
+    if ckpt is None:
+        raise RuntimeError("Could not resolve best checkpoint path.")
+    print(f"Loading best checkpoint for {split_name}: {ckpt}")
+    model = TemporalFusionTransformer.load_from_checkpoint(ckpt)
+    try:
+        vol_norm = _extract_norm_from_dataset(dataloader.dataset)
+    except Exception as e:
+        raise RuntimeError(f"Could not resolve normalizer from dataset: {e}")
+    return _collect_predictions(model, dataloader, vol_norm, id_to_name=id_to_name, out_path=out_path)
+@torch.no_grad()
+
 def safe_decode_vol(y: torch.Tensor, normalizer, group_ids: torch.Tensor | None):
     """
     Try normalizer.decode(), then inverse_transform(), else manual fallback.
@@ -3095,6 +3276,11 @@ print(f"Best checkpoint (local or remote): {best_model_path}")
 # --- Save VALIDATION predictions from the BEST checkpoint (overwrites any earlier "final" predictions) ---
 try:
     print("Generating validation predictions from best checkpoint …")
+    try:
+        val_pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_best_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+        _save_predictions_from_best(trainer, val_dataloader, "val", val_pred_path)
+    except Exception as e:
+        print(f"[WARN] Failed to save validation predictions from best checkpoint: {e}")
     df_val_preds = _collect_predictions(
         best_model, val_dataloader, id_to_name=metrics_cb.id_to_name, vol_norm=metrics_cb.vol_norm
     )
@@ -3307,6 +3493,10 @@ try:
     except Exception as e:
         print(f"[WARN] Could not upload test predictions: {e}")
 
+print("Generating test predictions from best checkpoint …")
+try:
+    test_pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_best_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+    _save_predictions_from_best(trainer, test_dataloader, "test", test_pred_path)
 except Exception as e:
     print(f"[WARN] Failed to save test predictions: {e}")
     
