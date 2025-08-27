@@ -602,8 +602,7 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dic
         except Exception as _e:
             print(f"[WARN] per-asset calibration failed, skipping: {_e}")
 
-    id_to_name = id_to_name or {}
-    assets = [id_to_name.get(int(i), str(int(i))) for i in g_cpu.numpy().tolist()]
+
     t_cpu = torch.cat(all_t) if all_t else None
 
     df = pd.DataFrame({
@@ -1191,6 +1190,7 @@ class PerAssetMetrics(pl.Callback):
 
     @torch.no_grad()
     def on_validation_epoch_end(self, trainer, pl_module):
+        global PER_ASSET_CAL_SCALES
         # If nothing collected, exit quietly
         if not self._g_dev:
             return
@@ -2448,7 +2448,7 @@ EXTRA_CALLBACKS = [
       TailWeightRamp(
           vol_loss=VOL_LOSS,
           start=1.0,
-          end=1.15,
+          end=1.0,
           ramp_epochs=16,
           gate_by_calibration=True,
           gate_low=0.95,
@@ -2456,7 +2456,7 @@ EXTRA_CALLBACKS = [
           gate_patience=2,
       ),
       ReduceLROnPlateauCallback(
-          monitor="val_qlike_overall", factor=0.5, patience=4, min_lr=3e-5, cooldown=1, stop_after_epoch=None
+          monitor="val_qlike_overall", factor=0.5, patience=5, min_lr=3e-5, cooldown=1, stop_after_epoch=None
       ),
       ModelCheckpoint(
           dirpath=str(LOCAL_CKPT_DIR),
@@ -3223,9 +3223,9 @@ if __name__ == "__main__":
         df["rv_scale"].fillna(asset_scale_map.median(), inplace=True)
     # Global decoded-scale floor for vol (prevents QLIKE blow-ups on near-zero preds)
     try:
-        EVAL_VOL_FLOOR = max(1e-8, float(asset_scales["rv_scale"].median() * 0.02))
+        EVAL_VOL_FLOOR = max(2e-6, float(asset_scales["rv_scale"].median() * 0.02))
     except Exception:
-        EVAL_VOL_FLOOR = 1e-8
+        EVAL_VOL_FLOOR = 2e-6
     print(f"[EVAL] Global vol floor (decoded) set to {EVAL_VOL_FLOOR:.6g}")
 
     # Add calendar features to all splits
