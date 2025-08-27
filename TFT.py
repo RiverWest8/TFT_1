@@ -2843,14 +2843,14 @@ if __name__ == "__main__":
     # Trainer instance
     # ----------------------------
     checkpoint_callback = ModelCheckpoint(
-        dirpath=str(LOCAL_OUTPUT_DIR),
-        filename="tft-{epoch:02d}-{val_loss:.4f}",
-        monitor="val_qlike_overall",      # or val_qlike_overall if you want
-        save_top_k=1,            # keep best only
-        save_last = True,
-        auto_insert_metric_name=False,
-        mode="min",              # because lower val_loss is better
-    )
+            dirpath=str(LOCAL_OUTPUT_DIR),
+            filename="tft-{epoch:02d}-val_qlike_overall={val_qlike_overall:.4f}",
+            monitor="val_qlike_overall",      # or val_qlike_overall if you want
+            save_top_k=1,            # keep best only
+            save_last = True,
+            auto_insert_metric_name=False,
+            mode="min",              # because lower val_loss is better
+        )
     trainer = Trainer(
         accelerator=ACCELERATOR,
         devices=DEVICES,
@@ -2859,7 +2859,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[TQDMProgressBar(refresh_rate=50), es_cb, metrics_cb, mirror_cb, lr_cb, val_hist_cb] + EXTRA_CALLBACKS,
+        callbacks=[TQDMProgressBar(refresh_rate=50), es_cb, metrics_cb, mirror_cb, lr_cb, val_hist_cb, checkpoint_callback] + EXTRA_CALLBACKS,
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
         enable_progress_bar=True,
@@ -3053,6 +3053,40 @@ if best_model is None:
     raise RuntimeError("No model available for testing (checkpoint and in-memory both unavailable).")
 
 print(f"Best checkpoint (local or remote): {best_model_path}")
+# --- Save VALIDATION predictions from the BEST checkpoint (overwrites any earlier "final" predictions) ---
+try:
+    print("Generating validation predictions from best checkpoint …")
+    df_val_preds = _collect_predictions(
+        best_model, val_dataloader, id_to_name=metrics_cb.id_to_name, vol_norm=metrics_cb.vol_norm
+    )
+
+    # Compute decoded validation metrics for reference
+    _vy = [v for v in df_val_preds.get("realised_vol", []).tolist() if v is not None]
+    if _vy:
+        _vy_t = torch.tensor(_vy, dtype=torch.float32)
+        _vp_t = torch.tensor(df_val_preds["pred_realised_vol"].tolist(), dtype=torch.float32)[: _vy_t.numel()]
+        eps = 1e-8
+        v_mae  = torch.mean(torch.abs(_vp_t - _vy_t)).item()
+        v_mse  = torch.mean((_vp_t - _vy_t) ** 2).item()
+        v_rmse = v_mse ** 0.5
+        sigma2_p = torch.clamp(torch.abs(_vp_t), min=eps) ** 2
+        sigma2_y = torch.clamp(torch.abs(_vy_t), min=eps) ** 2
+        ratio = sigma2_y / sigma2_p
+        v_qlike = torch.mean(ratio - torch.log(ratio) - 1.0).item()
+        print(f"[VAL (best ckpt)] (decoded) MAE={v_mae:.6f} RMSE={v_rmse:.6f} MSE={v_mse:.6f} QLIKE={v_qlike:.6f}")
+    else:
+        print("[VAL (best ckpt)] WARNING: could not compute decoded metrics (no ground-truth available in DataLoader).")
+
+    # Save parquet & upload (same filename scheme as earlier so the 'best' overwrites the 'final')
+    val_pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+    df_val_preds.to_parquet(val_pred_path, index=False)
+    print(f"✓ Saved validation predictions (best ckpt, Parquet) → {val_pred_path}")
+    try:
+        upload_file_to_gcs(str(val_pred_path), f"{GCS_OUTPUT_PREFIX}/{val_pred_path.name}")
+    except Exception as e:
+        print(f"[WARN] Could not upload validation predictions: {e}")
+except Exception as e:
+    print(f"[WARN] Failed to save validation predictions from best checkpoint: {e}")
 
 # --- Run TEST loop with the best checkpoint & print decoded metrics ---
 try:
@@ -3077,7 +3111,7 @@ def _safe_prob(t: torch.Tensor) -> torch.Tensor:
     return torch.clamp(t, 0.0, 1.0)
 
 @torch.no_grad()
-def _collect_test_predictions(model, dl, id_to_name, vol_norm):
+def _collect_predictions(model, dl, id_to_name, vol_norm):
     model_device = next(model.parameters()).device
     assets_all, t_idx_all = [], []
     yv_all, pv_all, yd_all, pdprob_all = [], [], [], []
@@ -3145,6 +3179,7 @@ def _collect_test_predictions(model, dl, id_to_name, vol_norm):
             y_dec = safe_decode_vol(yv.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
         p_dec = safe_decode_vol(p_vol.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
         p_dec = torch.clamp(p_dec, min=1e-8)
+        y_dec = torch.clamp(y_dec, min = 1e-8)
 
         # direction prob
         p_dir_prob = _safe_prob(d_log) if torch.is_tensor(d_log) else None
@@ -3185,7 +3220,7 @@ def _collect_test_predictions(model, dl, id_to_name, vol_norm):
 
 # Build dataframe of predictions and compute TEST metrics on decoded scale
 try:
-    df_test_preds = _collect_test_predictions(
+    df_test_preds = _collect_predictions(
         best_model, test_dataloader, id_to_name=metrics_cb.id_to_name, vol_norm=metrics_cb.vol_norm
     )
 
