@@ -390,8 +390,21 @@ def manual_inverse_transform_groupnorm(normalizer, y: torch.Tensor, group_ids: t
     """
     y_ = y.squeeze(-1) if y.ndim > 1 else y
 
+    # right after: y_ = y.squeeze(-1) if y.ndim > 1 else y
+    dev = None
+    if torch.is_tensor(y_):
+        dev = y_.device
+    if group_ids is not None and torch.is_tensor(group_ids):
+        dev = group_ids.device
+
     center = getattr(normalizer, "center", None)
     scale  = getattr(normalizer, "scale",  None)
+
+    if dev is not None:
+        if isinstance(center, torch.Tensor) and center.device != dev:
+            center = center.to(dev)
+        if isinstance(scale, torch.Tensor) and scale.device != dev:
+            scale = scale.to(dev)
 
     if scale is None:
         x = y_
@@ -401,6 +414,11 @@ def manual_inverse_transform_groupnorm(normalizer, y: torch.Tensor, group_ids: t
             if g.ndim > 1 and g.size(-1) == 1:
                 g = g.squeeze(-1)
             g = g.long()
+            # Ensure index tensor `g` is on the same device as scale/center
+            if isinstance(scale, torch.Tensor) and g.device != scale.device:
+                g = g.to(scale.device)
+            if isinstance(center, torch.Tensor) and g.device != center.device:
+                g = g.to(center.device)
             s = scale[g] if isinstance(scale, torch.Tensor) else scale
             c = center[g] if isinstance(center, torch.Tensor) else 0.0
         else:
@@ -456,7 +474,7 @@ def _get_best_ckpt_path(trainer) -> str | None:
 
 
 @torch.no_grad()
-def _collect_predictions(model, dataloader, vol_normalizer, id_to_name: dict | None, out_path: Path | str | None):
+def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dict | None = None, out_path: Path | str | None = None, **kwargs):
     """
     Iterate a dataloader, run model in eval, extract:
       • realised_vol median prediction (q=0.50) & target
@@ -464,6 +482,11 @@ def _collect_predictions(model, dataloader, vol_normalizer, id_to_name: dict | N
     Decode vol using `vol_normalizer`, clamp floors, and save to Parquet.
     """
     import pandas as pd
+        # Accept alias vol_norm from legacy call-sites
+    if vol_normalizer is None:
+        vol_normalizer = kwargs.get("vol_norm", None)
+    if vol_normalizer is None:
+        raise RuntimeError("vol_normalizer (or vol_norm) must be provided to _collect_predictions")
 
     model.eval()
     all_g, all_yv, all_pv, all_yd, all_pd, all_t = [], [], [], [], [], []
@@ -601,7 +624,7 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
         vol_norm = _extract_norm_from_dataset(dataloader.dataset)
     except Exception as e:
         raise RuntimeError(f"Could not resolve normalizer from dataset: {e}")
-    return _collect_predictions(model, dataloader, vol_norm, id_to_name=id_to_name, out_path=out_path)
+    return _collect_predictions(model, dataloader, vol_normalizer=vol_norm, id_to_name=id_to_name, out_path=out_path)
 @torch.no_grad()
 
 def safe_decode_vol(y: torch.Tensor, normalizer, group_ids: torch.Tensor | None):
@@ -616,10 +639,11 @@ def safe_decode_vol(y: torch.Tensor, normalizer, group_ids: torch.Tensor | None)
     try:
         return normalizer.inverse_transform(y, group_ids=group_ids)
     except Exception:
-        try:
-            return normalizer.inverse_transform(y)
-        except Exception:
-            pass
+        pass
+    try:
+        return normalizer.inverse_transform(y)
+    except Exception:
+        pass
     return manual_inverse_transform_groupnorm(normalizer, y, group_ids)
 
 
@@ -3146,7 +3170,7 @@ if __name__ == "__main__":
     val_hist_cb  = ValLossHistory(val_hist_csv)
 
 
-  
+
 
 
     # ----------------------------
