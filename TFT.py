@@ -1821,7 +1821,10 @@ class PerAssetMetrics(pl.Callback):
                 # ensure probs in [0,1]
                 probs = pdir_cpu
                 try:
-                    if torch.isfinite(probs).any() and (probs.min() < 0 or probs.max() > 1):
+                    _finite = bool(torch.isfinite(probs).any().item())
+                    _min = float(probs.min().item())
+                    _max = float(probs.max().item())
+                    if _finite and ((_min < 0.0) or (_max > 1.0)):
                         probs = torch.sigmoid(probs)
                 except Exception:
                     probs = torch.sigmoid(probs)
