@@ -394,21 +394,22 @@ def manual_inverse_transform_groupnorm(normalizer, y: torch.Tensor, group_ids: t
     """
     y_ = y.squeeze(-1) if y.ndim > 1 else y
 
-    # right after: y_ = y.squeeze(-1) if y.ndim > 1 else y
-    dev = None
-    if torch.is_tensor(y_):
-        dev = y_.device
-    if group_ids is not None and torch.is_tensor(group_ids):
-        dev = group_ids.device
+    # --- Force CPU for robust offline decoding (prediction export paths) ---
+    try:
+        import torch as _t
+        cpu = _t.device("cpu")
+        if _t.is_tensor(y_):
+            y_ = y_.to(cpu)
+        if group_ids is not None and _t.is_tensor(group_ids):
+            group_ids = group_ids.to(cpu)
+    except Exception:
+        pass
 
-    center = getattr(normalizer, "center", None)
-    scale  = getattr(normalizer, "scale",  None)
-
-    if dev is not None:
-        if isinstance(center, torch.Tensor) and center.device != dev:
-            center = center.to(dev)
-        if isinstance(scale, torch.Tensor) and scale.device != dev:
-            scale = scale.to(dev)
+    dev = torch.device("cpu")
+    if isinstance(center, torch.Tensor) and center.device != dev:
+     center = center.to(dev)
+    if isinstance(scale, torch.Tensor) and scale.device != dev:
+        scale = scale.to(dev)
 
     if scale is None:
         x = y_
@@ -492,6 +493,28 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dic
     if vol_normalizer is None:
         raise RuntimeError("vol_normalizer (or vol_norm) must be provided to _collect_predictions")
 
+    # Pre-compute a clean (asset, time_idx) → Time mapping from the dataset
+    ts_map_df = None
+    try:
+        ds = dataloader.dataset
+        df_map = getattr(ds, "data", None)
+        if df_map is None:
+            df_map = getattr(ds, "dataframe", None)
+        if isinstance(df_map, pd.DataFrame) and ("asset" in df_map.columns) and ("time_idx" in df_map.columns):
+            # pick the same column used in validation exports (prefer 'Time')
+            ts_col = None
+            for cname in ["Time", "timestamp", "Datetime", "datetime", "date", "time"]:
+                if cname in df_map.columns:
+                    ts_col = cname
+                    break
+            if ts_col is not None:
+                ts_map_df = df_map[["asset", "time_idx", ts_col]].copy()
+                ts_map_df["asset"] = ts_map_df["asset"].astype(str)
+                ts_map_df["time_idx"] = ts_map_df["time_idx"].astype(int)
+                ts_map_df = ts_map_df.rename(columns={ts_col: "Time"})
+    except Exception:
+        ts_map_df = None
+
     model.eval()
     all_g, all_yv, all_pv, all_yd, all_pd, all_t = [], [], [], [], [], []
 
@@ -543,7 +566,6 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dic
         if y_vol_t is None:
             continue
 
-
         # forward (no grad)
         with torch.no_grad():
             y_hat = model(x)
@@ -592,8 +614,7 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dic
             pv_dec = pv_dec * float(cal_scale)
         except Exception:
             pass
-        # Optional per-asset multiplicative calibration (derived from validation only)
-        
+    # Optional per-asset multiplicative calibration (derived from validation only)
     if per_asset_scales is None:
         per_asset_scales = kwargs.get("per_asset_calibration", None)
 
@@ -603,22 +624,36 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dic
     if isinstance(per_asset_scales, dict) and len(per_asset_scales) > 0:
         try:
             _map = {str(k): float(v) for k, v in per_asset_scales.items()}
-            scales_vec = torch.tensor([_map.get(str(a), 1.0) for a in assets], dtype=pv_dec.dtype)
+            scales_vec = torch.tensor([_map.get(str(a), 1.0) for a in assets], dtype=pv_dec.dtype, device=pv_dec.device)
             pv_dec = pv_dec * scales_vec
         except Exception as _e:
             print(f"[WARN] per-asset calibration failed, skipping: {_e}")
 
-
     t_cpu = torch.cat(all_t) if all_t else None
 
+    # Base frame with asset and time_idx
     df = pd.DataFrame({
         "asset": assets,
         "time_idx": t_cpu.numpy().tolist() if t_cpu is not None else [None] * len(assets),
         "y_vol": yv_dec.numpy().tolist(),
         "y_vol_pred": pv_dec.numpy().tolist(),
     })
+    df["asset"] = df["asset"].astype(str)
+    # Merge in wall-clock Time the same way validation parquet does
+    if ts_map_df is not None and df["time_idx"].notna().all():
+        try:
+            df["time_idx"] = df["time_idx"].astype(int)
+            df = df.merge(ts_map_df, on=["asset", "time_idx"], how="left")
+        except Exception:
+            df["Time"] = None
+    else:
+        df["Time"] = None
 
-    if all_yd and all_pd:
+    # Reorder columns to a stable schema
+    cols = [c for c in ["asset", "Time", "time_idx", "y_vol", "y_vol_pred"] if c in df.columns]
+    df = df[cols + [c for c in df.columns if c not in cols]]
+
+    if (len(all_yd) > 0) and (len(all_pd) > 0):
         yd_all = torch.cat(all_yd)
         pd_all = torch.cat(all_pd)
         try:
@@ -2786,7 +2821,7 @@ EXTRA_CALLBACKS = [
           target_under=1.09,
           target_mean_bias=0.04,
           warmup_epochs=5,
-          qlike_target_weight=0.0,   # keep out of the loss; diagnostics only
+          qlike_target_weight=0.05,   
           start_mean_bias=0.0,
           mean_bias_ramp_until=12,
           guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
@@ -2796,15 +2831,15 @@ EXTRA_CALLBACKS = [
       TailWeightRamp(
           vol_loss=VOL_LOSS,
           start=1.0,
-          end=1.15,
-          ramp_epochs=16,
+          end=1.2,
+          ramp_epochs=8,
           gate_by_calibration=True,
           gate_low=0.95,
           gate_high=1.05,
           gate_patience=2,
       ),
       ReduceLROnPlateauCallback(
-          monitor="val_qlike_overall", factor=0.5, patience=7, min_lr=3e-5, cooldown=1, stop_after_epoch=None
+          monitor="val_qlike_overall", factor=0.5, patience=5, min_lr=3e-5, cooldown=2, stop_after_epoch=8
       ),
       ModelCheckpoint(
           dirpath=str(LOCAL_CKPT_DIR),
@@ -4224,8 +4259,14 @@ def _collect_predictions(model, dl, id_to_name, vol_norm):
         if torch.is_tensor(yv):
             y_dec = safe_decode_vol(yv.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
         p_dec = safe_decode_vol(p_vol.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
-        p_dec = torch.clamp(p_dec, min=1e-8)
-        y_dec = torch.clamp(y_dec, min = 1e-8)
+        # Guards to avoid None reaching clamp/exports
+        if yv_dec is None or pv_dec is None:
+            raise RuntimeError("Decoded tensors are None — aborting export early.")
+
+        # Clamp floors here (tensors guaranteed now)
+        floor_val = float(globals().get("EVAL_VOL_FLOOR", 1e-6))
+        yv_dec = torch.clamp(yv_dec, min=floor_val)
+        pv_dec = torch.clamp(pv_dec, min=floor_val)
 
         # direction prob
         p_dir_prob = _safe_prob(d_log) if torch.is_tensor(d_log) else None
