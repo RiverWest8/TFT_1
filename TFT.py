@@ -665,7 +665,7 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dic
         pd_all = torch.cat(all_pd)
         try:
             needs_sigmoid = False
-            if torch.isfinite(pd_all).any():
+            if bool(torch.isfinite(pd_all).any().item()):   
                 _min = float(pd_all.min().item())
                 _max = float(pd_all.max().item())
                 needs_sigmoid = (_min < 0.0) or (_max > 1.0)
@@ -1634,7 +1634,7 @@ class PerAssetMetrics(pl.Callback):
             probs = pdir_cpu
             try:
                 needs_sigmoid = False
-                if torch.isfinite(probs).any():
+                if bool(torch.isfinite(probs).any().item()):
                     _min = float(probs.min().item())
                     _max = float(probs.max().item())
                     needs_sigmoid = (_min < 0.0) or (_max > 1.0)
