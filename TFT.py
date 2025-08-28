@@ -1936,15 +1936,7 @@ class PerAssetMetrics(pl.Callback):
         print(
             f"UNCAL — MAE: {overall['mae']:.6f} | RMSE: {overall['rmse']:.6f} | MSE: {overall['mse']:.6f} | NMSE: {overall.get('nmse', float('nan')):.6f} | QLIKE: {overall['qlike']:.6f}" + da_str
         )
-        # If calibrated fields were stored in overall dict by on_validation_epoch_end, print them too
-        mae_cal  = overall.get('mae_cal', None)
-        rmse_cal = overall.get('rmse_cal', None)
-        mse_cal  = overall.get('mse_cal', None)
-        ql_cal   = overall.get('qlike_cal', None)
-        if mae_cal is not None and ql_cal is not None:
-            print(
-                f"CALIB — MAE: {mae_cal:.6f} | RMSE: {rmse_cal:.6f} | MSE: {mse_cal:.6f} | NMSE: {overall.get('nmse_cal', float('nan')):.6f} | QLIKE: {ql_cal:.6f}"
-            )
+
 
         print("\nPer-asset validation metrics (top by samples):")
         print("asset | MAE | RMSE | MSE | NMSE | QLIKE | DA | ACC | N")
@@ -1953,18 +1945,7 @@ class PerAssetMetrics(pl.Callback):
             da_str  = "-" if r[6] is None else f"{r[6]:.3f}"
             print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {r[5]:.6f} | {da_str} | {acc_str} | {r[8]}")
 
-        # Calibrated per-asset table at fit end (if available)
-        try:
-            rows_cal = getattr(self, "_last_rows_cal", [])
-            if rows_cal:
-                print("\nPer-asset validation metrics (CALIBRATED, top by samples):")
-                print("asset | MAE | RMSE | MSE | NMSE | QLIKE | DA | N")
-                for r in rows_cal[: self.max_print]:
-                    da_str = "-" if r[6] is None else f"{r[6]:.3f}"
-                    print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {r[5]:.6f} | {da_str} | {r[7]}")
-        except Exception as _e:
-            print(f"[WARN] Could not print calibrated per-asset metrics at end: {_e}")
-
+ 
         dir_overall = None
         yd = overall.get("yd", None)
         pd_all = overall.get("pd", None)
@@ -2109,31 +2090,7 @@ class PerAssetMetrics(pl.Callback):
                     upload_file_to_gcs(str(pred_path), f"{GCS_OUTPUT_PREFIX}/{pred_path.name}")
                 except Exception as e:
                     print(f"[WARN] Could not upload validation predictions: {e}")
-                # Also save a calibrated version (no look-ahead; uses validation-derived scale)
-                try:
-                    s = GLOBAL_CAL_SCALE if (GLOBAL_CAL_SCALE is not None) else _load_val_cal_scale()
-                    if s is not None:
-                        df_cal = df_out.copy()
-                        # apply scalar to predicted vols only
-                        df_cal["y_vol_pred"] = (
-                            torch.tensor(df_cal["y_vol_pred"].values) * float(s)
-                        ).numpy().tolist()
-                        if _epoch_now is not None:
-                            cal_path = LOCAL_OUTPUT_DIR / f"calibrated_validation_predictions_e{_epoch_now}_{RUN_SUFFIX}.parquet"
-                        else:
-                            cal_path = LOCAL_OUTPUT_DIR / f"calibrated_validation_predictions_{RUN_SUFFIX}.parquet"
-                        df_cal.to_parquet(cal_path, index=False)
-                        print(f"✓ Saved calibrated validation predictions (Parquet) → {cal_path}")
-                        try:
-                            upload_file_to_gcs(str(cal_path), f"{GCS_OUTPUT_PREFIX}/{cal_path.name}")
-                        except Exception as e:
-                            print(f"[WARN] Could not upload calibrated validation predictions: {e}")
-                    else:
-                        print("[WARN] No validation calibration scale available; skipping calibrated_validation parquet.")
-                except Exception as e:
-                    print(f"[WARN] Could not save calibrated validation predictions: {e}")
-        except Exception as e:
-            print(f"[WARN] Could not save validation predictions: {e}")
+
 
 import lightning.pytorch as pl
 
