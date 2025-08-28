@@ -581,7 +581,7 @@ def _collect_predictions(
             all_yd.append(y_dir_t.reshape(-1)[:L].detach().cpu())
             all_pd.append(p_dir.reshape(-1)[:L].detach().cpu())
 
-        dec_time = x.get("decoder_time_idx", None) or x.get("decoder_relative_idx", None)
+        dec_time = _first_not_none(x, ("decoder_time_idx", "decoder_relative_idx"))
         if dec_time is not None and torch.is_tensor(dec_time):
             tvec = dec_time
             while tvec.ndim > 1 and tvec.size(-1) == 1:
