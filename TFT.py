@@ -167,6 +167,10 @@ EVAL_VOL_FLOOR = 1e-6
 # Composite metric weights (override via --metric_weights "w_mae,w_rmse,w_qlike")
 COMP_WEIGHTS = (1.0, 1.0, 0.333)  # default: slightly emphasise QLIKE for RV focus
 
+# Directional Accuracy dead-band: ignore tiny changes when computing DA
+DA_DEADBAND_Q = 0.12   # drop the smallest 20% |Δy| per asset from DA calculation
+DA_PRED_FACTOR = 0.50  # predicted-change threshold relative to the y threshold
+
 def composite_score(mae, rmse, qlike,
                     b_mae=None, b_rmse=None, b_qlike=None,
                     weights=None, eps=1e-12):
@@ -1152,6 +1156,8 @@ class AsymmetricQuantileLoss(QuantileLoss):
         eps: float = 1e-8,
         med_clip: float = 3.0,
         log_ratio_clip: float = 12.0,
+        delta_weight: float = 0.25,
+        delta_huber_delta: float = 0.001,
         **kwargs,
     ):
         super().__init__(quantiles=quantiles, **kwargs)
@@ -1163,6 +1169,8 @@ class AsymmetricQuantileLoss(QuantileLoss):
         self.eps = float(eps)
         self.med_clip = float(med_clip)
         self.log_ratio_clip = float(log_ratio_clip)
+        self.delta_weight = float(delta_weight)
+        self.delta_huber_delta = float(delta_huber_delta)
 
         try:
             self._q50_idx = self.quantiles.index(0.5)
@@ -1236,6 +1244,34 @@ class AsymmetricQuantileLoss(QuantileLoss):
                 # if anything goes sideways, just fall back to quantile-only
                 pass
 
+        # ---- Δ-vol matching on the median (encourages responsiveness) ----
+        if getattr(self, "delta_weight", 0.0) and self.delta_weight > 0.0:
+            try:
+                t = target[0] if isinstance(target, tuple) else target
+                # Median (q=0.5) on encoded scale
+                med = y_pred[..., self._q50_idx]
+                # Identify time dimension (second-to-last if quantiles are last)
+                # Works for shapes like [B, T, K] or [B, 1, K]; skips when T < 2
+                if med.ndim >= 2:
+                    time_dim = -2
+                    if med.size(time_dim) > 1 and t.size(time_dim) > 1:
+                        m1 = med.narrow(time_dim, 1, med.size(time_dim) - 1)
+                        m0 = med.narrow(time_dim, 0, med.size(time_dim) - 1)
+                        d_m = m1 - m0
+                        t1 = t.narrow(time_dim, 1, t.size(time_dim) - 1)
+                        t0 = t.narrow(time_dim, 0, t.size(time_dim) - 1)
+                        d_t = t1 - t0
+                        resid = d_m - d_t
+                        abs_res = torch.abs(resid)
+                        delta = float(self.delta_huber_delta)
+                        huber = torch.where(
+                            abs_res <= delta,
+                            0.5 * (abs_res ** 2) / max(delta, 1e-12),
+                            abs_res - 0.5 * delta,
+                        )
+                        base = base + float(self.delta_weight) * torch.nan_to_num(huber.mean(), nan=0.0, posinf=1e4, neginf=1e4)
+            except Exception:
+                pass
         return torch.nan_to_num(base, nan=0.0, posinf=1e4, neginf=1e4)
 
 
@@ -1505,7 +1541,10 @@ class PerAssetMetrics(pl.Callback):
                     gdf = gdf.sort_values("t")
                     y_diff = _np.diff(gdf["y"].values)
                     p_diff = _np.diff(gdf["p"].values)
-                    valid = (y_diff != 0) | (p_diff != 0)
+                    if y_diff.size == 0:
+                        continue
+                    thr = float(_np.quantile(_np.abs(y_diff), DA_DEADBAND_Q)) if _np.isfinite(_np.abs(y_diff)).all() else 0.0
+                    valid = (_np.abs(y_diff) > thr) | (_np.abs(p_diff) > thr * DA_PRED_FACTOR)
                     if valid.any():
                         m = (_np.sign(y_diff[valid]) * _np.sign(p_diff[valid]) > 0)
                         matches.extend(list(m.astype(float)))
@@ -1683,9 +1722,11 @@ class PerAssetMetrics(pl.Callback):
                         gdf_sorted = gdf.sort_values("t")
                         ydif = np.diff(gdf_sorted["y"].values)
                         pdif = np.diff(gdf_sorted["p"].values)
-                        valid = (ydif != 0) | (pdif != 0)
-                        if valid.any():
-                            da_a = float(((np.sign(ydif[valid]) * np.sign(pdif[valid])) > 0).mean())
+                        if ydif.size > 0:
+                            thr = float(np.quantile(np.abs(ydif), DA_DEADBAND_Q))
+                            valid = (np.abs(ydif) > thr) | (np.abs(pdif) > thr * DA_PRED_FACTOR)
+                            if valid.any():
+                                da_a = float(((np.sign(ydif[valid]) * np.sign(pdif[valid])) > 0).mean())
                 except Exception:
                     da_a = None
 
@@ -1760,10 +1801,12 @@ class PerAssetMetrics(pl.Callback):
                         if "t" in gdf.columns:
                             gdf_sorted = gdf.sort_values("t")
                             ydif = np.diff(gdf_sorted["y"].values)
-                            pdif = np.diff((p_ac.numpy()))
-                            valid = (ydif != 0) | (pdif != 0)
-                            if valid.any():
-                                da_c = float(((np.sign(ydif[valid]) * np.sign(pdif[valid])) > 0).mean())
+                            pdif = np.diff(p_ac.numpy())
+                            if ydif.size > 0:
+                                thr = float(np.quantile(np.abs(ydif), DA_DEADBAND_Q))
+                                valid = (np.abs(ydif) > thr) | (np.abs(pdif) > thr * DA_PRED_FACTOR)
+                                if valid.any():
+                                    da_c = float(((np.sign(ydif[valid]) * np.sign(pdif[valid])) > 0).mean())
                     except Exception:
                         da_c = None
 
@@ -2731,7 +2774,7 @@ VOL_LOSS = AsymmetricQuantileLoss(
 EXTRA_CALLBACKS = [
       BiasWarmupCallback(
           vol_loss=VOL_LOSS,
-          target_under=1.1115,
+          target_under=1.08,
           target_mean_bias=0.0,
           warmup_epochs=5,
           qlike_target_weight=0.0,   # keep out of the loss; diagnostics only
@@ -2739,16 +2782,16 @@ EXTRA_CALLBACKS = [
           mean_bias_ramp_until=12,
           guard_patience=getattr(ARGS, "warmup_guard_patience", 100),
           guard_tol=getattr(ARGS, "warmup_guard_tol", 0.0),
-          alpha_step=0.02,
+          alpha_step=0.01,
       ),
       TailWeightRamp(
           vol_loss=VOL_LOSS,
           start=1.0,
-          end=1.2,
-          ramp_epochs=16,
+          end=1.1,
+          ramp_epochs=20,
           gate_by_calibration=True,
-          gate_low=0.95,
-          gate_high=1.05,
+          gate_low=0.98,
+          gate_high=1.02,
           gate_patience=2,
       ),
       ReduceLROnPlateauCallback(
@@ -3791,7 +3834,7 @@ if __name__ == "__main__":
         training_dataset,
         hidden_size=96,
         attention_head_size=4,
-        dropout=0.13, #0.0833704625250354,
+        dropout=0.0833740, #0.0833704625250354,
         hidden_continuous_size=24,
         learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.00035), #0.0019 0017978
         optimizer="AdamW",
