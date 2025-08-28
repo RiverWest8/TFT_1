@@ -2013,34 +2013,38 @@ class PerAssetMetrics(pl.Callback):
         # Optionally save per-sample predictions for plotting
         try:
             import pandas as pd  # ensure pd is bound locally and not shadowed
+
             # Recompute decoded tensors from the stored device buffers
-            g_cpu = torch.cat(self._g_dev).detach().cpu() if self._g_dev else None
-            yv_cpu = torch.cat(self._yv_dev).detach().cpu() if self._yv_dev else None
-            pv_cpu = torch.cat(self._pv_dev).detach().cpu() if self._pv_dev else None
-            yd_cpu = torch.cat(self._yd_dev).detach().cpu() if self._yd_dev else None
-            pdir_cpu = torch.cat(self._pd_dev).detach().cpu() if self._pd_dev else None
-            # decode vol back to physical scale
+            g_cpu   = torch.cat(self._g_dev).detach().cpu() if self._g_dev else None
+            yv_cpu  = torch.cat(self._yv_dev).detach().cpu() if self._yv_dev else None
+            pv_cpu  = torch.cat(self._pv_dev).detach().cpu() if self._pv_dev else None
+            yd_cpu  = torch.cat(self._yd_dev).detach().cpu() if self._yd_dev else None
+            pdir_cpu= torch.cat(self._pd_dev).detach().cpu() if self._pd_dev else None
+
+            # decode vol back to physical scale (robust via helper used earlier)
             if g_cpu is not None and yv_cpu is not None and pv_cpu is not None:
-                yv_dec = self.vol_norm.decode(yv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
-                pv_dec = self.vol_norm.decode(pv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
-                # Apply the same calibration used in metrics so saved preds match the plots
-                # map group id -> name
+                yv_dec = safe_decode_vol(yv_cpu.unsqueeze(-1), self.vol_norm, g_cpu.unsqueeze(-1)).squeeze(-1)
+                pv_dec = safe_decode_vol(pv_cpu.unsqueeze(-1), self.vol_norm, g_cpu.unsqueeze(-1)).squeeze(-1)
+
+                # map group id -> human asset name
                 assets = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
-                # time index (may be missing)
+
+                # optional time index (may be missing)
                 t_cpu = torch.cat(self._t_dev).detach().cpu() if self._t_dev else None
+
                 df_out = pd.DataFrame({
                     "asset": assets,
-                    "time_idx": t_cpu.numpy().tolist() if t_cpu is not None else [None] * len(assets),
+                    "time_idx": (t_cpu.numpy().tolist() if t_cpu is not None else [None] * len(assets)),
                     "y_vol": yv_dec.numpy().tolist(),
                     "y_vol_pred": pv_dec.numpy().tolist(),
                 })
-                if yd_cpu is not None and pdir_cpu is not None and yd_cpu.numel() > 0 and pdir_cpu.numel() > 0:
-                    # ensure pdir is probability
+
+                # attach direction columns if present
+                if (yd_cpu is not None) and (pdir_cpu is not None) and (int(yd_cpu.numel()) > 0) and (int(pdir_cpu.numel()) > 0):
                     pdp = pdir_cpu
                     try:
                         _finite = bool(torch.isfinite(pdp).any().item())
-                        _min = float(pdp.min().item())
-                        _max = float(pdp.max().item())
+                        _min = float(pdp.min().item()); _max = float(pdp.max().item())
                         if _finite and ((_min < 0.0) or (_max > 1.0)):
                             pdp = torch.sigmoid(pdp)
                     except Exception:
@@ -2050,10 +2054,11 @@ class PerAssetMetrics(pl.Callback):
                     df_out = df_out.iloc[:Lm].copy()
                     df_out["y_dir"] = yd_cpu[:Lm].numpy().tolist()
                     df_out["y_dir_prob"] = pdp[:Lm].numpy().tolist()
+
                 # --- Attach real timestamps from a source DataFrame, if available ---
                 try:
                     # Look for a likely source dataframe that contains ['asset','time_idx','Time']
-                    candidate_names = ["val_df"]
+                    candidate_names = ["val_df", "raw_df", "raw_data", "full_df", "df", "train_df", "test_df"]
                     src_df = None
                     for _name in candidate_names:
                         obj = globals().get(_name)
@@ -2073,36 +2078,41 @@ class PerAssetMetrics(pl.Callback):
                         # Coerce Time to timezone-naive pandas datetimes
                         df_out["Time"] = pd.to_datetime(df_out["Time"], errors="coerce")
                         try:
-                            # If tz-aware, drop timezone info; if already naive this may raise — ignore
                             df_out["Time"] = df_out["Time"].dt.tz_localize(None)
                         except Exception:
                             pass
                     else:
-                        print(
-                            "[WARN] Could not locate a source dataframe with ['asset','time_idx','Time'] among candidates: "
-                            "raw_df, raw_data, full_df, df (also checked val_df/train_df/test_df)."
-                        )
+                        print("[WARN] Could not locate a source dataframe with ['asset','time_idx','Time'] among "
+                              "candidates: val_df, raw_df, raw_data, full_df, df, train_df, test_df.")
+                except Exception as _e_merge:
+                    print(f"[WARN] Could not merge timestamps into validation predictions: {_e_merge}")
 
-                except Exception as e:
-                    print(f"[WARN] Failed to attach real timestamps: {e}")
-                # Use the actual current epoch in filenames (not MAX_EPOCHS)
+                # --- Persist parquet to the run directory ---
                 try:
-                    _epoch_now = int(getattr(trainer, "current_epoch", -1)) + 1
+                    # epoch number was computed above in this method; fall back if missing
+                    epoch_num = int(getattr(trainer, "current_epoch", -1)) + 1
                 except Exception:
-                    _epoch_now = None
-                if _epoch_now is not None:
-                    pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{_epoch_now}_{RUN_SUFFIX}.parquet"
-                else:
-                    pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_{RUN_SUFFIX}.parquet"
-                df_out.to_parquet(pred_path, index=False)
-                print(f"✓ Saved validation predictions (Parquet) → {pred_path}")
+                    epoch_num = None
                 try:
-                    upload_file_to_gcs(str(pred_path), f"{GCS_OUTPUT_PREFIX}/{pred_path.name}")
-                except Exception as e:
-                    print(f"[WARN] Could not upload validation predictions: {e}")
+                    out_dir = LOCAL_RUN_DIR / "predictions"
+                except Exception:
+                    from pathlib import Path
+                    out_dir = Path("/tmp/tft_run/predictions")
+                out_dir.mkdir(parents=True, exist_ok=True)
+
+                fname = f"val_predictions_epoch{epoch_num or 'NA'}_{RUN_SUFFIX}.parquet" if 'RUN_SUFFIX' in globals() else f"val_predictions_epoch{epoch_num or 'NA'}.parquet"
+                out_path = out_dir / fname
+                df_out.to_parquet(out_path, index=False)
+                print(f"✓ Saved validation predictions → {out_path}")
+            else:
+                print("[WARN] Skipping validation predictions save: missing g/yv/pv buffers")
+        except Exception as e:
+            import traceback as _tb
+            print(f"[WARN] Could not build/save per-sample validation predictions: {e}")
+            _tb.print_exc()
 
 
-import lightning.pytorch as pl
+
 
 class BiasWarmupCallback(pl.Callback):
     """
