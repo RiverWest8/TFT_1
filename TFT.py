@@ -1626,21 +1626,30 @@ class PerAssetMetrics(pl.Callback):
         trainer.callback_metrics["val_mae_overall"]       = torch.tensor(overall_mae)
         trainer.callback_metrics["val_rmse_overall"]      = torch.tensor(overall_rmse)
         trainer.callback_metrics["val_mse_overall"]       = torch.tensor(overall_mse)
-        trainer.callback_metrics["val_qlike_overall"]     = torch.tensor(overall_qlike)
-        trainer.callback_metrics["val_qlike_cal"]         = torch.tensor(overall_qlike_cal)
-        trainer.callback_metrics["val_N_overall"]         = torch.tensor(float(N))
-        # Add NMSE, DA, and calibrated metrics to callback_metrics if available
-        trainer.callback_metrics["val_nmse_overall"] = torch.tensor(overall_nmse)
-        if overall_nmse_cal is not None:
-            trainer.callback_metrics["val_nmse_cal"] = torch.tensor(overall_nmse_cal)
-        if overall_da is not None:
-            trainer.callback_metrics["val_da_overall"] = torch.tensor(overall_da)
-        if overall_mae_cal is not None:
-            trainer.callback_metrics['val_mae_cal']   = torch.tensor(overall_mae_cal)
-            trainer.callback_metrics['val_mse_cal']   = torch.tensor(overall_mse_cal)
-            trainer.callback_metrics['val_rmse_cal']  = torch.tensor(overall_rmse_cal)
-        if overall_qlike_cal is not None:
-            trainer.callback_metrics['val_qlike_cal'] = torch.tensor(overall_qlike_cal)
+
+        # --- Guarded metrics assignment block ---
+        trainer.callback_metrics["val_qlike_overall"] = torch.tensor(overall_qlike)
+        trainer.callback_metrics["val_N_overall"]     = torch.tensor(float(N))
+        trainer.callback_metrics["val_nmse_overall"]  = torch.tensor(overall_nmse)
+
+        # Optional extras
+        if overall_da is not None and math.isfinite(float(overall_da)):
+            trainer.callback_metrics["val_da_overall"] = torch.tensor(float(overall_da))
+
+        # --- Calibrated metrics: only set if computed (not None) and finite ---
+        if (overall_mae_cal is not None) and math.isfinite(float(overall_mae_cal)):
+            trainer.callback_metrics["val_mae_cal"] = torch.tensor(float(overall_mae_cal))
+        if (overall_mse_cal is not None) and math.isfinite(float(overall_mse_cal)):
+            trainer.callback_metrics["val_mse_cal"] = torch.tensor(float(overall_mse_cal))
+        if (overall_rmse_cal is not None) and math.isfinite(float(overall_rmse_cal)):
+            trainer.callback_metrics["val_rmse_cal"] = torch.tensor(float(overall_rmse_cal))
+        if (overall_nmse_cal is not None) and math.isfinite(float(overall_nmse_cal)):
+            trainer.callback_metrics["val_nmse_cal"] = torch.tensor(float(overall_nmse_cal))
+        if (overall_qlike_cal is not None) and math.isfinite(float(overall_qlike_cal)):
+            trainer.callback_metrics["val_qlike_cal"] = torch.tensor(float(overall_qlike_cal))
+        else:
+            # Ensure stale keys don't linger across epochs
+            trainer.callback_metrics.pop("val_qlike_cal", None)
 
         msg = (
             f"[VAL EPOCH {epoch_num}] "
