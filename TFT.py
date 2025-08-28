@@ -912,24 +912,123 @@ def _load_epoch_per_asset_scales(epoch: int) -> dict | None:
     return None
 @torch.no_grad()
 def compute_global_scale(y_true_dec: torch.Tensor, y_pred_dec: torch.Tensor, eps: float = 1e-12) -> float:
-    """Return QLIKE-optimal multiplicative scale s for decoded vols.
-    For constant scaling, the optimum satisfies E[y^2/(s^2 p^2)] = 1 ⇒ s^2 = E[y^2/p^2].
-    Works on any device/dtype; returns python float.
+    """Return composite-optimal multiplicative scale s for decoded vols.
+    Now uses a composite criterion (MAE, RMSE, QLIKE) with grid search over candidate scales.
     """
     if y_true_dec is None or y_pred_dec is None:
         return 1.0
-    y = y_true_dec.reshape(-1)
-    p = y_pred_dec.reshape(-1)
+    y = y_true_dec.reshape(-1).to(dtype=torch.float32)
+    p = y_pred_dec.reshape(-1).to(dtype=torch.float32)
     if y.numel() == 0 or p.numel() == 0:
         return 1.0
-    y32 = y.to(dtype=torch.float32)
-    p32 = p.to(dtype=torch.float32)
-    sigma2_y = torch.clamp(y32.abs(), min=eps) ** 2
-    sigma2_p = torch.clamp(p32.abs(), min=eps) ** 2
-    ratio = sigma2_y / sigma2_p
-    r_clamped = torch.clamp(ratio, min=1e-6, max=1e6)
-    s2 = torch.clamp(r_clamped.mean(), min=eps)
-    return float(torch.sqrt(s2).item())
+
+    eps = float(eps)
+
+    # --- Candidate scales ---
+    # 1) MSE-optimal scale (regression through origin)
+    denom = float((p * p).mean().item()) if p.numel() > 0 else 0.0
+    s_mse = (float((y * p).mean().item()) / max(denom, eps)) if denom > 0 else 1.0
+    if not (s_mse > 0 and math.isfinite(s_mse)):
+        s_mse = 1.0
+
+    # 2) QLIKE-optimal scale (second-moment matching)
+    s2 = torch.clamp((torch.clamp(y.abs(), min=eps) ** 2) / (torch.clamp(p.abs(), min=eps) ** 2), min=1e-6, max=1e6).mean()
+    s_qlike = float(torch.sqrt(torch.clamp(s2, min=eps)).item())
+
+    # 3) MAE-ish scale (median of ratios)
+    r = torch.clamp(y.abs(), min=eps) / torch.clamp(p.abs(), min=eps)
+    s_med = float(torch.median(r).item())
+    if not (s_med > 0 and math.isfinite(s_med)):
+        s_med = 1.0
+
+    # 4) Build a candidate set with small grids around each base scale and around 1.0
+    grid = [0.5, 0.67, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0]
+    cands = {1.0}
+    for base in (s_mse, s_qlike, s_med, 1.0):
+        if base > 0 and math.isfinite(base):
+            for g in grid:
+                s = base * g
+                if s > 0 and math.isfinite(s):
+                    cands.add(float(s))
+
+    # --- Evaluate composite score for each candidate and pick the best ---
+    best_s = 1.0
+    best_comp = float("inf")
+    for s in cands:
+        ps = p * s
+        diff = ps - y
+        mae = float(diff.abs().mean().item())
+        mse = float((diff ** 2).mean().item())
+        rmse = float(math.sqrt(mse))
+        s2y = torch.clamp(y.abs(), min=eps) ** 2
+        s2p = torch.clamp(ps.abs(), min=eps) ** 2
+        ratio = s2y / s2p
+        qlike = float((ratio - torch.log(ratio) - 1.0).mean().item())
+        comp = composite_score(mae, rmse, qlike, weights=COMP_WEIGHTS)
+        if comp < best_comp:
+            best_comp = comp
+            best_s = s
+
+    # Clamp to avoid extreme corrections
+    best_s = float(max(0.2, min(5.0, best_s)))
+    return best_s
+
+
+# --- Composite-optimal per-asset calibration helpers ---
+@torch.no_grad()
+def compute_best_scale_composite(y_true_dec: torch.Tensor, y_pred_dec: torch.Tensor, weights=COMP_WEIGHTS, eps: float = 1e-12) -> float:
+    """Return multiplicative scale s that minimises the same composite score used for validation
+    (w_mae * MAE + w_rmse * RMSE + w_qlike * QLIKE). Safe for per-asset use.
+    """
+    if y_true_dec is None or y_pred_dec is None:
+        return 1.0
+    y = y_true_dec.reshape(-1).to(dtype=torch.float32)
+    p = y_pred_dec.reshape(-1).to(dtype=torch.float32)
+    if y.numel() == 0 or p.numel() == 0:
+        return 1.0
+
+    eps = float(eps)
+
+    denom = float((p * p).mean().item()) if p.numel() > 0 else 0.0
+    s_mse = (float((y * p).mean().item()) / max(denom, eps)) if denom > 0 else 1.0
+    if not (s_mse > 0 and math.isfinite(s_mse)):
+        s_mse = 1.0
+
+    s2 = torch.clamp((torch.clamp(y.abs(), min=eps) ** 2) / (torch.clamp(p.abs(), min=eps) ** 2), min=1e-6, max=1e6).mean()
+    s_qlike = float(torch.sqrt(torch.clamp(s2, min=eps)).item())
+
+    r = torch.clamp(y.abs(), min=eps) / torch.clamp(p.abs(), min=eps)
+    s_med = float(torch.median(r).item())
+    if not (s_med > 0 and math.isfinite(s_med)):
+        s_med = 1.0
+
+    grid = [0.5, 0.67, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0]
+    cands = {1.0}
+    for base in (s_mse, s_qlike, s_med, 1.0):
+        if base > 0 and math.isfinite(base):
+            for g in grid:
+                s = base * g
+                if s > 0 and math.isfinite(s):
+                    cands.add(float(s))
+
+    best_s = 1.0
+    best_comp = float("inf")
+    for s in cands:
+        ps = p * s
+        diff = ps - y
+        mae = float(diff.abs().mean().item())
+        mse = float((diff ** 2).mean().item())
+        rmse = float(math.sqrt(mse))
+        s2y = torch.clamp(y.abs(), min=eps) ** 2
+        s2p = torch.clamp(ps.abs(), min=eps) ** 2
+        ratio = s2y / s2p
+        qlike = float((ratio - torch.log(ratio) - 1.0).mean().item())
+        comp = composite_score(mae, rmse, qlike, weights=weights)
+        if comp < best_comp:
+            best_comp = comp
+            best_s = s
+
+    return float(max(0.2, min(5.0, best_s)))
 
 import json as _json
 
@@ -1307,6 +1406,8 @@ class PerAssetMetrics(pl.Callback):
         g_cpu  = g.detach().cpu()
         yd_cpu = yd.detach().cpu() if yd is not None else None
         pdir_cpu = pdir.detach().cpu() if pdir is not None else None
+        # optional time index for DA computation
+        t_cpu = torch.cat(self._t_dev).detach().cpu() if self._t_dev else None
 
         # Resolve 1-based epoch number for file naming
         try:
@@ -1315,12 +1416,13 @@ class PerAssetMetrics(pl.Callback):
             _epoch_now = None
     
 
-        # Compute and persist global validation calibration scale (QLIKE-optimal)
+        # Compute and persist global validation calibration scale (composite-optimal)
         try:
-            s = compute_global_scale(y_cpu, p_cpu)
+            s = compute_best_scale_composite(y_cpu, p_cpu, weights=COMP_WEIGHTS)
             global GLOBAL_CAL_SCALE
             GLOBAL_CAL_SCALE = float(s)
             _save_val_cal_scale(GLOBAL_CAL_SCALE)
+            print(f"[CAL] chosen global scale (composite-opt): s={GLOBAL_CAL_SCALE:.6g}")
         except Exception as _e:
             print(f"[WARN] Could not compute/save validation calibration scale: {_e}")
         if _epoch_now is not None:
@@ -1344,28 +1446,23 @@ class PerAssetMetrics(pl.Callback):
         except Exception:
             pass
 
-        # --- Compute & save per-asset QLIKE-optimal scales s_a (validation only) ---
+        # --- Compute & save per-asset composite-optimal scales s_a (validation only) ---
         try:
             assets = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
             df_pa = pd.DataFrame({"asset": assets, "y": y_cpu.numpy(), "p": p_cpu.numpy()})
             scales = {}
-            eps = 1e-12
             for a, gdf in df_pa.groupby("asset", sort=False):
                 y_a = torch.tensor(gdf["y"].values, dtype=torch.float32)
                 p_a = torch.tensor(gdf["p"].values, dtype=torch.float32)
-                if len(gdf) == 0:
+                if y_a.numel() == 0 or p_a.numel() == 0:
                     continue
-                s2y = torch.clamp(y_a.abs(), min=eps) ** 2
-                s2p = torch.clamp(p_a.abs(), min=eps) ** 2
-                ratio = s2y / s2p
-                ratio = torch.clamp(ratio, min=1e-6, max=1e6)
-                s2 = torch.clamp(ratio.mean(), min=eps)
-                scales[str(a)] = float(torch.sqrt(s2).item())
+                s_a = compute_best_scale_composite(y_a, p_a, weights=COMP_WEIGHTS)
+                scales[str(a)] = float(s_a)
             if scales:
                 PER_ASSET_CAL_SCALES = scales
                 _save_val_per_asset_scales(scales)
             if _epoch_now is not None and PER_ASSET_CAL_SCALES:
-                 _save_epoch_per_asset_scales(_epoch_now, PER_ASSET_CAL_SCALES)
+                _save_epoch_per_asset_scales(_epoch_now, PER_ASSET_CAL_SCALES)
         except Exception as e:
             print(f"[WARN] per-asset scale computation failed: {e}")
 
@@ -1381,11 +1478,37 @@ class PerAssetMetrics(pl.Callback):
         ratio    = sigma2_y / sigma2_p
         overall_qlike = float((ratio - torch.log(ratio) - 1.0).mean().item())
 
+        # Normalized MSE (vs constant-mean baseline)
+        var_y = float(((y_cpu - y_cpu.mean()) ** 2).mean().item())
+        overall_nmse = overall_mse / max(eps, var_y)
+
+        # Directional Accuracy (DA) of volatility changes (sorted by time per asset)
+        overall_da = None
+        try:
+            if t_cpu is not None:
+                import numpy as _np
+                assets_da = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
+                df_da = pd.DataFrame({"asset": assets_da, "t": t_cpu.numpy(), "y": y_cpu.numpy(), "p": p_cpu.numpy()})
+                matches = []
+                for a, gdf in df_da.groupby("asset", sort=False):
+                    gdf = gdf.sort_values("t")
+                    y_diff = _np.diff(gdf["y"].values)
+                    p_diff = _np.diff(gdf["p"].values)
+                    valid = (y_diff != 0) | (p_diff != 0)
+                    if valid.any():
+                        m = (_np.sign(y_diff[valid]) * _np.sign(p_diff[valid]) > 0)
+                        matches.extend(list(m.astype(float)))
+                if len(matches) > 0:
+                    overall_da = float(_np.mean(matches))
+        except Exception as _e:
+            overall_da = None
+
         # --- Calibrated regression metrics (overall) ---
         overall_mae_cal = None
         overall_mse_cal = None
         overall_rmse_cal = None
         overall_qlike_cal = None if 'overall_qlike_cal' not in locals() else overall_qlike_cal
+        overall_nmse_cal = None
         try:
             if 'p_cal' not in locals():
                 p_cal = calibrate_vol_predictions(y_cpu, p_cpu)
@@ -1396,6 +1519,10 @@ class PerAssetMetrics(pl.Callback):
             sigma2_pc = torch.clamp(p_cal.abs(), min=eps) ** 2
             ratio_cal = sigma2_y / sigma2_pc
             overall_qlike_cal = float((ratio_cal - torch.log(ratio_cal) - 1.0).mean().item())
+            try:
+                overall_nmse_cal = overall_mse_cal / max(eps, var_y)
+            except Exception:
+                pass
         except Exception as _e:
             pass
 
@@ -1452,7 +1579,12 @@ class PerAssetMetrics(pl.Callback):
         trainer.callback_metrics["val_qlike_overall"]     = torch.tensor(overall_qlike)
         trainer.callback_metrics["val_qlike_cal"]         = torch.tensor(overall_qlike_cal)
         trainer.callback_metrics["val_N_overall"]         = torch.tensor(float(N))
-        # Add calibrated metrics to callback_metrics if available
+        # Add NMSE, DA, and calibrated metrics to callback_metrics if available
+        trainer.callback_metrics["val_nmse_overall"] = torch.tensor(overall_nmse)
+        if overall_nmse_cal is not None:
+            trainer.callback_metrics["val_nmse_cal"] = torch.tensor(overall_nmse_cal)
+        if overall_da is not None:
+            trainer.callback_metrics["val_da_overall"] = torch.tensor(overall_da)
         if overall_mae_cal is not None:
             trainer.callback_metrics['val_mae_cal']   = torch.tensor(overall_mae_cal)
             trainer.callback_metrics['val_mse_cal']   = torch.tensor(overall_mse_cal)
@@ -1465,9 +1597,11 @@ class PerAssetMetrics(pl.Callback):
             f"(decoded) MAE={overall_mae:.6f} "
             f"RMSE={overall_rmse:.6f} "
             f"MSE={overall_mse:.6f} "
+            f"NMSE={overall_nmse:.6f} "
             f"QLIKE={overall_qlike:.6f} "
             f"CompLoss = {val_comp:.6f} "
             + (f"QLIKE_CAL={overall_qlike_cal:.6f} " if overall_qlike_cal is not None else "")
+            + (f" | DA={overall_da:.3f}" if overall_da is not None else "")
             + (f" | ACC={acc:.3f}"   if acc   is not None else "")
             + (f" | Brier={brier:.4f}" if brier is not None else "")
             + (f" | AUROC={auroc:.3f}" if auroc is not None else "")
@@ -1481,6 +1615,7 @@ class PerAssetMetrics(pl.Callback):
                 f"MAE={overall_mae_cal:.6f} "
                 f"RMSE={overall_rmse_cal:.6f} "
                 f"MSE={overall_mse_cal:.6f} "
+                f"NMSE={overall_nmse_cal:.6f} "
                 f"QLIKE={overall_qlike_cal:.6f} "
                 f"| N={N}"
             )
@@ -1497,6 +1632,8 @@ class PerAssetMetrics(pl.Callback):
                 "y": y_cpu.numpy(),
                 "p": p_cpu.numpy(),
             })
+            if t_cpu is not None:
+                dfm["t"] = t_cpu.numpy()
             if yd_cpu is not None and pdir_cpu is not None and yd_cpu.numel() > 0 and pdir_cpu.numel() > 0:
                 # ensure probs in [0,1]
                 probs = pdir_cpu
@@ -1518,19 +1655,37 @@ class PerAssetMetrics(pl.Callback):
                 mse_a = float(((p_a - y_a) ** 2).mean().item())
                 rmse_a = float(mse_a ** 0.5)
 
+                # NMSE vs. mean-baseline for this asset
+                var_a = float(((y_a - y_a.mean()) ** 2).mean().item())
+                nmse_a = mse_a / max(1e-8, var_a)
+
+                # QLIKE per asset
                 s2p = torch.clamp(torch.tensor(np.abs(gdf["p"].values)), min=eps) ** 2
                 s2y = torch.clamp(torch.tensor(np.abs(gdf["y"].values)), min=eps) ** 2
                 ratio_a = s2y / s2p
                 qlike_a = float((ratio_a - torch.log(ratio_a) - 1.0).mean().item())
+
+                # Directional Accuracy of vol changes for this asset (if time present)
+                da_a = None
+                try:
+                    if "t" in gdf.columns:
+                        gdf_sorted = gdf.sort_values("t")
+                        ydif = np.diff(gdf_sorted["y"].values)
+                        pdif = np.diff(gdf_sorted["p"].values)
+                        valid = (ydif != 0) | (pdif != 0)
+                        if valid.any():
+                            da_a = float(((np.sign(ydif[valid]) * np.sign(pdif[valid])) > 0).mean())
+                except Exception:
+                    da_a = None
 
                 acc_a = None
                 if "yd" in gdf.columns and "pd" in gdf.columns:
                     acc_a = float(((torch.tensor(gdf["pd"].values) >= 0.5).int() ==
                                    torch.tensor(gdf["yd"].values).int()).float().mean().item())
 
-                rows.append((a, mae_a, rmse_a, mse_a, qlike_a, acc_a, n_a))
+                rows.append((a, mae_a, rmse_a, mse_a, nmse_a, qlike_a, da_a, acc_a, n_a))
 
-            # --- Compute per-asset QLIKE-optimal multiplicative scales and persist ---
+            # --- Compute per-asset composite-optimal multiplicative scales and persist ---
             try:
                 pa_scales = {}
                 for a, gdf in dfm.groupby("asset", sort=False):
@@ -1538,13 +1693,8 @@ class PerAssetMetrics(pl.Callback):
                     p_a = torch.tensor(gdf["p"].values, dtype=torch.float32)
                     if y_a.numel() == 0 or p_a.numel() == 0:
                         continue
-                    s2y = torch.clamp(y_a.abs(), min=eps) ** 2
-                    s2p = torch.clamp(p_a.abs(), min=eps) ** 2
-                    ratio = s2y / s2p
-                    ratio = torch.clamp(ratio, min=1e-6, max=1e6)
-                    s2 = torch.clamp(ratio.mean(), min=eps)
-                    s  = float(torch.sqrt(s2).item())
-                    pa_scales[str(a)] = s
+                    s_a = compute_best_scale_composite(y_a, p_a, weights=COMP_WEIGHTS)
+                    pa_scales[str(a)] = float(s_a)
                 if pa_scales:
                     PER_ASSET_CAL_SCALES = pa_scales
                     _save_val_per_asset_scales(pa_scales)
@@ -1572,7 +1722,7 @@ class PerAssetMetrics(pl.Callback):
                     y_a = torch.tensor(gdf["y"].values)
                     p_a = torch.tensor(gdf["p"].values)
                     n_a = int(len(gdf))
-                    # Choose scale: per-asset first, else global, else 1.0 (s computed from mean(y^2/p^2))
+                    # Choose scale: per-asset first, else global, else 1.0
                     s_a = 1.0
                     if pa_scales_loaded is not None and str(a) in pa_scales_loaded:
                         s_a = float(pa_scales_loaded[str(a)])
@@ -1584,17 +1734,34 @@ class PerAssetMetrics(pl.Callback):
                     mse_c = float((diff_c ** 2).mean().item())
                     rmse_c = float(mse_c ** 0.5)
 
+                    # NMSE_cal uses same var(y_a)
+                    var_a = float(((y_a - y_a.mean()) ** 2).mean().item())
+                    nmse_c = mse_c / max(eps_local, var_a)
+
                     s2pc = torch.clamp(torch.tensor(np.abs(p_ac.numpy())), min=eps_local) ** 2
                     s2yc = torch.clamp(torch.tensor(np.abs(y_a.numpy())),  min=eps_local) ** 2
                     ratio_c = s2yc / s2pc
                     qlike_c = float((ratio_c - torch.log(ratio_c) - 1.0).mean().item())
 
-                    rows_cal.append((a, mae_c, rmse_c, mse_c, qlike_c, n_a))
+                    # DA on calibrated predictions (identical to uncal for positive scales)
+                    da_c = None
+                    try:
+                        if "t" in gdf.columns:
+                            gdf_sorted = gdf.sort_values("t")
+                            ydif = np.diff(gdf_sorted["y"].values)
+                            pdif = np.diff((p_ac.numpy()))
+                            valid = (ydif != 0) | (pdif != 0)
+                            if valid.any():
+                                da_c = float(((np.sign(ydif[valid]) * np.sign(pdif[valid])) > 0).mean())
+                    except Exception:
+                        da_c = None
+
+                    rows_cal.append((a, mae_c, rmse_c, mse_c, nmse_c, qlike_c, da_c, n_a))
             except Exception as _e:
                 print(f"[WARN] per-asset calibrated metrics failed: {_e}")
 
             # sort by sample count (desc) so “top by samples” prints nicely
-            rows.sort(key=lambda r: r[6], reverse=True)
+            rows.sort(key=lambda r: r[8], reverse=True)
             # Store both uncalibrated and calibrated for on_fit_end
             self._last_rows = rows
             self._last_rows_cal = rows_cal if 'rows_cal' in locals() else []
@@ -1604,22 +1771,28 @@ class PerAssetMetrics(pl.Callback):
                 k = min(5, getattr(self, "max_print", 5))
                 if rows:
                     print("Per-asset (epoch snapshot, top by samples):")
-                    print("asset | MAE | RMSE | MSE | QLIKE | ACC | N")
+                    print("asset | MAE | RMSE | MSE | NMSE | QLIKE | DA | ACC | N")
                     for r in rows[:k]:
-                        acc_str = "-" if r[5] is None else f"{r[5]:.3f}"
-                        print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {acc_str} | {r[6]}")
+                        acc_str = "-" if r[7] is None else f"{r[7]:.3f}"
+                        da_str  = "-" if r[6] is None else f"{r[6]:.3f}"
+                        print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {r[5]:.6f} | {da_str} | {acc_str} | {r[8]}")
             except Exception as _e:
                 print(f"[WARN] per-epoch per-asset print failed: {_e}")
 
             # --- Calibrated per-epoch per-asset snapshot (top by samples) ---
             try:
                 if rows_cal:
-                    rows_cal.sort(key=lambda r: r[5], reverse=True)
+                    rows_cal.sort(key=lambda r: r[7], reverse=True)
                     k = min(5, getattr(self, "max_print", 5))
                     print("Per-asset (CALIBRATED snapshot, top by samples):")
-                    print("asset | MAE | RMSE | MSE | QLIKE | N")
+                    print("asset | MAE | RMSE | MSE | NMSE | QLIKE | DA | N")
+                    if pa_scales_loaded is not None:
+                        print("(using composite-opt per-asset scales)")
+                    elif s_global is not None:
+                        print(f"(using composite-opt global scale s={s_global:.6g})")
                     for r in rows_cal[:k]:
-                        print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {r[5]}")
+                        da_str = "-" if r[6] is None else f"{r[6]:.3f}"
+                        print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {r[5]:.6f} | {da_str} | {r[7]}")
             except Exception as _e:
                 print(f"[WARN] per-epoch per-asset calibrated print failed: {_e}")
 
@@ -1632,7 +1805,9 @@ class PerAssetMetrics(pl.Callback):
             "mae": overall_mae,
             "rmse": overall_rmse,
             "mse": overall_mse,
+            "nmse": overall_nmse,
             "qlike": overall_qlike,
+            "da": overall_da,
             "val_loss": val_comp,
             "dir_bce": brier,   # (kept for backwards compatibility with your saver)
             "yd": yd_cpu,
@@ -1641,6 +1816,7 @@ class PerAssetMetrics(pl.Callback):
             "mae_cal": overall_mae_cal,
             "rmse_cal": overall_rmse_cal,
             "mse_cal": overall_mse_cal,
+            "nmse_cal": overall_nmse_cal,
             "qlike_cal": overall_qlike_cal,
         }
 
@@ -1651,29 +1827,37 @@ class PerAssetMetrics(pl.Callback):
         rows = self._last_rows
         overall = self._last_overall
         print("\nOverall decoded metrics (final):")
-        print(f"UNCAL — MAE: {overall['mae']:.6f} | RMSE: {overall['rmse']:.6f} | MSE: {overall['mse']:.6f} | QLIKE: {overall['qlike']:.6f}")
+        da_final = overall.get('da', None)
+        da_str = f" | DA: {da_final:.3f}" if isinstance(da_final, float) else ""
+        print(
+            f"UNCAL — MAE: {overall['mae']:.6f} | RMSE: {overall['rmse']:.6f} | MSE: {overall['mse']:.6f} | NMSE: {overall.get('nmse', float('nan')):.6f} | QLIKE: {overall['qlike']:.6f}" + da_str
+        )
         # If calibrated fields were stored in overall dict by on_validation_epoch_end, print them too
         mae_cal  = overall.get('mae_cal', None)
         rmse_cal = overall.get('rmse_cal', None)
         mse_cal  = overall.get('mse_cal', None)
         ql_cal   = overall.get('qlike_cal', None)
         if mae_cal is not None and ql_cal is not None:
-            print(f"CALIB — MAE: {mae_cal:.6f} | RMSE: {rmse_cal:.6f} | MSE: {mse_cal:.6f} | QLIKE: {ql_cal:.6f}")
+            print(
+                f"CALIB — MAE: {mae_cal:.6f} | RMSE: {rmse_cal:.6f} | MSE: {mse_cal:.6f} | NMSE: {overall.get('nmse_cal', float('nan')):.6f} | QLIKE: {ql_cal:.6f}"
+            )
 
         print("\nPer-asset validation metrics (top by samples):")
-        print("asset | MAE | RMSE | MSE | QLIKE | ACC | N")
+        print("asset | MAE | RMSE | MSE | NMSE | QLIKE | DA | ACC | N")
         for r in rows[: self.max_print]:
-            acc_str = "-" if r[5] is None else f"{r[5]:.3f}"
-            print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {acc_str} | {r[6]}")
+            acc_str = "-" if r[7] is None else f"{r[7]:.3f}"
+            da_str  = "-" if r[6] is None else f"{r[6]:.3f}"
+            print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {r[5]:.6f} | {da_str} | {acc_str} | {r[8]}")
 
         # Calibrated per-asset table at fit end (if available)
         try:
             rows_cal = getattr(self, "_last_rows_cal", [])
             if rows_cal:
                 print("\nPer-asset validation metrics (CALIBRATED, top by samples):")
-                print("asset | MAE | RMSE | MSE | QLIKE | N")
+                print("asset | MAE | RMSE | MSE | NMSE | QLIKE | DA | N")
                 for r in rows_cal[: self.max_print]:
-                    print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {r[5]}")
+                    da_str = "-" if r[6] is None else f"{r[6]:.3f}"
+                    print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {r[5]:.6f} | {da_str} | {r[7]}")
         except Exception as _e:
             print(f"[WARN] Could not print calibrated per-asset metrics at end: {_e}")
 
@@ -1714,10 +1898,10 @@ class PerAssetMetrics(pl.Callback):
             import re as _re
             out = {
                 "decoded": True,
-                "overall": {k: v for k, v in overall.items() if k in ("mae","rmse","mse","qlike","val_loss","dir_bce")},
+                "overall": {k: v for k, v in overall.items() if k in ("mae","rmse","mse","nmse","qlike","da","val_loss","dir_bce")},
                 "direction_overall": dir_overall,
                 "per_asset": [
-                    {"asset": r[0], "mae": r[1], "rmse": r[2], "mse": r[3], "qlike": r[4], "acc": r[5], "n": r[6]}
+                    {"asset": r[0], "mae": r[1], "rmse": r[2], "mse": r[3], "nmse": r[4], "qlike": r[5], "da": r[6], "acc": r[7], "n": r[8]}
                     for r in rows
                 ],
             }
