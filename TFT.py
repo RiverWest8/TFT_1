@@ -608,16 +608,47 @@ def _collect_predictions(
     yv_dec = torch.clamp(yv_dec, min=floor_val)
     pv_dec = torch.clamp(pv_dec, min=floor_val)
 
-    # Calibration disabled: pv_dec is left unchanged
-    # (global/per-asset multipliers intentionally not applied)  
+    # ---- Assemble asset names and time indices on CPU ----
+    # Concatenate time indices if we collected any
+    t_cpu = torch.cat(all_t) if all_t else None
+
+    # Map group-id → asset string via id_to_name (fallback to numeric str)
+    _id2n = {}
+    try:
+        if id_to_name is not None:
+            _id2n = {int(k): str(v) for k, v in id_to_name.items()}
+    except Exception:
+        _id2n = {}
+
+    assets = [ _id2n.get(int(i), str(int(i))) for i in g_cpu.tolist() ]
 
     # Base frame with asset and time_idx
-    df = pd.DataFrame({
-        "asset": assets,
-        "time_idx": t_cpu.numpy().tolist() if t_cpu is not None else [None] * len(assets),
-        "y_vol": yv_dec.numpy().tolist(),
-        "y_vol_pred": pv_dec.numpy().tolist(),
-    })
+    if t_cpu is not None:
+        time_idx_list = t_cpu.numpy().tolist()
+        # Align length in case of any stray mismatch
+        Lmin = min(len(assets), len(time_idx_list), yv_dec.numel(), pv_dec.numel())
+        assets = assets[:Lmin]
+        time_idx_list = time_idx_list[:Lmin]
+        y_list = yv_dec[:Lmin].numpy().tolist()
+        p_list = pv_dec[:Lmin].numpy().tolist()
+        df = pd.DataFrame({
+            "asset": assets,
+            "time_idx": time_idx_list,
+            "y_vol": y_list,
+            "y_vol_pred": p_list,
+        })
+    else:
+        # No time indices collected; still save predictions
+        Lmin = min(len(assets), yv_dec.numel(), pv_dec.numel())
+        assets = assets[:Lmin]
+        y_list = yv_dec[:Lmin].numpy().tolist()
+        p_list = pv_dec[:Lmin].numpy().tolist()
+        df = pd.DataFrame({
+            "asset": assets,
+            "time_idx": [None] * Lmin,
+            "y_vol": y_list,
+            "y_vol_pred": p_list,
+        })
     df["asset"] = df["asset"].astype(str)
     # Merge in wall-clock Time the same way validation parquet does
     try:
@@ -649,10 +680,11 @@ def _collect_predictions(
         if needs_sigmoid:
             pd_all = torch.sigmoid(pd_all)
         pd_all = torch.clamp(pd_all, 0.0, 1.0)
-        Lm = min(len(df), yd_all.numel(), pd_all.numel())
-        df = df.iloc[:Lm].copy()
-        df["y_dir"] = yd_all[:Lm].numpy().tolist()
-        df["y_dir_prob"] = pd_all[:Lm].numpy().tolist()
+        Ldp = min(len(df), yd_all.numel(), pd_all.numel())
+        if Ldp > 0:
+            df = df.iloc[:Ldp].copy()
+            df["y_dir"] = yd_all[:Ldp].numpy().tolist()
+            df["y_dir_prob"] = pd_all[:Ldp].numpy().tolist()
 
     if out_path is not None:
         out_path = Path(out_path)
@@ -1733,26 +1765,13 @@ class PerAssetMetrics(pl.Callback):
             f"NMSE={overall_nmse:.6f} "
             f"QLIKE={overall_qlike:.6f} "
             f"CompLoss = {val_comp:.6f} "
-            + (f"QLIKE_CAL={overall_qlike_cal:.6f} " if overall_qlike_cal is not None else "")
-            + (f" | DA={overall_da:.3f}" if overall_da is not None else "")
             + (f" | ACC={acc:.3f}"   if acc   is not None else "")
             + (f" | Brier={brier:.4f}" if brier is not None else "")
             + (f" | AUROC={auroc:.3f}" if auroc is not None else "")
             + f" | N={N}"
         )
         print(msg)
-        # Print calibrated summary on a separate line for clarity
-        if overall_mae_cal is not None and overall_qlike_cal is not None:
-            msg_cal = (
-                f"[VAL EPOCH {epoch_num}] CALIBRATED "
-                f"MAE={overall_mae_cal:.6f} "
-                f"RMSE={overall_rmse_cal:.6f} "
-                f"MSE={overall_mse_cal:.6f} "
-                f"NMSE={overall_nmse_cal:.6f} "
-                f"QLIKE={overall_qlike_cal:.6f} "
-                f"| N={N}"
-            )
-            print(msg_cal)
+
 
         # --- Per-asset metrics table (so on_fit_end can print it) ---
         self._last_rows = []
