@@ -464,6 +464,21 @@ def manual_inverse_transform_groupnorm(normalizer, y: torch.Tensor, group_ids: t
     return x.view_as(y)
 
 
+def _move_to_device(obj, device):
+    """
+    Recursively move tensors (in dicts/lists/tuples) to `device`.
+    Leaves non-tensors untouched.
+    """
+    import torch as _t
+    if _t.is_tensor(obj):
+        return obj.to(device, non_blocking=True)
+    if isinstance(obj, dict):
+        return {k: _move_to_device(v, device) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        seq = [ _move_to_device(v, device) for v in obj ]
+        return type(obj)(seq) if isinstance(obj, tuple) else seq
+    return obj
+
 @torch.no_grad()
 def _collect_predictions(
     model,
@@ -512,6 +527,11 @@ def _collect_predictions(
         ts_map_df = None
 
     model.eval()
+    # Ensure we run the forward on the same device as the model (we moved model to CPU above)
+    try:
+        model_device = next(model.parameters()).device
+    except StopIteration:
+        model_device = torch.device("cpu")
     all_g, all_yv, all_pv, all_yd, all_pd, all_t = [], [], [], [], [], []
 
     for batch in dataloader:
@@ -519,6 +539,10 @@ def _collect_predictions(
             continue
         x = batch[0]
         yb = batch[1] if len(batch) > 1 else None
+        # --- NEW: force batch onto model device to avoid CPU/CUDA mismatches or hangs
+        x  = _move_to_device(x,  model_device)
+        if yb is not None:
+            yb = _move_to_device(yb, model_device)
         if not isinstance(x, dict):
             continue
 
@@ -581,7 +605,13 @@ def _collect_predictions(
             all_yd.append(y_dir_t.reshape(-1)[:L].detach().cpu())
             all_pd.append(p_dir.reshape(-1)[:L].detach().cpu())
 
-        dec_time = _first_not_none(x, ("decoder_time_idx", "decoder_relative_idx"))
+        # Safely pick a decoder time index without boolean-evaluating tensors
+        dec_time = None
+        if isinstance(x, dict):
+            if "decoder_time_idx" in x and x["decoder_time_idx"] is not None:
+                dec_time = x["decoder_time_idx"]
+            elif "decoder_relative_idx" in x and x["decoder_relative_idx"] is not None:
+                dec_time = x["decoder_relative_idx"]
         if dec_time is not None and torch.is_tensor(dec_time):
             tvec = dec_time
             while tvec.ndim > 1 and tvec.size(-1) == 1:
@@ -816,6 +846,12 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
         print(f"[INFO] Loaded with strict=False (missing={len(_missing)}, unexpected={len(_unexpected)})")
 
     model = model.to("cpu").eval()
+
+    try:
+        _dev = next(model.parameters()).device
+        print(f"[EXPORT] model device for export: {_dev}")
+    except Exception:
+        pass
 
     try:
         vol_norm = _extract_norm_from_dataset(dataloader.dataset)
@@ -1858,72 +1894,6 @@ class PerAssetMetrics(pl.Callback):
             except Exception as _e:
                 print(f"[WARN] Could not compute/save per-asset scales: {_e}")
 
-            # --- Calibrated per-asset metrics (use per-asset s_a if available, else global s) ---
-            rows_cal = []
-            try:
-                # Load scales computed earlier this epoch or from disk
-                s_global = None
-                try:
-                    s_global = GLOBAL_CAL_SCALE if (GLOBAL_CAL_SCALE is not None) else _load_val_cal_scale()
-                except Exception:
-                    s_global = None
-                try:
-                    pa_scales_loaded = PER_ASSET_CAL_SCALES if (PER_ASSET_CAL_SCALES is not None) else _load_val_per_asset_scales()
-                except Exception:
-                    pa_scales_loaded = None
-                if pa_scales_loaded is not None:
-                    pa_scales_loaded = {str(k): float(v) for k, v in pa_scales_loaded.items()}
-
-                eps_local = 1e-8
-                for a, gdf in dfm.groupby("asset", sort=False):
-                    y_a = torch.tensor(gdf["y"].values)
-                    p_a = torch.tensor(gdf["p"].values)
-                    n_a = int(len(gdf))
-                    # Choose scale: per-asset first, else global, else 1.0
-                    s_a = 1.0
-                    if pa_scales_loaded is not None and str(a) in pa_scales_loaded:
-                        s_a = float(pa_scales_loaded[str(a)])
-                    elif s_global is not None:
-                        s_a = float(s_global)
-                    p_ac = p_a * s_a
-                    diff_c = (p_ac - y_a)
-                    mae_c = float(diff_c.abs().mean().item())
-                    mse_c = float((diff_c ** 2).mean().item())
-                    rmse_c = float(mse_c ** 0.5)
-
-                    # NMSE_cal uses same var(y_a)
-                    var_a = float(((y_a - y_a.mean()) ** 2).mean().item())
-                    nmse_c = mse_c / max(eps_local, var_a)
-
-                    s2pc = torch.clamp(torch.tensor(np.abs(p_ac.numpy())), min=eps_local) ** 2
-                    s2yc = torch.clamp(torch.tensor(np.abs(y_a.numpy())),  min=eps_local) ** 2
-                    ratio_c = s2yc / s2pc
-                    qlike_c = float((ratio_c - torch.log(ratio_c) - 1.0).mean().item())
-
-                    # DA on calibrated predictions (identical to uncal for positive scales)
-                    da_c = None
-                    try:
-                        if "t" in gdf.columns:
-                            gdf_sorted = gdf.sort_values("t")
-                            ydif = np.diff(gdf_sorted["y"].values)
-                            pdif = np.diff(p_ac.numpy())
-                            if ydif.size > 0:
-                                thr = float(np.quantile(np.abs(ydif), DA_DEADBAND_Q))
-                                valid = (np.abs(ydif) > thr) | (np.abs(pdif) > thr * DA_PRED_FACTOR)
-                                if valid.any():
-                                    da_c = float(((np.sign(ydif[valid]) * np.sign(pdif[valid])) > 0).mean())
-                    except Exception:
-                        da_c = None
-
-                    rows_cal.append((a, mae_c, rmse_c, mse_c, nmse_c, qlike_c, da_c, n_a))
-            except Exception as _e:
-                print(f"[WARN] per-asset calibrated metrics failed: {_e}")
-
-            # sort by sample count (desc) so “top by samples” prints nicely
-            rows.sort(key=lambda r: r[8], reverse=True)
-            # Store both uncalibrated and calibrated for on_fit_end
-            self._last_rows = rows
-            self._last_rows_cal = rows_cal if 'rows_cal' in locals() else []
 
             # --- Per-epoch per-asset snapshot (top by samples) ---
             try:
@@ -1938,27 +1908,7 @@ class PerAssetMetrics(pl.Callback):
             except Exception as _e:
                 print(f"[WARN] per-epoch per-asset print failed: {_e}")
 
-            # --- Calibrated per-epoch per-asset snapshot (top by samples) ---
-            try:
-                if rows_cal:
-                    rows_cal.sort(key=lambda r: r[7], reverse=True)
-                    k = min(5, getattr(self, "max_print", 5))
-                    print("Per-asset (CALIBRATED snapshot, top by samples):")
-                    print("asset | MAE | RMSE | MSE | NMSE | QLIKE | DA | N")
-                    if pa_scales_loaded is not None:
-                        print("(using composite-opt per-asset scales)")
-                    elif s_global is not None:
-                        print(f"(using composite-opt global scale s={s_global:.6g})")
-                    for r in rows_cal[:k]:
-                        da_str = "-" if r[6] is None else f"{r[6]:.3f}"
-                        print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {r[5]:.6f} | {da_str} | {r[7]}")
-            except Exception as _e:
-                print(f"[WARN] per-epoch per-asset calibrated print failed: {_e}")
-
-        except Exception as e:
-            print(f"[WARN] per-asset aggregation failed: {e}")
-            self._last_rows = []
-
+  
         # stash overall for on_fit_end
         self._last_overall = {
             "mae": overall_mae,
@@ -1971,11 +1921,6 @@ class PerAssetMetrics(pl.Callback):
             "dir_bce": brier,   # (kept for backwards compatibility with your saver)
             "yd": yd_cpu,
             "pd": pdir_cpu,
-            # calibrated (if available)
-            "mae_cal": overall_mae_cal,
-            "rmse_cal": overall_rmse_cal,
-            "mse_cal": overall_mse_cal,
-            "nmse_cal": overall_nmse_cal,
             "qlike_cal": overall_qlike_cal,
         }
 
