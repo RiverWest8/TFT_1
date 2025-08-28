@@ -2057,7 +2057,10 @@ class PerAssetMetrics(pl.Callback):
                 yd1 = yd[:L].float()
                 pd1 = pd_all[:L]
                 try:
-                    if torch.isfinite(pd1).any() and (pd1.min() < 0 or pd1.max() > 1):
+                    _finite = bool(torch.isfinite(pd1).any().item())
+                    _min = float(pd1.min().item())
+                    _max = float(pd1.max().item())
+                    if _finite and ((_min < 0.0) or (_max > 1.0)):
                         pd1 = torch.sigmoid(pd1)
                 except Exception:
                     pd1 = torch.sigmoid(pd1)
@@ -2127,7 +2130,10 @@ class PerAssetMetrics(pl.Callback):
                     # ensure pdir is probability
                     pdp = pdir_cpu
                     try:
-                        if torch.isfinite(pdp).any() and (pdp.min() < 0 or pdp.max() > 1):
+                        _finite = bool(torch.isfinite(pdp).any().item())
+                        _min = float(pdp.min().item())
+                        _max = float(pdp.max().item())
+                        if _finite and ((_min < 0.0) or (_max > 1.0)):
                             pdp = torch.sigmoid(pdp)
                     except Exception:
                         pdp = torch.sigmoid(pdp)
@@ -2168,9 +2174,18 @@ class PerAssetMetrics(pl.Callback):
                             "[WARN] Could not locate a source dataframe with ['asset','time_idx','Time'] among candidates: "
                             "raw_df, raw_data, full_df, df (also checked val_df/train_df/test_df)."
                         )
+
                 except Exception as e:
                     print(f"[WARN] Failed to attach real timestamps: {e}")
-                pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+                # Use the actual current epoch in filenames (not MAX_EPOCHS)
+                try:
+                    _epoch_now = int(getattr(trainer, "current_epoch", -1)) + 1
+                except Exception:
+                    _epoch_now = None
+                if _epoch_now is not None:
+                    pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{_epoch_now}_{RUN_SUFFIX}.parquet"
+                else:
+                    pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_{RUN_SUFFIX}.parquet"
                 df_out.to_parquet(pred_path, index=False)
                 print(f"✓ Saved validation predictions (Parquet) → {pred_path}")
                 try:
@@ -2186,7 +2201,10 @@ class PerAssetMetrics(pl.Callback):
                         df_cal["y_vol_pred"] = (
                             torch.tensor(df_cal["y_vol_pred"].values) * float(s)
                         ).numpy().tolist()
-                        cal_path = LOCAL_OUTPUT_DIR / f"calibrated_validation_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+                        if _epoch_now is not None:
+                            cal_path = LOCAL_OUTPUT_DIR / f"calibrated_validation_predictions_e{_epoch_now}_{RUN_SUFFIX}.parquet"
+                        else:
+                            cal_path = LOCAL_OUTPUT_DIR / f"calibrated_validation_predictions_{RUN_SUFFIX}.parquet"
                         df_cal.to_parquet(cal_path, index=False)
                         print(f"✓ Saved calibrated validation predictions (Parquet) → {cal_path}")
                         try:
