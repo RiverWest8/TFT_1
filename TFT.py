@@ -631,7 +631,11 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dic
     })
     df["asset"] = df["asset"].astype(str)
     # Merge in wall-clock Time the same way validation parquet does
-    if ts_map_df is not None and df["time_idx"].notna().all():
+    try:
+        _ok = (ts_map_df is not None) and bool(df["time_idx"].notna().all())
+    except Exception:
+        _ok = False
+    if _ok:
         try:
             df["time_idx"] = df["time_idx"].astype(int)
             df = df.merge(ts_map_df, on=["asset", "time_idx"], how="left")
@@ -648,14 +652,12 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dic
         yd_all = torch.cat(all_yd)
         pd_all = torch.cat(all_pd)
         try:
-            needs_sigmoid = False
-            if bool(torch.isfinite(pd_all).any().item()):   
-                _min = float(pd_all.min().item())
-                _max = float(pd_all.max().item())
-                needs_sigmoid = (_min < 0.0) or (_max > 1.0)
-            if needs_sigmoid:
-                pd_all = torch.sigmoid(pd_all)
+            _min = float(pd_all.min().item())
+            _max = float(pd_all.max().item())
+            needs_sigmoid = (_min < 0.0) or (_max > 1.0)
         except Exception:
+            needs_sigmoid = True
+        if needs_sigmoid:
             pd_all = torch.sigmoid(pd_all)
         pd_all = torch.clamp(pd_all, 0.0, 1.0)
         Lm = min(len(df), yd_all.numel(), pd_all.numel())
@@ -671,6 +673,75 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dic
         return out_path
     return df
 
+# ---------------- Best checkpoint resolver ----------------
+from pathlib import Path as _Path
+import re as _re
+def _get_best_ckpt_path(trainer) -> str | None:
+    """
+    Return path to best checkpoint if available, else last.ckpt in the same dir,
+    else the newest *.ckpt under run dir. Prefers monitor='val_qlike_overall' in the filename.
+    """
+    # 1) If Trainer has a checkpoint callback with best_model_path, use it
+    try:
+        cb = None
+        for c in getattr(trainer, "callbacks", []):
+            if hasattr(c, "best_model_path") and getattr(c, "monitor", None) is not None:
+                cb = c
+                break
+        if cb and cb.best_model_path and str(cb.best_model_path).strip():
+            p = _Path(cb.best_model_path)
+            if p.exists():
+                return str(p)
+    except Exception:
+        pass
+
+    # 2) Fall back to trainer.checkpoint_callback if present
+    try:
+        cbc = getattr(trainer, "checkpoint_callback", None)
+        if cbc and getattr(cbc, "best_model_path", None):
+            p = _Path(cbc.best_model_path)
+            if p.exists():
+                return str(p)
+    except Exception:
+        pass
+
+    # 3) Try last.ckpt under the same directory used by checkpoint callback
+    ckpt_dir = None
+    try:
+        if cb and getattr(cb, "dirpath", None):
+            ckpt_dir = _Path(cb.dirpath)
+        elif cbc and getattr(cbc, "dirpath", None):
+            ckpt_dir = _Path(cbc.dirpath)
+    except Exception:
+        pass
+
+    if ckpt_dir and ckpt_dir.exists():
+        last = ckpt_dir / "last.ckpt"
+        if last.exists():
+            return str(last)
+        # 4) Pick a best *.ckpt file by min val_qlike_overall if pattern matches; else newest
+        files = sorted(ckpt_dir.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if files:
+            # try to pick by min val_qlike_overall in filename
+            best = None
+            best_val = None
+            for f in files:
+                m = _re.search(r"val_qlike_overall=([0-9.]+)", f.name)
+                if m:
+                    v = float(m.group(1))
+                    if (best_val is None) or (v < best_val):
+                        best = f; best_val = v
+            return str(best or files[0])
+
+    # 5) As a last resort, scan /tmp/tft_run/checkpoints
+    try:
+        default = _Path("/tmp/tft_run/checkpoints")
+        files = sorted(default.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if files:
+            return str(files[0])
+    except Exception:
+        pass
+    return None
 
 @torch.no_grad()
 def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: Path | str, id_to_name: dict | None = None):
@@ -695,10 +766,23 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
 
 
     import torch as _t
+    import torch.serialization as _ts
+    # Allow-list PF normalizer class for PyTorch 2.6 secure loader
+    try:
+        from pytorch_forecasting.data.encoders import MultiNormalizer as _PFMultiNorm
+        _ts.add_safe_globals([_PFMultiNorm])
+    except Exception:
+        pass
 
     # Reuse the in-memory model (same architecture/features) and load weights from ckpt
-    model = trainer.lightning_module  # <- critical: do NOT reconstruct a new model here
-    _sd = _t.load(ckpt, map_location="cpu")
+    model = trainer.lightning_module  # <- do NOT instantiate a new model (avoids shape mismatches)
+
+    # Try secure load first, then fall back to weights_only=False (trusted checkpoint)
+    try:
+        _sd = _t.load(ckpt, map_location="cpu")  # PyTorch 2.6 defaults to weights_only=True
+    except Exception:
+        _sd = _t.load(ckpt, map_location="cpu", weights_only=False)
+
     _state = _sd.get("state_dict", _sd)
 
     try:
