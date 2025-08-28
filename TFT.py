@@ -387,55 +387,68 @@ def _extract_heads(pred):
 @torch.no_grad()
 def manual_inverse_transform_groupnorm(normalizer, y: torch.Tensor, group_ids: torch.Tensor | None):
     """
-    Reverse GroupNormalizer:
-      1) destandardize: y -> y*scale + center (center may be None when center=False)
-      2) inverse transform: asinh -> sinh, identity -> no-op, else via registry
-    Works with scale_by_group=True (index by group_ids) or global scale.
+    Reverse GroupNormalizer on CPU to avoid CUDA/CPU indexing issues:
+      1) y_dec = y * scale[g] + center[g]   (or global scale/center)
+      2) apply inverse transformation ('log1p' -> expm1, etc.)
+    Always returns a tensor on the original device of `y`.
     """
+    import torch as _t
+    import numpy as _np
+
+    # Preserve original device for final return
+    orig_dev = y.device if _t.is_tensor(y) else _t.device("cpu")
+
+    # Work entirely on CPU inside this routine
+    cpu = _t.device("cpu")
+    y_cpu = y.detach().to(cpu)
+
+    # Pull center/scale; convert to 1D CPU tensors when present
     center = getattr(normalizer, "center", None)
     scale  = getattr(normalizer, "scale",  None)
-    y_ = y.squeeze(-1) if y.ndim > 1 else y
 
-    # --- Force CPU for robust offline decoding (prediction export paths) ---
-    try:
-        import torch as _t
-        cpu = _t.device("cpu")
-        if _t.is_tensor(y_):
-            y_ = y_.to(cpu)
-        if group_ids is not None and _t.is_tensor(group_ids):
-            group_ids = group_ids.to(cpu)
-    except Exception:
-        pass
+    def _to_1d_cpu_tensor(arr):
+        if arr is None:
+            return None
+        if _t.is_tensor(arr):
+            return arr.detach().to(cpu).view(-1)
+        if isinstance(arr, _np.ndarray):
+            return _t.as_tensor(arr, device=cpu).view(-1)
+        # scalar / list
+        try:
+            return _t.as_tensor(arr, device=cpu).view(-1)
+        except Exception:
+            return None
 
-    dev = torch.device("cpu")
-    if isinstance(center, torch.Tensor) and center.device != dev:
-     center = center.to(dev)
-    if isinstance(scale, torch.Tensor) and scale.device != dev:
-        scale = scale.to(dev)
+    center_t = _to_1d_cpu_tensor(center)
+    scale_t  = _to_1d_cpu_tensor(scale)
 
-    if scale is None:
-        x = y_
+    # Build per-sample center/scale on CPU
+    g = None
+    if group_ids is not None and _t.is_tensor(group_ids):
+        g = group_ids.detach().to(cpu).long().view(-1)
+
+    if scale_t is None:
+        x = y_cpu
     else:
-        if group_ids is not None and torch.is_tensor(group_ids):
-            g = group_ids
-            if g.ndim > 1 and g.size(-1) == 1:
-                g = g.squeeze(-1)
-            g = g.long()
-            # Ensure index tensor `g` is on the same device as scale/center
-            if isinstance(scale, torch.Tensor) and g.device != scale.device:
-                g = g.to(scale.device)
-            if isinstance(center, torch.Tensor) and g.device != center.device:
-                g = g.to(center.device)
-            s = scale[g] if isinstance(scale, torch.Tensor) else scale
-            c = center[g] if isinstance(center, torch.Tensor) else 0.0
+        if g is not None and scale_t.numel() > 1:
+            s = scale_t.index_select(0, g)
+            if center_t is not None and center_t.numel() > 1:
+                c = center_t.index_select(0, g)
+            else:
+                c = center_t[0] if (center_t is not None and center_t.numel() > 0) else _t.tensor(0.0, device=cpu)
+                if not _t.is_tensor(c):
+                    c = _t.as_tensor(float(c), device=cpu).expand_as(s)
         else:
-            s = scale
-            c = center if isinstance(center, torch.Tensor) else 0.0
-        x = y_ * s + c
+            s = scale_t[0] if scale_t.numel() > 0 else _t.tensor(1.0, device=cpu)
+            s = _t.as_tensor(float(s), device=cpu)
+            c = center_t[0] if (center_t is not None and center_t.numel() > 0) else _t.tensor(0.0, device=cpu)
+            c = _t.as_tensor(float(c), device=cpu)
+        x = y_cpu * s + c
 
+    # Inverse transformation
     tfm = getattr(normalizer, "transformation", None)
     if tfm == "log1p":
-        x = torch.expm1(x)
+        x = _t.expm1(x)
     elif tfm in (None, "identity"):
         pass
     else:
@@ -445,39 +458,10 @@ def manual_inverse_transform_groupnorm(normalizer, y: torch.Tensor, group_ids: t
         except Exception:
             pass
 
+    # Return on original device
+    if x.device != orig_dev:
+        x = x.to(orig_dev)
     return x.view_as(y)
-
-@torch.no_grad()
-def _get_best_ckpt_path(trainer) -> str | None:
-    """Return path to the best checkpoint chosen by `val_qlike_overall` if available.
-    Fallback to any `best_model_path`, else newest local .ckpt in LOCAL_CKPT_DIR.
-    """
-    best_path = None
-    try:
-        for cb in getattr(trainer, "callbacks", []):
-            if isinstance(cb, ModelCheckpoint):
-                mon = getattr(cb, "monitor", None)
-                bmp = getattr(cb, "best_model_path", "")
-                if mon == "val_qlike_overall" and bmp:
-                    return bmp
-        if not best_path:
-            for cb in getattr(trainer, "callbacks", []):
-                if isinstance(cb, ModelCheckpoint):
-                    bmp = getattr(cb, "best_model_path", "")
-                    if bmp:
-                        best_path = bmp
-                        break
-    except Exception:
-        pass
-    if best_path:
-        return best_path
-    try:
-        ckpts = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if ckpts:
-            return str(ckpts[0])
-    except Exception:
-        pass
-    return None
 
 
 @torch.no_grad()
@@ -718,13 +702,8 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
     except Exception:
         epoch_for_ckpt = None
 
-    # Load model and normalizer from the dataloader's dataset
-    model = TemporalFusionTransformer.load_from_checkpoint(ckpt)
-        # Force CPU inference to avoid device mismatches with dataset/normalizer
-    try:
-        model = model.to("cpu")
-    except Exception:
-        pass
+    model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu")
+    model = model.to("cpu")
     model.eval()
     try:
         vol_norm = _extract_norm_from_dataset(dataloader.dataset)
