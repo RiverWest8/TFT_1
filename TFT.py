@@ -608,30 +608,8 @@ def _collect_predictions(
     yv_dec = torch.clamp(yv_dec, min=floor_val)
     pv_dec = torch.clamp(pv_dec, min=floor_val)
 
-    # Optional global multiplicative calibration (derived from validation only)
-    if cal_scale is None:
-        cal_scale = kwargs.get("calibration_scale", None)
-    if cal_scale is not None:
-        try:
-            pv_dec = pv_dec * float(cal_scale)
-        except Exception:
-            pass
-    # Optional per-asset multiplicative calibration (derived from validation only)
-    if per_asset_scales is None:
-        per_asset_scales = kwargs.get("per_asset_calibration", None)
-
-    id_to_name = id_to_name or {}
-    assets = [id_to_name.get(int(i), str(int(i))) for i in g_cpu.numpy().tolist()]
-
-    if isinstance(per_asset_scales, dict) and len(per_asset_scales) > 0:
-        try:
-            _map = {str(k): float(v) for k, v in per_asset_scales.items()}
-            scales_vec = torch.tensor([_map.get(str(a), 1.0) for a in assets], dtype=pv_dec.dtype, device=pv_dec.device)
-            pv_dec = pv_dec * scales_vec
-        except Exception as _e:
-            print(f"[WARN] per-asset calibration failed, skipping: {_e}")
-
-    t_cpu = torch.cat(all_t) if (len(all_t) > 0) else None
+    # Calibration disabled: pv_dec is left unchanged
+    # (global/per-asset multipliers intentionally not applied)  
 
     # Base frame with asset and time_idx
     df = pd.DataFrame({
@@ -837,92 +815,7 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
             with_direction=False,
         )
 
-    # Prefer epoch-matched global scale; fall back to latest/global
-    s = None
-    if epoch_for_ckpt is not None:
-        s = _load_epoch_cal_scale(epoch_for_ckpt)
-    if s is None:
-        try:
-            s = GLOBAL_CAL_SCALE if (GLOBAL_CAL_SCALE is not None) else _load_val_cal_scale()
-        except Exception:
-            s = None
-
-    if s is not None:
-        out_path = Path(out_path)
-        cal_name = f"calibrated_{out_path.name}"
-        cal_path = out_path.with_name(cal_name)
-        print(f"Saving calibrated predictions for {split_name} with s={float(s):.6g} → {cal_path}")
-        try:
-            _collect_predictions(
-                model,
-                dataloader,
-                vol_normalizer=vol_norm,
-                id_to_name=id_to_name,
-                out_path=cal_path,
-                cal_scale=float(s),
-                with_direction=True,
-            )
-        except Exception as e:
-            import traceback as _tb
-            print(f"[WARN] Calibrated export failed ({e}); retrying in SAFE mode (vol-only)")
-            _tb.print_exc()
-            _collect_predictions(
-                model,
-                dataloader,
-                vol_normalizer=vol_norm,
-                id_to_name=id_to_name,
-                out_path=cal_path,
-                cal_scale=float(s),
-                with_direction=False,
-            )
-    else:
-        print("[WARN] No validation calibration scale available; skipping calibrated parquet for",
-              split_name)
-
-    # Load per-asset scales (if available) and save a per-asset calibrated parquet
-    # Prefer epoch-matched per-asset scales; fall back to latest/global
-    per_asset = None
-    if epoch_for_ckpt is not None:
-        per_asset = _load_epoch_per_asset_scales(epoch_for_ckpt)
-    if per_asset is None:
-        try:
-            per_asset = _load_val_per_asset_scales()
-        except Exception:
-            per_asset = None
-
-    if isinstance(per_asset, dict) and len(per_asset) > 0:
-        out_path = Path(out_path)
-        pa_name = f"calibrated_pa_{out_path.name}"
-        pa_path = out_path.with_name(pa_name)
-        print(f"Saving per-asset calibrated predictions for {split_name} → {pa_path}")
-        try:
-            _collect_predictions(
-                model,
-                dataloader,
-                vol_normalizer=vol_norm,
-                id_to_name=id_to_name,
-                out_path=pa_path,
-                cal_scale=None,                 # don't double-apply the global scale
-                per_asset_scales=per_asset,
-                with_direction=True,
-            )
-        except Exception as e:
-            import traceback as _tb
-            print(f"[WARN] Per-asset calibrated export failed ({e}); retrying in SAFE mode (vol-only)")
-            _tb.print_exc()
-            _collect_predictions(
-                model,
-                dataloader,
-                vol_normalizer=vol_norm,
-                id_to_name=id_to_name,
-                out_path=pa_path,
-                cal_scale=None,                 # don't double-apply the global scale
-                per_asset_scales=per_asset,
-                with_direction=False,
-            )
-    else:
-        print(f"[WARN] No per-asset scales available; skipping per-asset calibrated parquet for {split_name}")
-
+   
     return out_uncal
 
 @torch.no_grad()
