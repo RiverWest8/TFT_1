@@ -392,6 +392,8 @@ def manual_inverse_transform_groupnorm(normalizer, y: torch.Tensor, group_ids: t
       2) inverse transform: asinh -> sinh, identity -> no-op, else via registry
     Works with scale_by_group=True (index by group_ids) or global scale.
     """
+    center = getattr(normalizer, "center", None)
+    scale  = getattr(normalizer, "scale",  None)
     y_ = y.squeeze(-1) if y.ndim > 1 else y
 
     # --- Force CPU for robust offline decoding (prediction export paths) ---
@@ -599,8 +601,13 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dic
     pv_cpu = torch.cat(all_pv)
 
     # decode to physical scale (robust)
-    yv_dec = safe_decode_vol(yv_cpu.unsqueeze(-1), vol_normalizer, g_cpu.unsqueeze(-1)).squeeze(-1)
-    pv_dec = safe_decode_vol(pv_cpu.unsqueeze(-1), vol_normalizer, g_cpu.unsqueeze(-1)).squeeze(-1)
+    try:
+        yv_dec = safe_decode_vol(yv_cpu.unsqueeze(-1), vol_normalizer, g_cpu.unsqueeze(-1)).squeeze(-1)
+        pv_dec = safe_decode_vol(pv_cpu.unsqueeze(-1), vol_normalizer, g_cpu.unsqueeze(-1)).squeeze(-1)
+    except Exception as _e:
+        print(f"[WARN] decode failed, using encoded values directly: {_e}")
+        yv_dec = yv_cpu.clone()
+        pv_dec = pv_cpu.clone()
 
     floor_val = float(globals().get("EVAL_VOL_FLOOR", 1e-6))
     yv_dec = torch.clamp(yv_dec, min=floor_val)
@@ -629,7 +636,7 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dic
         except Exception as _e:
             print(f"[WARN] per-asset calibration failed, skipping: {_e}")
 
-    t_cpu = torch.cat(all_t) if all_t else None
+    t_cpu = torch.cat(all_t) if (len(all_t) > 0) else None
 
     # Base frame with asset and time_idx
     df = pd.DataFrame({
@@ -657,7 +664,12 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dic
         yd_all = torch.cat(all_yd)
         pd_all = torch.cat(all_pd)
         try:
-            if torch.isfinite(pd_all).any() and (pd_all.min() < 0 or pd_all.max() > 1):
+            needs_sigmoid = False
+            if torch.isfinite(pd_all).any():
+                _min = float(pd_all.min().item())
+                _max = float(pd_all.max().item())
+                needs_sigmoid = (_min < 0.0) or (_max > 1.0)
+            if needs_sigmoid:
                 pd_all = torch.sigmoid(pd_all)
         except Exception:
             pd_all = torch.sigmoid(pd_all)
@@ -800,6 +812,8 @@ def safe_decode_vol(y: torch.Tensor, normalizer, group_ids: torch.Tensor | None)
     try:
         out = manual_inverse_transform_groupnorm(normalizer, y, group_ids)
         if torch.is_tensor(out):
+            if orig_dev is not None and out.device != orig_dev:
+                out = out.to(orig_dev)
             return out
     except Exception:
         pass
@@ -1619,7 +1633,12 @@ class PerAssetMetrics(pl.Callback):
             # Convert logits→probs if needed
             probs = pdir_cpu
             try:
-                if torch.isfinite(probs).any() and (probs.min() < 0 or probs.max() > 1):
+                needs_sigmoid = False
+                if torch.isfinite(probs).any():
+                    _min = float(probs.min().item())
+                    _max = float(probs.max().item())
+                    needs_sigmoid = (_min < 0.0) or (_max > 1.0)
+                if needs_sigmoid:
                     probs = torch.sigmoid(probs)
             except Exception:
                 probs = torch.sigmoid(probs)
@@ -4191,119 +4210,6 @@ def _safe_prob(t: torch.Tensor) -> torch.Tensor:
         t = torch.sigmoid(t)
     return torch.clamp(t, 0.0, 1.0)
 
-@torch.no_grad()
-def _collect_predictions(model, dl, id_to_name, vol_norm):
-    model_device = next(model.parameters()).device
-    assets_all, t_idx_all = [], []
-    yv_all, pv_all, yd_all, pdprob_all = [], [], [], []
-
-    for batch in dl:
-        if not isinstance(batch, (list, tuple)) or len(batch) < 2:
-            continue
-        x, y = batch[0], batch[1]
-        if not isinstance(x, dict):
-            continue
-
-        # groups / time_idx
-        g = x.get("groups")
-        if g is None:
-            g = x.get("group_ids")
-        if isinstance(g, (list, tuple)):
-            g = g[0] if g else None
-        if torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
-            g = g.squeeze(-1)
-        if not torch.is_tensor(g):
-            continue
-
-        t_idx = x.get("decoder_time_idx")
-        if t_idx is None:
-            t_idx = x.get("time_idx")
-        if torch.is_tensor(t_idx) and t_idx.ndim > 1 and t_idx.size(-1) == 1:
-            t_idx = t_idx.squeeze(-1)
-
-        # true targets (encoded)
-        yv, yd = None, None
-        if torch.is_tensor(y):
-            t = y
-            if t.ndim == 3 and t.size(1) == 1:
-                t = t[:, 0, :]
-            if t.ndim == 2 and t.size(1) >= 1:
-                yv = t[:, 0]
-                yd = (t[:, 1] if t.size(1) > 1 else None)
-
-        # forward
-        x_dev = {k: (v.to(model_device, non_blocking=True) if torch.is_tensor(v)
-                     else [vv.to(model_device, non_blocking=True) if torch.is_tensor(vv) else vv for vv in v]
-                     if isinstance(v, (list, tuple)) else v)
-                 for k, v in x.items()}
-        out = model(x_dev)
-        pred = getattr(out, "prediction", out)
-        if isinstance(pred, dict) and "prediction" in pred:
-            pred = pred["prediction"]
-
-        # split heads
-        if isinstance(pred, (list, tuple)):
-            vol_q = pred[0]
-            d_log = pred[1] if len(pred) > 1 else None
-        else:
-            t = pred
-            if t.ndim >= 4 and t.size(1) == 1:
-                t = t.squeeze(1)
-            if t.ndim == 3 and t.size(1) == 1:
-                t = t[:, 0, :]
-            vol_q, d_log = t[:, : t.size(-1)-1], t[:, -1]
-        p_vol = _median_from_quantiles(vol_q) if torch.is_tensor(vol_q) else vol_q
-
-        # decode to physical scale
-        y_dec = None
-        if torch.is_tensor(yv):
-            y_dec = safe_decode_vol(yv.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
-        p_dec = safe_decode_vol(p_vol.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
-        # Guards to avoid None reaching clamp/exports
-        if yv_dec is None or pv_dec is None:
-            raise RuntimeError("Decoded tensors are None — aborting export early.")
-
-        # Clamp floors here (tensors guaranteed now)
-        floor_val = float(globals().get("EVAL_VOL_FLOOR", 1e-6))
-        yv_dec = torch.clamp(yv_dec, min=floor_val)
-        pv_dec = torch.clamp(pv_dec, min=floor_val)
-
-        # direction prob
-        p_dir_prob = _safe_prob(d_log) if torch.is_tensor(d_log) else None
-
-        # append
-        gn_list = g.detach().cpu().long().tolist()
-        assets_all.extend([id_to_name.get(int(i), str(int(i))) for i in gn_list])
-
-        if torch.is_tensor(t_idx):
-            t_idx_all.extend(t_idx.detach().cpu().long().tolist())
-        else:
-            t_idx_all.extend([None] * len(gn_list))
-
-        if y_dec is not None:
-            yv_all.append(y_dec.detach().cpu())
-        pv_all.append(p_dec.detach().cpu())
-
-        if torch.is_tensor(yd):
-            yd_all.append(yd.detach().cpu())
-        if p_dir_prob is not None:
-            pdprob_all.append(p_dir_prob.detach().cpu())
-
-    # stack safely
-    yv_list = torch.cat(yv_all).numpy().tolist() if yv_all else [None] * len(assets_all)
-    pv_list = torch.cat(pv_all).numpy().tolist() if pv_all else []
-    yd_list = torch.cat(yd_all).numpy().tolist() if yd_all else [None] * len(assets_all)
-    pd_list = torch.cat(pdprob_all).numpy().tolist() if pdprob_all else [None] * len(assets_all)
-
-    L = min(len(assets_all), len(t_idx_all), len(pv_list), len(yv_list), len(yd_list), len(pd_list))
-    return pd.DataFrame({
-        "asset":             assets_all[:L],
-        "time_idx":          t_idx_all[:L],
-        "realised_vol":      yv_list[:L],
-        "pred_realised_vol": pv_list[:L],
-        "direction":         yd_list[:L],
-        "pred_direction":    pd_list[:L],
-    })
 
 # Build dataframe of predictions and compute TEST metrics on decoded scale
 try:
