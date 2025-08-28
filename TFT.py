@@ -715,7 +715,7 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
     try:
         vol_norm = _extract_norm_from_dataset(dataloader.dataset)
     except Exception as e:
-        raise RuntimeError(f"Could not resolve normalizer from dataset: {e}") RuntimeError(f"Could not resolve normalizer from dataset: {e}")
+        raise RuntimeError(f"Could not resolve normalizer from dataset: {e}") 
 
     # 1) Save the uncalibrated predictions to out_path
     out_uncal = _collect_predictions(
