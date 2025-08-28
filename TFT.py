@@ -692,23 +692,30 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
             epoch_for_ckpt = int(m.group(1)) + 1  # make it 1-based to match our saved epoch files
     except Exception:
         epoch_for_ckpt = None
-    # Try to parse the (0-based) epoch from the checkpoint name like "...epoch=09-..."
-    import re as _re  # safe even if already imported elsewhere
-    epoch_for_ckpt = None
-    try:
-        m = _re.search(r"epoch=(\d+)", str(ckpt))
-        if m:
-            epoch_for_ckpt = int(m.group(1)) + 1  # make it 1-based to match our saved epoch files
-    except Exception:
-        epoch_for_ckpt = None
 
-    model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu")
-    model = model.to("cpu")
-    model.eval()
+
+    import torch as _t
+
+    # Reuse the in-memory model (same architecture/features) and load weights from ckpt
+    model = trainer.lightning_module  # <- critical: do NOT reconstruct a new model here
+    _sd = _t.load(ckpt, map_location="cpu")
+    _state = _sd.get("state_dict", _sd)
+
+    try:
+        _missing, _unexpected = model.load_state_dict(_state, strict=True)
+        if _missing or _unexpected:
+            print(f"[WARN] load_state_dict strict=True yielded missing={len(_missing)} unexpected={len(_unexpected)}")
+    except RuntimeError as _e:
+        print(f"[WARN] strict=True state_dict load failed: {_e}\n       Falling back to strict=False")
+        _missing, _unexpected = model.load_state_dict(_state, strict=False)
+        print(f"[INFO] Loaded with strict=False (missing={len(_missing)}, unexpected={len(_unexpected)})")
+
+    model = model.to("cpu").eval()
+
     try:
         vol_norm = _extract_norm_from_dataset(dataloader.dataset)
     except Exception as e:
-        raise RuntimeError(f"Could not resolve normalizer from dataset: {e}")
+        raise RuntimeError(f"Could not resolve normalizer from dataset: {e}") RuntimeError(f"Could not resolve normalizer from dataset: {e}")
 
     # 1) Save the uncalibrated predictions to out_path
     out_uncal = _collect_predictions(
@@ -2818,7 +2825,7 @@ EXTRA_CALLBACKS = [
           vol_loss=VOL_LOSS,
           target_under=1.09,
           target_mean_bias=0.04,
-          warmup_epochs=5,
+          warmup_epochs=6,
           qlike_target_weight=0.05,   
           start_mean_bias=0.0,
           mean_bias_ramp_until=12,
@@ -2837,7 +2844,7 @@ EXTRA_CALLBACKS = [
           gate_patience=2,
       ),
       ReduceLROnPlateauCallback(
-          monitor="val_mae_overall", factor=0.5, patience=2, min_lr=3e-5, cooldown=2, stop_after_epoch=8
+          monitor="val_mae_overall", factor=0.5, patience=3, min_lr=3e-5, cooldown=2, stop_after_epoch=8
       ),
       ModelCheckpoint(
           dirpath=str(LOCAL_CKPT_DIR),
@@ -3411,7 +3418,23 @@ def _resolve_best_model(trainer, fallback):
     if best_path:
         try:
             print(f"Best checkpoint (min val_mae_overall): {best_path}")
-            return TemporalFusionTransformer.load_from_checkpoint(best_path)
+            import torch as _t
+            try:
+                model = getattr(trainer, "lightning_module", None) or fallback
+                _sd = _t.load(best_path, map_location="cpu")
+                _state = _sd.get("state_dict", _sd)
+                try:
+                    _missing, _unexpected = model.load_state_dict(_state, strict=True)
+                    if _missing or _unexpected:
+                        print(f"[WARN] load_state_dict strict=True yielded missing={len(_missing)} unexpected={len(_unexpected)}")
+                except RuntimeError as _e:
+                    print(f"[WARN] strict=True state_dict load failed: {_e}\n       Falling back to strict=False")
+                    _missing, _unexpected = model.load_state_dict(_state, strict=False)
+                    print(f"[INFO] Loaded with strict=False (missing={len(_missing)}, unexpected={len(_unexpected)})")
+                return model.to("cpu").eval()
+            except Exception as e:
+                print(f"[WARN] load_from_checkpoint(state_dict) failed: {e}")
+                return fallback
         except Exception as e:
             print(f"[WARN] load_from_checkpoint failed: {e}")
     return fallback
@@ -4114,14 +4137,29 @@ if not best_model_path and fs is not None:
 # Load the best checkpoint, or fall back to the in-memory model
 if best_model_path:
     print(f"Best checkpoint (local or remote): {best_model_path}")
+    import torch as _t
+    # Reuse the trained model instance to avoid shape mismatches
+    best_model = (globals().get("tft") or globals().get("model") or trainer.lightning_module)
     try:
-        best_model = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
+        _sd = _t.load(best_model_path, map_location="cpu")
+        _state = _sd.get("state_dict", _sd)
+        try:
+            _missing, _unexpected = best_model.load_state_dict(_state, strict=True)
+            if _missing or _unexpected:
+                print(f"[WARN] load_state_dict strict=True yielded missing={len(_missing)} unexpected={len(_unexpected)}")
+        except RuntimeError as _e:
+            print(f"[WARN] strict=True state_dict load failed: {_e}\n       Falling back to strict=False")
+            _missing, _unexpected = best_model.load_state_dict(_state, strict=False)
+            print(f"[INFO] Loaded with strict=False (missing={len(_missing)}, unexpected={len(_unexpected)})")
+        best_model = best_model.to("cpu").eval()
     except Exception as e:
         print(f"[WARN] Loading best checkpoint failed ({e}); using in-memory model.")
-        best_model = globals().get("tft") or globals().get("model")
+        best_model = (globals().get("tft") or globals().get("model") or trainer.lightning_module)
+        best_model = best_model.to("cpu").eval()
 else:
     print("[WARN] No checkpoint found; using in-memory model.")
-    best_model = globals().get("tft") or globals().get("model")
+    best_model = (globals().get("tft") or globals().get("model") or trainer.lightning_module)
+    best_model = best_model.to("cpu").eval()
 
 if best_model is None:
     raise RuntimeError("No model available for testing (checkpoint and in-memory both unavailable).")
