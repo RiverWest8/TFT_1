@@ -1814,6 +1814,7 @@ class PerAssetMetrics(pl.Callback):
         try:
             # map group id -> human name
             asset_names = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
+
             # compute per-asset aggregates
             dfm = pd.DataFrame({
                 "asset": asset_names,
@@ -1822,7 +1823,8 @@ class PerAssetMetrics(pl.Callback):
             })
             if t_cpu is not None:
                 dfm["t"] = t_cpu.numpy()
-            if yd_cpu is not None and pdir_cpu is not None and yd_cpu.numel() > 0 and pdir_cpu.numel() > 0:
+
+            if yd_cpu is not None and pdir_cpu is not None and int(yd_cpu.numel()) > 0 and int(pdir_cpu.numel()) > 0:
                 # ensure probs in [0,1]
                 probs = pdir_cpu
                 try:
@@ -1842,6 +1844,7 @@ class PerAssetMetrics(pl.Callback):
                 y_a = torch.tensor(gdf["y"].values)
                 p_a = torch.tensor(gdf["p"].values)
                 n_a = int(len(gdf))
+
                 mae_a = float((p_a - y_a).abs().mean().item())
                 mse_a = float(((p_a - y_a) ** 2).mean().item())
                 rmse_a = float(mse_a ** 0.5)
@@ -1878,6 +1881,9 @@ class PerAssetMetrics(pl.Callback):
 
                 rows.append((a, mae_a, rmse_a, mse_a, nmse_a, qlike_a, da_a, acc_a, n_a))
 
+            # Persist rows for on_fit_end
+            self._last_rows = rows
+
             # --- Compute per-asset composite-optimal multiplicative scales and persist ---
             try:
                 pa_scales = {}
@@ -1894,7 +1900,6 @@ class PerAssetMetrics(pl.Callback):
             except Exception as _e:
                 print(f"[WARN] Could not compute/save per-asset scales: {_e}")
 
-
             # --- Per-epoch per-asset snapshot (top by samples) ---
             try:
                 k = min(5, getattr(self, "max_print", 5))
@@ -1908,8 +1913,11 @@ class PerAssetMetrics(pl.Callback):
             except Exception as _e:
                 print(f"[WARN] per-epoch per-asset print failed: {_e}")
 
-  
-        # stash overall for on_fit_end
+        except Exception as _outer_e:
+            print(f"[WARN] per-asset aggregation failed: {_outer_e}")
+            # keep self._last_rows as [] so on_fit_end can safely skip
+
+        # --- Stash overall for on_fit_end (must remain inside the method) ---
         self._last_overall = {
             "mae": overall_mae,
             "rmse": overall_rmse,
@@ -1918,12 +1926,14 @@ class PerAssetMetrics(pl.Callback):
             "qlike": overall_qlike,
             "da": overall_da,
             "val_loss": val_comp,
-            "dir_bce": brier,   # (kept for backwards compatibility with your saver)
+            "dir_bce": brier,   # kept for backwards compatibility with your saver
             "yd": yd_cpu,
             "pd": pdir_cpu,
             "qlike_cal": overall_qlike_cal,
         }
+  
 
+  
     @torch.no_grad()
     def on_fit_end(self, trainer, pl_module):
         if self._last_rows is None or self._last_overall is None:
