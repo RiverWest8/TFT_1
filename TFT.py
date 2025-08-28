@@ -52,7 +52,9 @@ import math
 import pandas as _pd
 pd = _pd  # Ensure pd always refers to pandas module
 import lightning.pytorch as pl
-
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
 
 
 
@@ -533,6 +535,11 @@ def _collect_predictions(
     except StopIteration:
         model_device = torch.device("cpu")
     all_g, all_yv, all_pv, all_yd, all_pd, all_t = [], [], [], [], [], []
+    try:
+        _n_batches = len(dataloader)
+        print(f"[EXPORT] starting prediction loop over {int(_n_batches)} batches …")
+    except Exception:
+        print("[EXPORT] starting prediction loop …")
 
     for batch in dataloader:
         if not isinstance(batch, (list, tuple)):
@@ -857,12 +864,35 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
         vol_norm = _extract_norm_from_dataset(dataloader.dataset)
     except Exception as e:
         raise RuntimeError(f"Could not resolve normalizer from dataset: {e}") 
+    
+    # --- Rebuild a SAFE single-worker DataLoader for export ---
+    # Some environments hang when iterating a PF dataloader with multiple workers
+    # after training. We rebuild a plain DataLoader with num_workers=0, no pinning.
+    try:
+        ds = dataloader.dataset
+        export_bs = getattr(dataloader, "batch_size", 256) or 256
+        export_loader = DataLoader(
+            ds,
+            batch_size=int(export_bs),
+            shuffle=False,
+            num_workers=0,            # single worker avoids MP hang
+            pin_memory=False,
+            persistent_workers=False, # make sure workers don’t persist
+            drop_last=False,
+        )
+        try:
+            print(f"[EXPORT] using single-worker export loader: batches={len(export_loader)}, bs={int(export_bs)}")
+        except Exception:
+            print("[EXPORT] using single-worker export loader")
+    except Exception as _e_rebuild:
+        print(f"[WARN] Could not rebuild single-worker export loader; falling back to given dataloader: {_e_rebuild}")
+        export_loader = dataloader
 
     # 1) Save the uncalibrated predictions to out_path
     try:
         out_uncal = _collect_predictions(
             model,
-            dataloader,
+            export_loader,
             vol_normalizer=vol_norm,
             id_to_name=id_to_name,
             out_path=out_path,
@@ -875,7 +905,7 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
         _tb.print_exc()
         out_uncal = _collect_predictions(
             model,
-            dataloader,
+            export_loader,
             vol_normalizer=vol_norm,
             id_to_name=id_to_name,
             out_path=out_path,
