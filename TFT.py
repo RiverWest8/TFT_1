@@ -58,7 +58,7 @@ import lightning.pytorch as pl
 
 BATCH_SIZE   = 128
 MAX_EPOCHS   = 35
-EARLY_STOP_PATIENCE = 8
+EARLY_STOP_PATIENCE = 5
 PERM_BLOCK_SIZE = 288
 
 # Extra belt-and-braces: swallow BrokenPipe errors on stdout.flush() if any other lib calls it.
@@ -2858,12 +2858,12 @@ EXTRA_CALLBACKS = [
           gate_patience=2,
       ),
       ReduceLROnPlateauCallback(
-          monitor="val_qlike_overall", factor=0.5, patience=5, min_lr=3e-5, cooldown=2, stop_after_epoch=8
+          monitor="val_mae_overall", factor=0.5, patience=2, min_lr=3e-5, cooldown=2, stop_after_epoch=8
       ),
       ModelCheckpoint(
           dirpath=str(LOCAL_CKPT_DIR),
           filename="tft-{epoch:02d}-{val_qlike_overall:.4f}",
-          monitor="val_qlike_overall",
+          monitor="val_mae_overall",
           mode="min",
           save_top_k=3,
           save_last=True,
@@ -2926,7 +2926,7 @@ EMBEDDING_CARDINALITY = {}
 
 BATCH_SIZE   = 128
 MAX_EPOCHS   = 35
-EARLY_STOP_PATIENCE = 8
+EARLY_STOP_PATIENCE = 5
 PERM_BLOCK_SIZE = 288
 
 # Artifacts are written locally then uploaded to GCS
@@ -3383,13 +3383,13 @@ def _resolve_best_model(trainer, fallback):
       5) Fallback to the in-memory model
     """
     best_path = None
-    # ---- Prefer the val_qlike_overall monitor explicitly ----
+    # ---- Prefer the val_mae_overall monitor explicitly ----
     try:
         for cb in getattr(trainer, "callbacks", []):
             if isinstance(cb, ModelCheckpoint):
                 mon = getattr(cb, "monitor", None)
                 bmp = getattr(cb, "best_model_path", "")
-                if mon == "val_qlike_overall" and bmp:
+                if mon == "val_mae_overall" and bmp:
                     best_path = bmp
                     break
         # ---- Otherwise any checkpoint with a best path ----
@@ -3431,7 +3431,7 @@ def _resolve_best_model(trainer, fallback):
 
     if best_path:
         try:
-            print(f"Best checkpoint (min val_qlike_overall): {best_path}")
+            print(f"Best checkpoint (min val_mae_overall): {best_path}")
             return TemporalFusionTransformer.load_from_checkpoint(best_path)
         except Exception as e:
             print(f"[WARN] load_from_checkpoint failed: {e}")
@@ -3859,7 +3859,7 @@ if __name__ == "__main__":
     print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.00091}")
     
     es_cb = EarlyStopping(
-    monitor="val_qlike_overall",
+    monitor="val_mae_overall",
     patience=EARLY_STOP_PATIENCE,
     mode="min",
     min_delta = 1e-4
@@ -3897,8 +3897,8 @@ if __name__ == "__main__":
         training_dataset,
         hidden_size=96,
         attention_head_size=4,
-        dropout=0.13, #0.0833704625250354,
-        hidden_continuous_size=24,
+        dropout=0.08337, #0.0833704625250354,
+        hidden_continuous_size=32,
         learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.00035), #0.0019 0017978
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
