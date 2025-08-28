@@ -646,6 +646,24 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
     if ckpt is None:
         raise RuntimeError("Could not resolve best checkpoint path.")
     print(f"Loading best checkpoint for {split_name}: {ckpt}")
+    # Try to parse the (0-based) epoch from the checkpoint name like "...epoch=09-..."
+    import re as _re  # safe even if already imported elsewhere
+    epoch_for_ckpt = None
+    try:
+        m = _re.search(r"epoch=(\d+)", str(ckpt))
+        if m:
+            epoch_for_ckpt = int(m.group(1)) + 1  # make it 1-based to match our saved epoch files
+    except Exception:
+        epoch_for_ckpt = None
+    # Try to parse the (0-based) epoch from the checkpoint name like "...epoch=09-..."
+    import re as _re  # safe even if already imported elsewhere
+    epoch_for_ckpt = None
+    try:
+        m = _re.search(r"epoch=(\d+)", str(ckpt))
+        if m:
+            epoch_for_ckpt = int(m.group(1)) + 1  # make it 1-based to match our saved epoch files
+    except Exception:
+        epoch_for_ckpt = None
 
     # Load model and normalizer from the dataloader's dataset
     model = TemporalFusionTransformer.load_from_checkpoint(ckpt)
@@ -664,11 +682,15 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
         cal_scale=None,
     )
 
-    # 2) Optionally save a calibrated copy using the validation-derived global scale
-    try:
-        s = GLOBAL_CAL_SCALE if (GLOBAL_CAL_SCALE is not None) else _load_val_cal_scale()
-    except Exception:
-        s = None
+    # Prefer epoch-matched global scale; fall back to latest/global
+    s = None
+    if epoch_for_ckpt is not None:
+        s = _load_epoch_cal_scale(epoch_for_ckpt)
+    if s is None:
+        try:
+            s = GLOBAL_CAL_SCALE if (GLOBAL_CAL_SCALE is not None) else _load_val_cal_scale()
+        except Exception:
+            s = None
 
     if s is not None:
         out_path = Path(out_path)
@@ -688,10 +710,16 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
               split_name)
 
     # Load per-asset scales (if available) and save a per-asset calibrated parquet
-    try:
-        per_asset = _load_val_per_asset_scales()
-    except Exception:
-        per_asset = None
+    # Prefer epoch-matched per-asset scales; fall back to latest/global
+    per_asset = None
+    if epoch_for_ckpt is not None:
+        per_asset = _load_epoch_per_asset_scales(epoch_for_ckpt)
+    if per_asset is None:
+        try:
+            per_asset = _load_val_per_asset_scales()
+        except Exception:
+            per_asset = None
+
     if isinstance(per_asset, dict) and len(per_asset) > 0:
         out_path = Path(out_path)
         pa_name = f"calibrated_pa_{out_path.name}"
@@ -838,6 +866,49 @@ def _load_val_per_asset_scales() -> dict | None:
                 return {str(k): float(v) for k, v in d.items()}
     except Exception as e:
         print(f"[WARN] Could not load per-asset validation scales: {e}")
+    return None
+
+def _save_epoch_cal_scale(epoch: int, scale: float):
+    """Persist per-epoch validation calibration scale s for decoded vols."""
+    try:
+        path = LOCAL_RUN_DIR / f"val_cal_scale_epoch{int(epoch)}_e{MAX_EPOCHS}_{RUN_SUFFIX}.json"
+        with open(path, "w") as f:
+            _json.dump({"scale": float(scale), "epoch": int(epoch)}, f)
+        print(f"✓ Saved epoch-calibration scale (epoch={int(epoch)}) s={scale:.6g} → {path}")
+    except Exception as e:
+        print(f"[WARN] Could not save epoch calibration scale: {e}")
+
+def _load_epoch_cal_scale(epoch: int) -> float | None:
+    """Load calibration scale saved for the specific epoch, if present."""
+    try:
+        path = LOCAL_RUN_DIR / f"val_cal_scale_epoch{int(epoch)}_e{MAX_EPOCHS}_{RUN_SUFFIX}.json"
+        if path.exists():
+            with open(path, "r") as f:
+                return float(_json.load(f).get("scale", 1.0))
+    except Exception as e:
+        print(f"[WARN] Could not load epoch calibration scale: {e}")
+    return None
+
+def _save_epoch_per_asset_scales(epoch: int, scales: dict):
+    """Persist per-epoch per-asset validation scales for later reuse (e.g., test)."""
+    try:
+        path = LOCAL_RUN_DIR / f"val_per_asset_scales_epoch{int(epoch)}_e{MAX_EPOCHS}_{RUN_SUFFIX}.json"
+        with open(path, "w") as f:
+            _json.dump({str(k): float(v) for k, v in scales.items()}, f, indent=2)
+        print(f"✓ Saved per-asset validation scales for epoch={int(epoch)} → {path}")
+    except Exception as e:
+        print(f"[WARN] Could not save per-epoch per-asset validation scales: {e}")
+
+def _load_epoch_per_asset_scales(epoch: int) -> dict | None:
+    """Load per-asset validation scales saved for the specific epoch, if present."""
+    try:
+        path = LOCAL_RUN_DIR / f"val_per_asset_scales_epoch{int(epoch)}_e{MAX_EPOCHS}_{RUN_SUFFIX}.json"
+        if path.exists():
+            with open(path, "r") as f:
+                d = _json.load(f)
+                return {str(k): float(v) for k, v in d.items()}
+    except Exception as e:
+        print(f"[WARN] Could not load per-epoch per-asset validation scales: {e}")
     return None
 @torch.no_grad()
 def compute_global_scale(y_true_dec: torch.Tensor, y_pred_dec: torch.Tensor, eps: float = 1e-12) -> float:
@@ -1236,6 +1307,12 @@ class PerAssetMetrics(pl.Callback):
         g_cpu  = g.detach().cpu()
         yd_cpu = yd.detach().cpu() if yd is not None else None
         pdir_cpu = pdir.detach().cpu() if pdir is not None else None
+
+        # Resolve 1-based epoch number for file naming
+        try:
+            _epoch_now = int(getattr(trainer, "current_epoch", -1)) + 1
+        except Exception:
+            _epoch_now = None
     
 
         # Compute and persist global validation calibration scale (QLIKE-optimal)
@@ -1246,6 +1323,9 @@ class PerAssetMetrics(pl.Callback):
             _save_val_cal_scale(GLOBAL_CAL_SCALE)
         except Exception as _e:
             print(f"[WARN] Could not compute/save validation calibration scale: {_e}")
+        if _epoch_now is not None:
+            _save_epoch_cal_scale(_epoch_now, GLOBAL_CAL_SCALE)
+             
 
         # Calibration diagnostic (not used in loss)
         try:
@@ -1284,6 +1364,8 @@ class PerAssetMetrics(pl.Callback):
             if scales:
                 PER_ASSET_CAL_SCALES = scales
                 _save_val_per_asset_scales(scales)
+            if _epoch_now is not None and PER_ASSET_CAL_SCALES:
+                 _save_epoch_per_asset_scales(_epoch_now, PER_ASSET_CAL_SCALES)
         except Exception as e:
             print(f"[WARN] per-asset scale computation failed: {e}")
 
@@ -1629,6 +1711,7 @@ class PerAssetMetrics(pl.Callback):
 
         try:
             import json
+            import re as _re
             out = {
                 "decoded": True,
                 "overall": {k: v for k, v in overall.items() if k in ("mae","rmse","mse","qlike","val_loss","dir_bce")},
