@@ -58,7 +58,7 @@ import lightning.pytorch as pl
 
 BATCH_SIZE   = 128
 MAX_EPOCHS   = 35
-EARLY_STOP_PATIENCE = 15
+EARLY_STOP_PATIENCE = 8
 PERM_BLOCK_SIZE = 288
 
 # Extra belt-and-braces: swallow BrokenPipe errors on stdout.flush() if any other lib calls it.
@@ -1097,7 +1097,7 @@ class LabelSmoothedBCEWithBrier(nn.Module):
     targets as the BCE term for consistency. Set brier_weight=0 to
     recover plain label-smoothed BCE.
     """
-    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.001, brier_weight: float = 0.15):
+    def __init__(self, smoothing: float = 0.1, pos_weight: float = 1.001, brier_weight: float = 0.18):
         super().__init__()
         self.smoothing = float(smoothing)
         self.register_buffer("pos_weight", torch.tensor(pos_weight))
@@ -2783,24 +2783,24 @@ VOL_LOSS = AsymmetricQuantileLoss(
 EXTRA_CALLBACKS = [
       BiasWarmupCallback(
           vol_loss=VOL_LOSS,
-          target_under=1.08,
-          target_mean_bias=0.0,
+          target_under=1.09,
+          target_mean_bias=0.04,
           warmup_epochs=5,
           qlike_target_weight=0.0,   # keep out of the loss; diagnostics only
           start_mean_bias=0.0,
           mean_bias_ramp_until=12,
-          guard_patience=getattr(ARGS, "warmup_guard_patience", 100),
+          guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
           guard_tol=getattr(ARGS, "warmup_guard_tol", 0.0),
-          alpha_step=0.01,
+          alpha_step=0.03,
       ),
       TailWeightRamp(
           vol_loss=VOL_LOSS,
           start=1.0,
-          end=1.1,
-          ramp_epochs=20,
+          end=1.15,
+          ramp_epochs=16,
           gate_by_calibration=True,
-          gate_low=0.98,
-          gate_high=1.02,
+          gate_low=0.95,
+          gate_high=1.05,
           gate_patience=2,
       ),
       ReduceLROnPlateauCallback(
@@ -2872,7 +2872,7 @@ EMBEDDING_CARDINALITY = {}
 
 BATCH_SIZE   = 128
 MAX_EPOCHS   = 35
-EARLY_STOP_PATIENCE = 7
+EARLY_STOP_PATIENCE = 8
 PERM_BLOCK_SIZE = 288
 
 # Artifacts are written locally then uploaded to GCS
@@ -3832,7 +3832,7 @@ if __name__ == "__main__":
     pos_weight = float(n_neg / n_pos)
 
     # then build the loss with:
-    DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.1, pos_weight=pos_weight)
+    DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.02, pos_weight=pos_weight)
 
 
     FIXED_VOL_WEIGHT = 1.0
@@ -3843,7 +3843,7 @@ if __name__ == "__main__":
         training_dataset,
         hidden_size=96,
         attention_head_size=4,
-        dropout=0.0833740, #0.0833704625250354,
+        dropout=0.13, #0.0833704625250354,
         hidden_continuous_size=24,
         learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.00035), #0.0019 0017978
         optimizer="AdamW",
