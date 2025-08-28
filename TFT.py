@@ -542,6 +542,8 @@ def _collect_predictions(
         print("[EXPORT] starting prediction loop …")
 
     for batch in dataloader:
+        if batch is None:
+            continue
         if not isinstance(batch, (list, tuple)):
             continue
         x = batch[0]
@@ -801,6 +803,17 @@ def _get_best_ckpt_path(trainer) -> str | None:
         pass
     return None
 
+from torch.utils.data._utils.collate import default_collate
+
+def safe_collate(batch):
+    """
+    Collate that skips None entries to avoid crashing export DataLoader.
+    """
+    batch = [b for b in batch if b is not None]
+    if len(batch) == 0:
+        return None
+    return default_collate(batch)
+
 @torch.no_grad()
 def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: Path | str, id_to_name: dict | None = None):
     """Load the best checkpoint (min val_qlike_overall) and write predictions for `dataloader`.
@@ -875,10 +888,11 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
             ds,
             batch_size=int(export_bs),
             shuffle=False,
-            num_workers=0,            # single worker avoids MP hang
+            num_workers=0,
             pin_memory=False,
-            persistent_workers=False, # make sure workers don’t persist
+            persistent_workers=False,
             drop_last=False,
+            collate_fn=safe_collate,   # <-- NEW
         )
         try:
             print(f"[EXPORT] using single-worker export loader: batches={len(export_loader)}, bs={int(export_bs)}")
