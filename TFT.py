@@ -539,8 +539,10 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dic
         if y_vol_t is None:
             continue
 
-        # forward
-        y_hat = model(x)
+
+        # forward (no grad)
+        with torch.no_grad():
+            y_hat = model(x)
         pred = getattr(y_hat, "prediction", y_hat)
         if isinstance(pred, dict) and "prediction" in pred:
             pred = pred["prediction"]
@@ -667,6 +669,12 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
 
     # Load model and normalizer from the dataloader's dataset
     model = TemporalFusionTransformer.load_from_checkpoint(ckpt)
+        # Force CPU inference to avoid device mismatches with dataset/normalizer
+    try:
+        model = model.to("cpu")
+    except Exception:
+        pass
+    model.eval()
     try:
         vol_norm = _extract_norm_from_dataset(dataloader.dataset)
     except Exception as e:
@@ -738,69 +746,72 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
         print(f"[WARN] No per-asset scales available; skipping per-asset calibrated parquet for {split_name}")
 
     return out_uncal
-@torch.no_grad()
 
+@torch.no_grad()
 def safe_decode_vol(y: torch.Tensor, normalizer, group_ids: torch.Tensor | None):
     """
-    Try normalizer.decode(), then inverse_transform(), else manual fallback.
-    y is expected as [B,1].
+    Try manual inverse first (avoids GPU/CPU index_select mismatches),
+    then fall back to the normalizer's decode/inverse_transform while
+    harmonizing devices. Always return a Tensor on the original `y` device.
     """
+    # Preserve the original device so we return the result there
+    orig_dev = y.device if torch.is_tensor(y) else None
+
+    # 1) Prefer our manual inverse (robust to device issues)
     try:
-        return normalizer.decode(y, group_ids=group_ids)
+        out = manual_inverse_transform_groupnorm(normalizer, y, group_ids)
+        if torch.is_tensor(out):
+            return out
     except Exception:
         pass
+
+    # Helper to pick a target device from normalizer internals
+    def _norm_device(norm):
+        dev = None
+        c = getattr(norm, "center", None)
+        s = getattr(norm, "scale",  None)
+        if isinstance(s, torch.Tensor):
+            dev = s.device
+        elif isinstance(c, torch.Tensor):
+            dev = c.device
+        return dev
+
+    # 2) Try normalizer.decode with device harmonization
     try:
-        return normalizer.inverse_transform(y, group_ids=group_ids)
+        tgt_dev = _norm_device(normalizer) or (y.device if torch.is_tensor(y) else None)
+        yy = y
+        gg = group_ids
+        if tgt_dev is not None:
+            if torch.is_tensor(yy) and yy.device != tgt_dev:
+                yy = yy.to(tgt_dev)
+            if group_ids is not None and torch.is_tensor(group_ids) and group_ids.device != tgt_dev:
+                gg = group_ids.to(tgt_dev)
+        out = normalizer.decode(yy, group_ids=gg)
+        if torch.is_tensor(out) and orig_dev is not None and out.device != orig_dev:
+            out = out.to(orig_dev)
+        return out
     except Exception:
         pass
+
+    # 3) Try inverse_transform with the same harmonization
     try:
-        return normalizer.inverse_transform(y)
+        tgt_dev = _norm_device(normalizer) or (y.device if torch.is_tensor(y) else None)
+        yy = y
+        gg = group_ids
+        if tgt_dev is not None:
+            if torch.is_tensor(yy) and yy.device != tgt_dev:
+                yy = yy.to(tgt_dev)
+            if group_ids is not None and torch.is_tensor(group_ids) and group_ids.device != tgt_dev:
+                gg = group_ids.to(tgt_dev)
+        out = normalizer.inverse_transform(yy, group_ids=gg)
+        if torch.is_tensor(out) and orig_dev is not None and out.device != orig_dev:
+            out = out.to(orig_dev)
+        return out
     except Exception:
         pass
-    return manual_inverse_transform_groupnorm(normalizer, y, group_ids)
 
-
-# ---------------- Global QLIKE‑optimal calibration helper ----------------
-@torch.no_grad()
-def calibrate_vol_predictions(y_true_dec: torch.Tensor, y_pred_dec: torch.Tensor) -> torch.Tensor:
-    """
-    Global QLIKE‑optimal multiplicative calibration.
-
-    Given decoded targets y and predictions p, choose a single scalar s that minimises
-        E[ (σ_y^2 / (s^2 σ_p^2)) - log(σ_y^2 / (s^2 σ_p^2)) - 1 ].
-    QLIKE-optimal constant scale satisfies E[y^2/(s^2 p^2)] = 1 ⇒ s^2 = E[y^2/p^2].
-
-    Returns p * s with shape preserved. No piece‑wise/tercile scaling.
-    """
-    # Basic guards
-    if y_true_dec is None or y_pred_dec is None:
-        return y_pred_dec
-
-    # Flatten to 1D on a working dtype; keep device
-    y = y_true_dec.reshape(-1)
-    p = y_pred_dec.reshape(-1)
-    if y.numel() == 0 or p.numel() == 0:
-        return y_pred_dec
-
-    # Work in float32 for numerical stability, keep device
-    device = y.device
-    y32 = y.to(dtype=torch.float32, device=device)
-    p32 = p.to(dtype=torch.float32, device=device)
-
-    # QLIKE‑optimal global scale: s^2 = E[ |y|^2 / |p|^2 ]
-    eps = 1e-12
-    sigma2_y = torch.clamp(y32.abs(), min=eps) ** 2
-    sigma2_p = torch.clamp(p32.abs(), min=eps) ** 2
-    ratio = sigma2_y / sigma2_p
-    # Robustify with mild winsorization to avoid exploding scales early in training
-    r_clamped = torch.clamp(ratio, min=1e-6, max=1e6)
-    s2_opt = r_clamped.mean()
-    s = torch.sqrt(torch.clamp(s2_opt, min=eps))
-
-    # Apply and restore original shape/dtype
-    p_cal32 = p32 * s
-    p_cal = p_cal32.to(dtype=y_pred_dec.dtype)
-    return p_cal.view_as(y_pred_dec)
+    # 4) Last resort — return the input unchanged to avoid Nones downstream
+    return y
 
 if not hasattr(GroupNormalizer, "decode"):
     def _gn_decode(self, y, group_ids=None, **kwargs):
@@ -2720,9 +2731,9 @@ VOL_LOSS = AsymmetricQuantileLoss(
 EXTRA_CALLBACKS = [
       BiasWarmupCallback(
           vol_loss=VOL_LOSS,
-          target_under=1.0,
+          target_under=1.1115,
           target_mean_bias=0.0,
-          warmup_epochs=9,
+          warmup_epochs=5,
           qlike_target_weight=0.0,   # keep out of the loss; diagnostics only
           start_mean_bias=0.0,
           mean_bias_ramp_until=12,
@@ -2733,7 +2744,7 @@ EXTRA_CALLBACKS = [
       TailWeightRamp(
           vol_loss=VOL_LOSS,
           start=1.0,
-          end=1.0,
+          end=1.2,
           ramp_epochs=16,
           gate_by_calibration=True,
           gate_low=0.95,
@@ -2741,7 +2752,7 @@ EXTRA_CALLBACKS = [
           gate_patience=2,
       ),
       ReduceLROnPlateauCallback(
-          monitor="val_qlike_overall", factor=0.5, patience=5, min_lr=3e-5, cooldown=1, stop_after_epoch=None
+          monitor="val_qlike_overall", factor=0.5, patience=7, min_lr=3e-5, cooldown=1, stop_after_epoch=None
       ),
       ModelCheckpoint(
           dirpath=str(LOCAL_CKPT_DIR),
