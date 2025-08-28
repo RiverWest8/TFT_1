@@ -465,11 +465,21 @@ def manual_inverse_transform_groupnorm(normalizer, y: torch.Tensor, group_ids: t
 
 
 @torch.no_grad()
-def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dict | None = None, out_path: Path | str | None = None, cal_scale: float | None = None, per_asset_scales: dict | None = None, **kwargs):
+def _collect_predictions(
+    model,
+    dataloader,
+    vol_normalizer=None,
+    id_to_name: dict | None = None,
+    out_path: Path | str | None = None,
+    cal_scale: float | None = None,
+    per_asset_scales: dict | None = None,
+    with_direction: bool = True,
+    **kwargs
+):
     """
     Iterate a dataloader, run model in eval, extract:
       • realised_vol median prediction (q=0.50) & target
-      • optional direction probability
+      • optional direction probability (if with_direction=True)
     Decode vol using `vol_normalizer`, clamp floors, and save to Parquet.
     """
     import pandas as pd
@@ -566,7 +576,8 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dic
         all_g.append(g.reshape(L).detach().cpu())
         all_yv.append(y_vol_t.reshape(L).detach().cpu())
         all_pv.append(p_vol.reshape(L).detach().cpu())
-        if y_dir_t is not None and p_dir is not None:
+        # Only collect direction fields if with_direction is True
+        if with_direction and (y_dir_t is not None) and (p_dir is not None):
             all_yd.append(y_dir_t.reshape(-1)[:L].detach().cpu())
             all_pd.append(p_dir.reshape(-1)[:L].detach().cpu())
 
@@ -648,7 +659,7 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dic
     cols = [c for c in ["asset", "Time", "time_idx", "y_vol", "y_vol_pred"] if c in df.columns]
     df = df[cols + [c for c in df.columns if c not in cols]]
 
-    if (len(all_yd) > 0) and (len(all_pd) > 0):
+    if with_direction and (len(all_yd) > 0) and (len(all_pd) > 0):
         yd_all = torch.cat(all_yd)
         pd_all = torch.cat(all_pd)
         try:
@@ -802,14 +813,29 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
         raise RuntimeError(f"Could not resolve normalizer from dataset: {e}") 
 
     # 1) Save the uncalibrated predictions to out_path
-    out_uncal = _collect_predictions(
-        model,
-        dataloader,
-        vol_normalizer=vol_norm,
-        id_to_name=id_to_name,
-        out_path=out_path,
-        cal_scale=None,
-    )
+    try:
+        out_uncal = _collect_predictions(
+            model,
+            dataloader,
+            vol_normalizer=vol_norm,
+            id_to_name=id_to_name,
+            out_path=out_path,
+            cal_scale=None,
+            with_direction=True,
+        )
+    except Exception as e:
+        import traceback as _tb
+        print(f"[WARN] Uncalibrated export failed ({e}); retrying in SAFE mode (vol-only)")
+        _tb.print_exc()
+        out_uncal = _collect_predictions(
+            model,
+            dataloader,
+            vol_normalizer=vol_norm,
+            id_to_name=id_to_name,
+            out_path=out_path,
+            cal_scale=None,
+            with_direction=False,
+        )
 
     # Prefer epoch-matched global scale; fall back to latest/global
     s = None
@@ -826,14 +852,29 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
         cal_name = f"calibrated_{out_path.name}"
         cal_path = out_path.with_name(cal_name)
         print(f"Saving calibrated predictions for {split_name} with s={float(s):.6g} → {cal_path}")
-        _collect_predictions(
-            model,
-            dataloader,
-            vol_normalizer=vol_norm,
-            id_to_name=id_to_name,
-            out_path=cal_path,
-            cal_scale=float(s),
-        )
+        try:
+            _collect_predictions(
+                model,
+                dataloader,
+                vol_normalizer=vol_norm,
+                id_to_name=id_to_name,
+                out_path=cal_path,
+                cal_scale=float(s),
+                with_direction=True,
+            )
+        except Exception as e:
+            import traceback as _tb
+            print(f"[WARN] Calibrated export failed ({e}); retrying in SAFE mode (vol-only)")
+            _tb.print_exc()
+            _collect_predictions(
+                model,
+                dataloader,
+                vol_normalizer=vol_norm,
+                id_to_name=id_to_name,
+                out_path=cal_path,
+                cal_scale=float(s),
+                with_direction=False,
+            )
     else:
         print("[WARN] No validation calibration scale available; skipping calibrated parquet for",
               split_name)
@@ -854,15 +895,31 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
         pa_name = f"calibrated_pa_{out_path.name}"
         pa_path = out_path.with_name(pa_name)
         print(f"Saving per-asset calibrated predictions for {split_name} → {pa_path}")
-        _collect_predictions(
-            model,
-            dataloader,
-            vol_normalizer=vol_norm,
-            id_to_name=id_to_name,
-            out_path=pa_path,
-            cal_scale=None,                 # don't double-apply the global scale
-            per_asset_scales=per_asset,
-        )
+        try:
+            _collect_predictions(
+                model,
+                dataloader,
+                vol_normalizer=vol_norm,
+                id_to_name=id_to_name,
+                out_path=pa_path,
+                cal_scale=None,                 # don't double-apply the global scale
+                per_asset_scales=per_asset,
+                with_direction=True,
+            )
+        except Exception as e:
+            import traceback as _tb
+            print(f"[WARN] Per-asset calibrated export failed ({e}); retrying in SAFE mode (vol-only)")
+            _tb.print_exc()
+            _collect_predictions(
+                model,
+                dataloader,
+                vol_normalizer=vol_norm,
+                id_to_name=id_to_name,
+                out_path=pa_path,
+                cal_scale=None,                 # don't double-apply the global scale
+                per_asset_scales=per_asset,
+                with_direction=False,
+            )
     else:
         print(f"[WARN] No per-asset scales available; skipping per-asset calibrated parquet for {split_name}")
 
@@ -1699,7 +1756,7 @@ class PerAssetMetrics(pl.Callback):
         acc = None
         brier = None
         auroc = None
-        if yd_cpu is not None and pdir_cpu is not None and yd_cpu.numel() > 0 and pdir_cpu.numel() > 0:
+        if (yd_cpu is not None) and (pdir_cpu is not None) and (int(yd_cpu.numel()) > 0) and (int(pdir_cpu.numel()) > 0):
             # Convert logits→probs if needed
             probs = pdir_cpu
             try:
