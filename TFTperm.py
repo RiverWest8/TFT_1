@@ -2457,62 +2457,69 @@ else:
 # -----------------------------------------------------------------------
 import argparse
 
-parser = argparse.ArgumentParser(description="TFT training with optional permutation importance", add_help=True)
+parser = argparse.ArgumentParser(
+    description="TFT training with optional permutation importance and Optuna tuning",
+    add_help=True
+)
 
-parser.add_argument("--disable_warmups", type=lambda s: str(s).lower() in ("1","true","t","yes","y","on"),
-                    default=False, help="Disable bias/QLIKE warm-ups and tail ramp")
-parser.add_argument("--warmup_guard_patience", type=int, default=2,
-                    help="Consecutive worsening epochs before freezing warm-ups")
-parser.add_argument("--warmup_guard_tol", type=float, default=0.0,
-                    help="Minimum delta in val_loss to count as worsening")
-
+# Core training knobs
 parser.add_argument("--max_encoder_length", type=int, default=None, help="Max encoder length")
 parser.add_argument("--max_epochs", type=int, default=None, help="Max training epochs")
 parser.add_argument("--batch_size", type=int, default=None, help="Training batch size")
+parser.add_argument("--learning_rate", type=float, default=None, help="Override model learning rate")
+
+# Feature importance / permutation
 parser.add_argument("--perm_len", type=int, default=None, help="Permutation block length for importance")
 parser.add_argument("--perm_block_size", type=int, default=None, help="Alias for --perm_len (permutation block length)")
-
 parser.add_argument(
     "--enable_perm_importance", "--enable-feature-importance",
     type=lambda s: str(s).lower() in ("1","true","t","yes","y","on"),
     default=None,
     help="Enable permutation feature importance (true/false)"
 )
+parser.add_argument("--fi_max_batches", type=int, default=20, help="Max val batches per feature in FI.")
 
 # Cloud paths / storage overrides
 parser.add_argument("--gcs_bucket", type=str, default=None, help="GCS bucket name to read/write from")
 parser.add_argument("--gcs_data_prefix", type=str, default=None, help="Full GCS prefix for data parquet folder")
 parser.add_argument("--gcs_output_prefix", type=str, default=None, help="Full GCS prefix for outputs/checkpoints")
+parser.add_argument("--data_dir", type=str, default=None,
+                    help="Local folder containing universal_*.parquet; if set, prefer local over GCS")
 
-# Performance / input control
-parser.add_argument("--data_dir", type=str, default=None, help="Local folder containing universal_*.parquet; if set, prefer local over GCS")
+# Dataloader / logging
 parser.add_argument("--num_workers", type=int, default=None, help="DataLoader workers (defaults to CPU count - 1)")
 parser.add_argument("--prefetch_factor", type=int, default=8, help="DataLoader prefetch factor (per worker)")
-
-# Validation / logging cadence
 parser.add_argument("--check_val_every_n_epoch", type=int, default=1, help="Validate every N epochs")
 parser.add_argument("--log_every_n_steps", type=int, default=200, help="How often to log train steps")
 
-# Optimizer overrides
-parser.add_argument("--learning_rate", type=float, default=None, help="Override model learning rate")
-
-parser.add_argument(
-    "--resume",
+# Runtime
+parser.add_argument("--resume",
     type=lambda s: str(s).lower() in ("1","true","t","yes","y","on"),
     default=False,
     help="Resume from latest checkpoint if available"
 )
+parser.add_argument("--predict",
+    type=lambda s: str(s).lower() in ("1","true","t","yes","y","on"),
+    default=True,
+    help="After fit, run fast validation/export path (keep True for Optuna trials)"
+)
+parser.add_argument("--grad_accum_steps", type=int, default=1)
 
 # Quick-run subsetting for speed
 parser.add_argument("--train_max_rows", type=int, default=None, help="Limit number of rows in TRAIN for fast iterations")
 parser.add_argument("--val_max_rows", type=int, default=None, help="Limit number of rows in VAL (optional; default full)")
-parser.add_argument(
-    "--subset_mode",
-    type=str,
-    default="per_asset_tail",
-    choices=["per_asset_tail", "per_asset_head", "random"],
-    help="Strategy for selecting a subset when limiting rows"
-)
+parser.add_argument("--subset_mode", type=str, default="per_asset_tail",
+                    choices=["per_asset_tail", "per_asset_head", "random"],
+                    help="Strategy for selecting a subset when limiting rows")
+
+# Warmups / tail ramp toggles
+parser.add_argument("--disable_warmups",
+                    type=lambda s: str(s).lower() in ("1","true","t","yes","y","on"),
+                    default=False, help="Disable bias/QLIKE warm-ups and tail ramp")
+parser.add_argument("--warmup_guard_patience", type=int, default=2,
+                    help="Consecutive worsening epochs before freezing warm-ups")
+parser.add_argument("--warmup_guard_tol", type=float, default=0.0,
+                    help="Minimum delta in val_loss to count as worsening")
 
 # ---------------- Optuna / scale-control knobs ----------------
 parser.add_argument("--optuna", action="store_true", help="Run Optuna hyperparameter search")
@@ -2520,7 +2527,8 @@ parser.add_argument("--optuna_trials", type=int, default=15)
 parser.add_argument("--optuna_timeout", type=int, default=0, help="Seconds; 0 disables")
 parser.add_argument("--optuna_max_epochs", type=int, default=12, help="Short fit for trial")
 parser.add_argument("--study_name", type=str, default=None, help="Optuna study name (optional)")
-parser.add_argument("--optuna_storage", type=str, default=None, help='Optuna storage URL, e.g. "sqlite:////tmp/tftperm_optuna.db"')
+parser.add_argument("--optuna_storage", type=str, default=None,
+                    help='Optuna storage URL, e.g. "sqlite:////tmp/tftperm_optuna.db"')
 
 # Bias warmup / scale control
 parser.add_argument("--bw_target_under", type=float, default=1.15)
@@ -2537,10 +2545,7 @@ parser.add_argument("--tail_gate_low", type=float, default=0.99)
 parser.add_argument("--tail_gate_high", type=float, default=1.01)
 parser.add_argument("--tail_end", type=float, default=1.15)
 
-# Runtime adjuncts
-parser.add_argument("--grad_accum_steps", type=int, default=1)
-
-# Parse known args so stray platform args do not crash the script
+# Final parse (use known to ignore platform injects)
 ARGS, _UNKNOWN = parser.parse_known_args()
 
 # -----------------------------------------------------------------------
@@ -3659,16 +3664,11 @@ def _run_optuna(args):
 # -----------------------------------------------------------------------
 # --- Early exit into Optuna mode without disturbing the normal run ---
 if __name__ == "__main__":
-    import argparse
-    ap = argparse.ArgumentParser()
-
-    # all your `ap.add_argument(...)` go here
-
-    args = ap.parse_args()
-
-    if args.optuna:
-        _run_optuna(args)
+    # ARGS is already parsed above via parse_known_args()
+    if ARGS.optuna:
+        _run_optuna(ARGS)
         sys.exit(0)
+
     print(
         f"[CONFIG] batch_size={BATCH_SIZE} | encoder={MAX_ENCODER_LENGTH} | epochs={MAX_EPOCHS} | "
         f"perm_importance={'on' if ENABLE_FEATURE_IMPORTANCE else 'off'} | fi_max_batches={FI_MAX_BATCHES} | "
