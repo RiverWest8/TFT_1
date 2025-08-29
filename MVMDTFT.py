@@ -2760,8 +2760,8 @@ EXTRA_CALLBACKS = [
       BiasWarmupCallback(
           vol_loss=VOL_LOSS,
           target_under=1.0,
-          target_mean_bias=0.0,
-          warmup_epochs=9,
+          target_mean_bias=0.04,
+          warmup_epochs=4,
           qlike_target_weight=0.0,   # keep out of the loss; diagnostics only
           start_mean_bias=0.0,
           mean_bias_ramp_until=12,
@@ -2772,9 +2772,9 @@ EXTRA_CALLBACKS = [
       TailWeightRamp(
           vol_loss=VOL_LOSS,
           start=1.0,
-          end=1.0,
-          ramp_epochs=16,
-          gate_by_calibration=True,
+          end=1.22,
+          ramp_epochs=15,
+          gate_by_calibration=False,
           gate_low=0.95,
           gate_high=1.05,
           gate_patience=2,
@@ -2784,7 +2784,7 @@ EXTRA_CALLBACKS = [
       ),
       ModelCheckpoint(
           dirpath=str(LOCAL_CKPT_DIR),
-          filename="tft-{epoch:02d}-{val_qlike_overall:.4f}",
+          filename="tft-{epoch:02d}-{val_mae_overall:.4f}",
           monitor="val_mae_overall",
           mode="min",
           save_top_k=3,
@@ -3311,7 +3311,7 @@ def _resolve_best_model(trainer, fallback):
             if isinstance(cb, ModelCheckpoint):
                 mon = getattr(cb, "monitor", None)
                 bmp = getattr(cb, "best_model_path", "")
-                if mon == "val_qlike_overall" and bmp:
+                if mon == "val_mae_overall" and bmp:
                     best_path = bmp
                     break
         # ---- Otherwise any checkpoint with a best path ----
@@ -3353,7 +3353,7 @@ def _resolve_best_model(trainer, fallback):
 
     if best_path:
         try:
-            print(f"Best checkpoint (min val_qlike_overall): {best_path}")
+            print(f"Best checkpoint (min val_mae_overall): {best_path}")
             return TemporalFusionTransformer.load_from_checkpoint(best_path)
         except Exception as e:
             print(f"[WARN] load_from_checkpoint failed: {e}")
@@ -3778,10 +3778,10 @@ if __name__ == "__main__":
     seed_everything(SEED, workers=True)
     # Loss and output_size for multi-target: realised_vol (quantile regression), direction (classification)
     print("▶ Building model …")
-    print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.00091}")
+    print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.0017978}")
     
     es_cb = EarlyStopping(
-    monitor="val_qlike_overall",
+    monitor="val_mae_overall",
     patience=EARLY_STOP_PATIENCE,
     mode="min",
     min_delta = 1e-4
@@ -3899,7 +3899,7 @@ if __name__ == "__main__":
        # Train the model
     trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
 
-    # --- Evaluate using the best checkpoint (min val_qlike_overall) ---
+    # --- Evaluate using the best checkpoint (min val_mae_overall) ---
     try:
         trainer.validate(ckpt_path="best", dataloaders=val_dataloader)
     except Exception as _e:
