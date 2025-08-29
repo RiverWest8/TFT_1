@@ -215,9 +215,11 @@ from pathlib import Path as _Path
 import os as _os, math as _math, json as _json
 
 def _latest_val_csv() -> _Path | None:
-    # 1) try local first
+    # 1) local first
     try:
-        cand = sorted(_Path("/tmp/tft_run").glob("tft_val_history_*.csv"),
+        local_dir = _Path("/tmp/tft_run")
+        local_dir.mkdir(parents=True, exist_ok=True)
+        cand = sorted(local_dir.glob("tft_val_history_*.csv"),
                       key=lambda p: p.stat().st_mtime, reverse=True)
         if cand:
             return cand[0]
@@ -226,28 +228,25 @@ def _latest_val_csv() -> _Path | None:
 
     # 2) fallback: look in GCS if an output prefix is provided
     try:
-        # NOTE: we avoid importing argparse here; base args are passed into trials, so we peek env var set by parent.
-        gcs_prefix = _os.environ.get("GCS_OUTPUT_PREFIX", "")
+        gcs_prefix = _os.environ.get("GCS_OUTPUT_PREFIX", "").rstrip("/")
         if not gcs_prefix:
             return None
-        # normalise
-        gcs_prefix = gcs_prefix.rstrip("/")
-        # search with fsspec
+
         import fsspec
         fs, _, _ = fsspec.get_fs_token_paths(gcs_prefix)
-        # list files that look like our CSVs
         files = [p for p in fs.glob(f"{gcs_prefix}/tft_val_history_*.csv")]
         if not files:
             return None
-        # pick newest by modified time
+
+        # newest by modified time if available, else by name
         def _mtime(p):
             try:
-                return fs.info(p).get("mtime", "")
+                return fs.info(p).get("mtime") or ""
             except Exception:
                 return ""
         files = sorted(files, key=_mtime, reverse=True)
         newest = files[0]
-        # download to local tmp and return the local path
+        # download to /tmp so _read_metrics_from_csv can use pandas normally
         local_dir = _Path("/tmp/tft_run")
         local_dir.mkdir(parents=True, exist_ok=True)
         local_path = local_dir / (_Path(newest).name)
@@ -256,6 +255,7 @@ def _latest_val_csv() -> _Path | None:
         return local_path
     except Exception:
         return None
+
 
 def _read_metrics_from_csv(csv_path: _Path):
     import pandas as _pd_local
@@ -304,17 +304,48 @@ def _build_trial_argv(base_args, script_path: str):
             argv += [k, str(v)]
     return [a for a in argv if a != "" and a is not None]
 
-def _objective_run_once(args_for_trial):
-    env = _os.environ.copy()
-    env["PYTHONHASHSEED"] = env.get("PYTHONHASHSEED", "0")
-    script_path = __file__
-    argv = _build_trial_argv(args_for_trial, script_path)
-    cp = subprocess.run(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    csv = _latest_val_csv()
-    if not csv:
-        raise RuntimeError("No validation history CSV found in /tmp/tft_run")
-    qlike, mean_scale = _read_metrics_from_csv(csv)
-    return qlike, mean_scale
+def _latest_val_csv() -> _Path | None:
+    # 1) local first
+    try:
+        local_dir = _Path("/tmp/tft_run")
+        local_dir.mkdir(parents=True, exist_ok=True)
+        cand = sorted(local_dir.glob("tft_val_history_*.csv"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+        if cand:
+            return cand[0]
+    except Exception:
+        pass
+
+    # 2) fallback: look in GCS if an output prefix is provided
+    try:
+        gcs_prefix = _os.environ.get("GCS_OUTPUT_PREFIX", "").rstrip("/")
+        if not gcs_prefix:
+            return None
+
+        import fsspec
+        fs, _, _ = fsspec.get_fs_token_paths(gcs_prefix)
+        files = [p for p in fs.glob(f"{gcs_prefix}/tft_val_history_*.csv")]
+        if not files:
+            return None
+
+        # newest by modified time if available, else by name
+        def _mtime(p):
+            try:
+                return fs.info(p).get("mtime") or ""
+            except Exception:
+                return ""
+        files = sorted(files, key=_mtime, reverse=True)
+        newest = files[0]
+        # download to /tmp so _read_metrics_from_csv can use pandas normally
+        local_dir = _Path("/tmp/tft_run")
+        local_dir.mkdir(parents=True, exist_ok=True)
+        local_path = local_dir / (_Path(newest).name)
+        with fs.open(newest, "rb") as rf, open(local_path, "wb") as wf:
+            wf.write(rf.read())
+        return local_path
+    except Exception:
+        return None
+
 
 def _optuna_objective(base_args):
     def obj(trial):
