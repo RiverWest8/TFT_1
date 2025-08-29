@@ -746,37 +746,80 @@ def _collect_predictions(
 from torch.utils.data import DataLoader
 from torch.utils.data._utils.collate import default_collate
 
+
 def make_export_loader(dl):
-    """Rebuild dl as a single-worker, safe-collate DataLoader for export."""
+    """
+    Rebuild `dl` as a single-worker DataLoader and *normalize* sample layout so
+    PyTorch-Forecasting's _collate_fn never hits `batches[0][1][1]` when weight is missing.
+
+    We coerce each sample to the canonical shape:
+        (x, (y, weight))    # weight may be None
+    """
     ds = dl.dataset
     bs = getattr(dl, "batch_size", 128)
-    try:
-        base_collate = getattr(ds, "_collate_fn", None) or default_collate
-    except Exception:
-        base_collate = default_collate
+    pf_collate = getattr(ds, "_collate_fn", None)  # PF's own collate, if present
+
+    def _massage_samples(samples):
+        fixed = []
+        for s in samples:
+            # target formats we see: (x, y), (x, (y,)), (x, (y, w)), (x, y, w)
+            if isinstance(s, tuple):
+                if len(s) == 3:
+                    x, y, w = s
+                    # if y already a (y, w2) tuple, keep its y; otherwise wrap
+                    if isinstance(y, tuple):
+                        y = (y[0], w if len(y) < 2 else y[1])
+                    else:
+                        y = (y, w)
+                    fixed.append((x, y))
+                    continue
+                if len(s) == 2:
+                    x, y = s
+                    if isinstance(y, tuple):
+                        # (y,) -> (y, None); (y,w,...) -> (y,w)
+                        if len(y) == 1:
+                            y = (y[0], None)
+                        else:
+                            y = (y[0], y[1])
+                    else:
+                        y = (y, None)
+                    fixed.append((x, y))
+                    continue
+            fixed.append(s)
+        return fixed
+
+    def fixed_collate(samples):
+        samples = _massage_samples(samples)
+        if pf_collate is not None:
+            try:
+                return pf_collate(samples)
+            except Exception as e:
+                print(f"[EXPORT] PF collate failed ({e}); falling back to default_collate.")
+        return default_collate(samples)
+
     return DataLoader(
         ds,
         batch_size=bs,
         shuffle=False,
-        num_workers=0,          # <- single worker to avoid hangs
+        num_workers=0,              # single worker to avoid hangs
         pin_memory=False,
-        collate_fn=make_safe_collate(base_collate),
         drop_last=False,
+        collate_fn=fixed_collate,   # our normalized collate
     )
 
 @torch.no_grad()
-def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: Path | str, id_to_name: dict | None = None):
-    """Load the best checkpoint (min val_mae_overall) and write predictions for `dataloader`.
-    Writes two files when a validation calibration scale is available:
-      • out_path  → uncalibrated predictions
-      • calibrated_<basename> → predictions scaled by validation-derived scalar (no look-ahead)
+def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: Path | str,
+                                id_to_name: dict | None = None):
+    """
+    Load the best checkpoint and write UNCALIBRATED predictions for `dataloader` to `out_path` (Parquet).
+    (We deliberately skip global/per-asset calibrated copies.)
     """
     ckpt = _get_best_ckpt_path(trainer)
     if ckpt is None:
         raise RuntimeError("Could not resolve best checkpoint path.")
     print(f"Loading best checkpoint for {split_name}: {ckpt}")
 
-    # Load model (compatible with PyTorch 2.6 safe loading)
+    # Safe load for PyTorch 2.6 (weights_only default)
     if _safe_globals_ctx is not None and _PFMultiNormalizer is not None:
         with _safe_globals_ctx([_PFMultiNormalizer]):
             try:
@@ -789,14 +832,13 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
         except TypeError:
             model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu", weights_only=False)
 
-    # Resolve volatility normalizer
+    # Resolve volatility normalizer from this dataloader's dataset
     try:
         vol_norm = _extract_norm_from_dataset(dataloader.dataset)
     except Exception as e:
         raise RuntimeError(f"Could not resolve normalizer from dataset: {e}")
 
-    # 1) Save the uncalibrated predictions
-    # Rebuild a safe, single-worker loader for export
+    # Build a *safe* single-worker export loader with normalized collate
     export_loader = make_export_loader(dataloader)
     try:
         n_batches = len(export_loader)
@@ -805,17 +847,16 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
     bs = getattr(export_loader, "batch_size", None)
     print(f"[EXPORT] using single-worker export loader: batches={n_batches}, bs={bs}")
 
-    # 1) Save the uncalibrated predictions
-    out_uncal = _collect_predictions(
+    # Collect & write parquet (uncalibrated only)
+    out = _collect_predictions(
         model,
         export_loader,
-        vol_norm=vol_norm,          # accepts either vol_norm or vol_normalizer
-        id_to_name=id_to_name,
+        vol_norm=vol_norm,           # alias accepted by collector
+        id_to_name=id_to_name or {},
         out_path=out_path,
-        cal_scale=None,
+        cal_scale=None,              # do not apply any calibration here
     )
-    return out_uncal
-
+    return out
 @torch.no_grad()
 def safe_decode_vol(y: torch.Tensor, normalizer, group_ids: torch.Tensor | None):
     """
@@ -3677,8 +3718,9 @@ if __name__ == "__main__":
     else:
         print("▶ Starting a fresh run (no resume)")
 
-    # Train the model
+       # Train the model
     trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
+
     # --- Evaluate using the best checkpoint (min val_qlike_overall) ---
     try:
         trainer.validate(ckpt_path="best", dataloaders=val_dataloader)
@@ -3692,16 +3734,56 @@ if __name__ == "__main__":
         print(f"[WARN] test(ckpt_path='best') failed: {_e}; testing current weights instead.")
         trainer.test(dataloaders=test_dataloader)
 
-    # Resolve the best checkpoint
+    # ---------- EXPORT PREDICTIONS FROM BEST CHECKPOINT ----------
+    try:
+        # Find the PerAssetMetrics callback so we can reuse id->name mapping
+        metrics_cb = None
+        for cb in getattr(trainer, "callbacks", []):
+            if isinstance(cb, PerAssetMetrics):
+                metrics_cb = cb
+                break
+        if metrics_cb is None:
+            raise RuntimeError("PerAssetMetrics callback not found; cannot build id->name map/normalizer.")
+
+        # VAL parquet (uncalibrated canonical export)
+        val_pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+        _save_predictions_from_best(
+            trainer,
+            val_dataloader,
+            "val",
+            val_pred_path,
+            id_to_name=metrics_cb.id_to_name,
+        )
+        print(f"✓ Wrote validation parquet → {val_pred_path}")
+        try:
+            upload_file_to_gcs(str(val_pred_path), f"{GCS_OUTPUT_PREFIX}/{val_pred_path.name}")
+        except Exception as e:
+            print(f"[WARN] Could not upload validation parquet: {e}")
+
+        # TEST parquet (uncalibrated canonical export)
+        test_pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+        _save_predictions_from_best(
+            trainer,
+            test_dataloader,
+            "test",
+            test_pred_path,
+            id_to_name=metrics_cb.id_to_name,
+        )
+        print(f"✓ Wrote test parquet → {test_pred_path}")
+        try:
+            upload_file_to_gcs(str(test_pred_path), f"{GCS_OUTPUT_PREFIX}/{test_pred_path.name}")
+        except Exception as e:
+            print(f"[WARN] Could not upload test parquet: {e}")
+
+    except Exception as e:
+        print(f"[WARN] Final export failed: {e}")
+
+    # Resolve the best checkpoint for any downstream analysis (e.g., FI)
     model_for_fi = _resolve_best_model(trainer, fallback=tft)
 
-    # Extract the same normalizer used for volatility during training
-    try:
-        train_vol_norm = _extract_norm_from_dataset(training_dataset)
-    except Exception as e:
-        print(f"[WARN] could not extract vol_norm from training dataset: {e}")
-        train_vol_norm = None
-    # ---- Permutation Importance (decoded) ----
+
+
+# ---- Permutation Importance (decoded) ----
 if ENABLE_FEATURE_IMPORTANCE:
     fi_csv = str(LOCAL_OUTPUT_DIR / f"TFTPFI_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")
     feats = time_varying_unknown_reals.copy()
