@@ -56,10 +56,24 @@ import lightning.pytorch as pl
 
 
 
+
 BATCH_SIZE   = 128
 MAX_EPOCHS   = 35
 EARLY_STOP_PATIENCE = 15
 PERM_BLOCK_SIZE = 288
+
+# --- Allowlist PF objects for torch.load under PyTorch>=2.6 (weights_only=True default) ---
+try:
+    from torch.serialization import add_safe_globals, safe_globals as _safe_globals_ctx
+except Exception:
+    _safe_globals_ctx = None
+    def add_safe_globals(_): pass
+
+try:
+    from pytorch_forecasting.data.encoders import MultiNormalizer as _PFMultiNormalizer
+    add_safe_globals([_PFMultiNormalizer])
+except Exception:
+    _PFMultiNormalizer = None
 
 # Extra belt-and-braces: swallow BrokenPipe errors on stdout.flush() if any other lib calls it.
 try:
@@ -73,6 +87,28 @@ try:
     sys.stdout.flush = _safe_flush
 except Exception:
     pass
+
+from torch.utils.data._utils.collate import default_collate
+
+def _clean_none(obj):
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return {k: _clean_none(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, (list, tuple)):
+        cleaned = [ _clean_none(v) for v in obj if v is not None ]
+        return type(obj)(v for v in cleaned if v is not None)
+    return obj
+
+def make_safe_collate(base=None):
+    base = base or default_collate
+    def _safe(batch):
+        batch = [b for b in batch if b is not None]
+        batch = [_clean_none(b) for b in batch]
+        # drop any samples that turned entirely empty
+        batch = [b for b in batch if b not in (None, (), [], {})]
+        return base(batch)
+    return _safe
 
 # Route all prints to stderr and swallow BrokenPipe to avoid crashes during teardown
 import builtins as _builtins, sys as _sys
@@ -451,7 +487,7 @@ def _get_best_ckpt_path(trainer) -> str | None:
             if isinstance(cb, ModelCheckpoint):
                 mon = getattr(cb, "monitor", None)
                 bmp = getattr(cb, "best_model_path", "")
-                if mon == "val_qlike_overall" and bmp:
+                if mon == "val_mae_overall" and bmp:
                     return bmp
         if not best_path:
             for cb in getattr(trainer, "callbacks", []):
@@ -556,7 +592,9 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dic
             all_yd.append(y_dir_t.reshape(-1)[:L].detach().cpu())
             all_pd.append(p_dir.reshape(-1)[:L].detach().cpu())
 
-        dec_time = x.get("decoder_time_idx", None) or x.get("decoder_relative_idx", None)
+        dec_time = x.get("decoder_time_idx", None)
+        if dec_time is None:
+            dec_time = x.get("decoder_relative_idx", None)
         if dec_time is not None and torch.is_tensor(dec_time):
             tvec = dec_time
             while tvec.ndim > 1 and tvec.size(-1) == 1:
@@ -637,7 +675,7 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dic
 
 @torch.no_grad()
 def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: Path | str, id_to_name: dict | None = None):
-    """Load the best checkpoint (min val_qlike_overall) and write predictions for `dataloader`.
+    """Load the best checkpoint (min val_mae_overall) and write predictions for `dataloader`.
     Writes two files when a validation calibration scale is available:
       • out_path  → uncalibrated predictions
       • calibrated_<basename> → predictions scaled by validation-derived scalar (no look-ahead)
@@ -647,14 +685,26 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
         raise RuntimeError("Could not resolve best checkpoint path.")
     print(f"Loading best checkpoint for {split_name}: {ckpt}")
 
-    # Load model and normalizer from the dataloader's dataset
-    model = TemporalFusionTransformer.load_from_checkpoint(ckpt)
+    # Load model (compatible with PyTorch 2.6 safe loading)
+    if _safe_globals_ctx is not None and _PFMultiNormalizer is not None:
+        with _safe_globals_ctx([_PFMultiNormalizer]):
+            try:
+                model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu")
+            except TypeError:
+                model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu", weights_only=False)
+    else:
+        try:
+            model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu")
+        except TypeError:
+            model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu", weights_only=False)
+
+    # Resolve volatility normalizer
     try:
         vol_norm = _extract_norm_from_dataset(dataloader.dataset)
     except Exception as e:
         raise RuntimeError(f"Could not resolve normalizer from dataset: {e}")
 
-    # 1) Save the uncalibrated predictions to out_path
+    # 1) Save the uncalibrated predictions
     out_uncal = _collect_predictions(
         model,
         dataloader,
@@ -664,7 +714,7 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
         cal_scale=None,
     )
 
-    # 2) Optionally save a calibrated copy using the validation-derived global scale
+    # 2) Save calibrated predictions (global scale if available)
     try:
         s = GLOBAL_CAL_SCALE if (GLOBAL_CAL_SCALE is not None) else _load_val_cal_scale()
     except Exception:
@@ -684,14 +734,14 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
             cal_scale=float(s),
         )
     else:
-        print("[WARN] No validation calibration scale available; skipping calibrated parquet for",
-              split_name)
+        print(f"[WARN] No validation calibration scale available; skipping calibrated parquet for {split_name}")
 
-    # Load per-asset scales (if available) and save a per-asset calibrated parquet
+    # 3) Save per-asset calibrated predictions if scales exist
     try:
         per_asset = _load_val_per_asset_scales()
     except Exception:
         per_asset = None
+
     if isinstance(per_asset, dict) and len(per_asset) > 0:
         out_path = Path(out_path)
         pa_name = f"calibrated_pa_{out_path.name}"
@@ -703,15 +753,15 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
             vol_normalizer=vol_norm,
             id_to_name=id_to_name,
             out_path=pa_path,
-            cal_scale=None,                 # don't double-apply the global scale
+            cal_scale=None,  # don't double-apply global scale
             per_asset_scales=per_asset,
         )
     else:
         print(f"[WARN] No per-asset scales available; skipping per-asset calibrated parquet for {split_name}")
 
     return out_uncal
-@torch.no_grad()
 
+@torch.no_grad()
 def safe_decode_vol(y: torch.Tensor, normalizer, group_ids: torch.Tensor | None):
     """
     Try normalizer.decode(), then inverse_transform(), else manual fallback.
@@ -1789,7 +1839,7 @@ class BiasWarmupCallback(pl.Callback):
         return None
 
     def on_validation_end(self, trainer, pl_module):
-        val = trainer.callback_metrics.get("val_loss") or trainer.callback_metrics.get("val_qlike_overall")
+        val = trainer.callback_metrics.get("val_loss") or trainer.callback_metrics.get("val_mae_overall")
         try:
             val = float(val.item() if hasattr(val, "item") else val)
         except Exception:
@@ -2456,12 +2506,12 @@ EXTRA_CALLBACKS = [
           gate_patience=2,
       ),
       ReduceLROnPlateauCallback(
-          monitor="val_qlike_overall", factor=0.5, patience=5, min_lr=3e-5, cooldown=1, stop_after_epoch=None
+          monitor="val_mae_overall", factor=0.5, patience=4, min_lr=3e-5, cooldown=1, stop_after_epoch=None
       ),
       ModelCheckpoint(
           dirpath=str(LOCAL_CKPT_DIR),
           filename="tft-{epoch:02d}-{val_qlike_overall:.4f}",
-          monitor="val_qlike_overall",
+          monitor="val_mae_overall",
           mode="min",
           save_top_k=3,
           save_last=True,
@@ -2971,10 +3021,10 @@ def _evaluate_decoded_metrics(
 def _resolve_best_model(trainer, fallback):
     """
     Return the model loaded from the *best* checkpoint as determined by the
-    minimum `val_qlike_overall` recorded by a ModelCheckpoint callback.
+    minimum `val_mae_overall` recorded by a ModelCheckpoint callback.
 
     Preference order:
-      1) ModelCheckpoint with monitor == 'val_qlike_overall' and a best_model_path
+      1) ModelCheckpoint with monitor == 'val_mae_overall' and a best_model_path
       2) Any ModelCheckpoint that has a best_model_path
       3) Newest local .ckpt in LOCAL_CKPT_DIR
       4) GCS 'last.ckpt' or lexicographically latest in CKPT_GCS_PREFIX
@@ -3438,7 +3488,9 @@ if __name__ == "__main__":
         pin_memory=False,
         **prefetch_kw,
     )
-
+    train_dataloader.collate_fn = make_safe_collate(getattr(train_dataloader, "collate_fn", None))
+    val_dataloader.collate_fn   = make_safe_collate(getattr(val_dataloader,   "collate_fn",   None))
+    test_dataloader.collate_fn  = make_safe_collate(getattr(test_dataloader,  "collate_fn",  None))
     # ---- derive id→asset-name mapping for callbacks ----
     asset_vocab = (
         training_dataset.get_parameters()["categorical_encoders"]["asset"].classes_
@@ -3916,15 +3968,17 @@ def _collect_predictions(model, dl, id_to_name, vol_norm):
         "pred_direction":    pd_list[:L],
     })
 
-# Build dataframe of predictions and compute TEST metrics on decoded scale
+# ==== TEST predictions + metrics on decoded scale ====
 try:
     df_test_preds = _collect_predictions(
-        best_model, test_dataloader, id_to_name=metrics_cb.id_to_name, vol_norm=metrics_cb.vol_norm
+        best_model, test_dataloader,
+        id_to_name=metrics_cb.id_to_name,
+        vol_normalizer=metrics_cb.vol_norm   # pass as vol_normalizer (collector accepts alias too)
     )
 
-    # Print decoded test metrics
-    _y = torch.tensor([v for v in df_test_preds["realised_vol"].tolist() if v is not None], dtype=torch.float32)
-    _p = torch.tensor(df_test_preds["pred_realised_vol"].tolist(), dtype=torch.float32)[: _y.numel()]
+    # Decoded regression metrics
+    _y = torch.tensor(df_test_preds["y_vol"].tolist(), dtype=torch.float32)
+    _p = torch.tensor(df_test_preds["y_vol_pred"].tolist(), dtype=torch.float32)[: _y.numel()]
     eps = 1e-8
     mae  = torch.mean(torch.abs(_p - _y)).item()
     mse  = torch.mean((_p - _y) ** 2).item()
@@ -3934,21 +3988,22 @@ try:
     ratio = sigma2_y / sigma2_p
     qlike = torch.mean(ratio - torch.log(ratio) - 1.0).item()
 
-    # Direction metrics if available
-    auroc_val, brier_val, acc_val = None, None, None
-    if "direction" in df_test_preds.columns and "pred_direction" in df_test_preds.columns:
-        pairs = [(a, b) for a, b in zip(df_test_preds["direction"], df_test_preds["pred_direction"]) if a is not None and b is not None]
-        if pairs:
-            yd_t = torch.tensor([a for a, _ in pairs], dtype=torch.float32)
-            pd_t = torch.tensor([b for _, b in pairs], dtype=torch.float32)
-            pd_t = _safe_prob(pd_t)
-            acc_val   = float(((pd_t >= 0.5).int() == yd_t.int()).float().mean().item())
-            brier_val = float(torch.mean((pd_t - yd_t) ** 2).item())
-            try:
-                from torchmetrics.classification import BinaryAUROC
-                auroc_val = float(BinaryAUROC()(pd_t, yd_t).item())
-            except Exception as e:
-                print(f"[WARN] AUROC (test) failed: {e}")
+    # Optional direction metrics
+    acc_val = brier_val = auroc_val = None
+    if "y_dir" in df_test_preds.columns and "y_dir_prob" in df_test_preds.columns:
+        yd_t = torch.tensor(df_test_preds["y_dir"].tolist(), dtype=torch.float32)
+        pd_t = torch.tensor(df_test_preds["y_dir_prob"].tolist(), dtype=torch.float32)
+        # ensure proper probabilities
+        if torch.isfinite(pd_t).any() and (pd_t.min() < 0 or pd_t.max() > 1):
+            pd_t = torch.sigmoid(pd_t)
+        pd_t = torch.clamp(pd_t, 0.0, 1.0)
+        acc_val   = float(((pd_t >= 0.5).int() == yd_t.int()).float().mean().item())
+        brier_val = float(((pd_t - yd_t) ** 2).mean().item())
+        try:
+            from torchmetrics.classification import BinaryAUROC
+            auroc_val = float(BinaryAUROC()(pd_t, yd_t).item())
+        except Exception as e:
+            print(f"[WARN] AUROC (test) failed: {e}")
 
     print(
         f"[TEST] (decoded) MAE={mae:.6f} RMSE={rmse:.6f} MSE={mse:.6f} QLIKE={qlike:.6f}"
@@ -3961,12 +4016,13 @@ try:
     pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
     df_test_preds.to_parquet(pred_path, index=False)
     print(f"✓ Saved TEST predictions → {pred_path}")
-    print("Generating test predictions from best checkpoint …")
+
+    # Also save “best-ckpt reloaded” exports (uncalibrated + calibrated if available)
     try:
         test_pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_best_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
-        _save_predictions_from_best(trainer, test_dataloader, "test", test_pred_path)
+        _save_predictions_from_best(trainer, test_dataloader, "test", test_pred_path, id_to_name=metrics_cb.id_to_name)
     except Exception as e:
-        print(f"[WARN] Failed to save test predictions: {e}")
+        print(f"[WARN] Failed to save test predictions from best checkpoint: {e}")
 
 except Exception as e:
     print(f"[WARN] Failed to collect or save test metrics/predictions: {e}")
