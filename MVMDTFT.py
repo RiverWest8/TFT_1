@@ -2738,26 +2738,26 @@ class ReduceLROnPlateauCallback(pl.Callback):
 
 VOL_LOSS = AsymmetricQuantileLoss(
     quantiles=VOL_QUANTILES,
-    underestimation_factor=1.25,  # managed by BiasWarmupCallback
+    underestimation_factor=1.00,  # managed by BiasWarmupCallback
     mean_bias_weight=0.01,        # small centering on the median for MAE
     tail_q=0.85,
     tail_weight=1.0,              # will be ramped by TailWeightRamp
-    qlike_weight=0.0,             # QLIKE weight is ramped safely in BiasWarmupCallback
+    qlike_weight=0.25,             # QLIKE weight is ramped safely in BiasWarmupCallback
     reduction="mean",
 )
 # ---------------- Callback bundle (bias warm-up, tail ramp, LR control) ----------------
 EXTRA_CALLBACKS = [
       BiasWarmupCallback(
           vol_loss=VOL_LOSS,
-          target_under=1.15,
-          target_mean_bias=0.05,
+          target_under=1.00,
+          target_mean_bias=0.01,
           warmup_epochs=3,
-          qlike_target_weight=0.00,   # keep out of the loss; diagnostics only
+          qlike_target_weight=0.25,   # keep out of the loss; diagnostics only
           start_mean_bias=0.0,
           mean_bias_ramp_until=8,
           guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
           guard_tol=getattr(ARGS, "warmup_guard_tol", 0.0),
-          alpha_step=0.05,
+          alpha_step=0.02,
       ),
       TailWeightRamp(
           vol_loss=VOL_LOSS,
