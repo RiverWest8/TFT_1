@@ -675,6 +675,27 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, vol_norm=None, 
         return out_path
     return df
 
+# ---- single-worker export loader (stable & safe) ----
+from torch.utils.data import DataLoader
+from torch.utils.data._utils.collate import default_collate
+
+def make_export_loader(dl):
+    """Rebuild dl as a single-worker, safe-collate DataLoader for export."""
+    ds = dl.dataset
+    bs = getattr(dl, "batch_size", 128)
+    try:
+        base_collate = getattr(ds, "_collate_fn", None) or default_collate
+    except Exception:
+        base_collate = default_collate
+    return DataLoader(
+        ds,
+        batch_size=bs,
+        shuffle=False,
+        num_workers=0,          # <- single worker to avoid hangs
+        pin_memory=False,
+        collate_fn=make_safe_collate(base_collate),
+        drop_last=False,
+    )
 
 @torch.no_grad()
 def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: Path | str, id_to_name: dict | None = None):
@@ -3800,17 +3821,15 @@ if best_model is None:
 
 print(f"Best checkpoint (local or remote): {best_model_path}")
 
-
 # --- Save VALIDATION predictions from the BEST checkpoint and compute decoded metrics ---
 try:
-    # Resolve path to best checkpoint
     ckpt = _get_best_ckpt_path(trainer)
     if ckpt is None:
         raise RuntimeError("Could not resolve best checkpoint path.")
     print(f"Best checkpoint (local or remote): {ckpt}")
     print("Generating validation predictions from best checkpoint …")
 
-    # Load best model safely (PyTorch 2.6 weights_only guard)
+    # Load best model (PyTorch 2.6 safe load)
     if _safe_globals_ctx is not None and _PFMultiNormalizer is not None:
         with _safe_globals_ctx([_PFMultiNormalizer]):
             try:
@@ -3823,47 +3842,48 @@ try:
         except TypeError:
             best_model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu", weights_only=False)
 
-    # Get the volatility normalizer from the validation dataset
-    vol_norm_val = _extract_norm_from_dataset(val_dataloader.dataset)
+    # Use a single-worker loader for export (prevents collate/hang issues)
+    val_export_loader = make_export_loader(val_dataloader)
 
-    # 1) Collect a DataFrame of validation predictions (UNCALIBRATED) for metrics & saving
+    # Get the volatility normalizer from the validation dataset
+    vol_norm_val = _extract_norm_from_dataset(val_export_loader.dataset)
+
+    # 1) Collect a DataFrame of validation predictions (UNCALIBRATED)
     df_val_preds = _collect_predictions(
         best_model,
-        val_dataloader,
+        val_export_loader,
         vol_normalizer=vol_norm_val,
-        id_to_name=metrics_cb.id_to_name,   # uses your callback's mapping
-        out_path=None,                      # return a DataFrame (do NOT write here)
+        id_to_name=metrics_cb.id_to_name,
+        out_path=None,   # return a DataFrame
     )
 
-    # Harmonize column names expected below
-    y_col = "y_vol" if "y_vol" in df_val_preds.columns else ("realised_vol" if "realised_vol" in df_val_preds.columns else None)
-    p_col = "y_vol_pred" if "y_vol_pred" in df_val_preds.columns else ("pred_realised_vol" if "pred_realised_vol" in df_val_preds.columns else None)
-    if y_col is None or p_col is None:
-        raise RuntimeError(f"Collector returned unexpected columns: {list(df_val_preds.columns)}")
+    # Pick column names provided by the collector
+    y_col = "y_vol" if "y_vol" in df_val_preds.columns else "realised_vol"
+    p_col = "y_vol_pred" if "y_vol_pred" in df_val_preds.columns else "pred_realised_vol"
 
-    # 2) Save the uncalibrated parquet (our canonical validation parquet)
-    pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
-    df_val_preds.to_parquet(pred_path, index=False)
-    print(f"✓ Saved validation predictions (best ckpt, Parquet) → {pred_path}")
+    # 2) Save the uncalibrated parquet (canonical val parquet)
+    val_pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+    df_val_preds.to_parquet(val_pred_path, index=False)
+    print(f"✓ Saved validation predictions (best ckpt, Parquet) → {val_pred_path}")
     try:
-        upload_file_to_gcs(str(pred_path), f"{GCS_OUTPUT_PREFIX}/{pred_path.name}")
+        upload_file_to_gcs(str(val_pred_path), f"{GCS_OUTPUT_PREFIX}/{val_pred_path.name}")
     except Exception as e:
         print(f"[WARN] Could not upload validation predictions: {e}")
 
-    # 3) Also write calibrated / per-asset calibrated copies via helper (these write files)
+    # 3) Also write calibrated & per-asset calibrated copies beside it
+    #    NOTE: do NOT pass vol_norm=... here — the saver resolves it from the dataset.
     try:
         _save_predictions_from_best(
             trainer,
-            val_dataloader,
+            val_export_loader,
             "val",
-            pred_path,                         # base file to mirror naming beside
-            id_to_name=metrics_cb.id_to_name   # mapping for human asset ids
+            val_pred_path,
+            id_to_name=metrics_cb.id_to_name,
         )
     except Exception as e:
         print(f"[WARN] Auxiliary calibrated exports failed: {e}")
 
-    # 4) Compute decoded metrics on the DF we just saved
-    # (Guard against Nones and length mismatches)
+    # 4) Compute decoded metrics from the saved DF (guard against Nones)
     import torch
     _vy = [v for v in df_val_preds[y_col].tolist() if v is not None]
     _vp = [v for v in df_val_preds[p_col].tolist() if v is not None]
@@ -3885,6 +3905,66 @@ try:
 
 except Exception as e:
     print(f"[WARN] Failed to save validation predictions from best checkpoint: {e}")
+
+
+    # --- TEST export (best ckpt) ---
+try:
+    ckpt = _get_best_ckpt_path(trainer)
+    if ckpt is None:
+        raise RuntimeError("Could not resolve best checkpoint path.")
+    print(f"Loading best checkpoint for test: {ckpt}")
+
+    # Load best model (safe)
+    if _safe_globals_ctx is not None and _PFMultiNormalizer is not None:
+        with _safe_globals_ctx([_PFMultiNormalizer]):
+            try:
+                best_model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu")
+            except TypeError:
+                best_model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu", weights_only=False)
+    else:
+        try:
+            best_model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu")
+        except TypeError:
+            best_model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu", weights_only=False)
+
+    test_export_loader = make_export_loader(test_dataloader)
+    vol_norm_test = _extract_norm_from_dataset(test_export_loader.dataset)
+
+    # Collect DF (uncalibrated)
+    df_test_preds = _collect_predictions(
+        best_model,
+        test_export_loader,
+        vol_normalizer=vol_norm_test,
+        id_to_name=metrics_cb.id_to_name,
+        out_path=None,
+    )
+
+    y_col = "y_vol" if "y_vol" in df_test_preds.columns else "realised_vol"
+    p_col = "y_vol_pred" if "y_vol_pred" in df_test_preds.columns else "pred_realised_vol"
+
+    test_pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+    df_test_preds.to_parquet(test_pred_path, index=False)
+    print(f"✓ Saved TEST predictions (Parquet) → {test_pred_path}")
+    try:
+        upload_file_to_gcs(str(test_pred_path), f"{GCS_OUTPUT_PREFIX}/{test_pred_path.name}")
+    except Exception as e:
+        print(f"[WARN] Could not upload test predictions: {e}")
+
+    # Also write calibrated/per-asset calibrated copies beside it
+    try:
+        _save_predictions_from_best(
+            trainer,
+            test_export_loader,
+            "test",
+            test_pred_path,
+            id_to_name=metrics_cb.id_to_name,
+        )
+    except Exception as e:
+        print(f"[WARN] Auxiliary calibrated TEST exports failed: {e}")
+
+except Exception as e:
+    print(f"[WARN] Failed to collect or save test metrics/predictions: {e}")
+
 
 # Helpers
 def _median_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
