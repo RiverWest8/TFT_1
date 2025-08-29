@@ -663,7 +663,9 @@ def _collect_predictions(
 
         # Optional time index
         try:
-            dec_time = x.get("decoder_time_idx", None) or x.get("decoder_relative_idx", None)
+            dec_time = x.get("decoder_time_idx", None)
+            if dec_time is None:
+                dec_time = x.get("decoder_relative_idx", None)
             if torch.is_tensor(dec_time):
                 tvec = dec_time
                 while tvec.ndim > 1 and tvec.size(-1) == 1:
@@ -896,7 +898,11 @@ def _classic_collect(model, dataloader, vol_norm, id_to_name: dict):
             return batch, None
         return None, None
 
+    batch_i = 0
     for batch in dataloader:
+        batch_i += 1
+        if batch_i % 50 == 0:
+            print(f"[EXPORT] processed {batch_i} batches…")
         x, y = _get_x_y(batch)
         if not isinstance(x, dict):
             continue
@@ -917,7 +923,9 @@ def _classic_collect(model, dataloader, vol_norm, id_to_name: dict):
             continue
 
         # time index (optional)
-        t = x.get("decoder_time_idx", None) or x.get("decoder_relative_idx", None)
+        t = x.get("decoder_time_idx", None)
+        if t is None:
+            t = x.get("decoder_relative_idx", None)
         if torch.is_tensor(t) and t.ndim > 1 and t.size(-1) == 1:
             t = t.squeeze(-1)
 
