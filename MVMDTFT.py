@@ -754,14 +754,22 @@ def make_export_loader(dl):
 
     We coerce each sample to the canonical shape:
         (x, (y, weight))    # weight may be None
+
+    Additionally, we filter out None samples inside a batch so `default_collate`
+    never sees `NoneType`.
     """
+    from torch.utils.data import DataLoader
+    from torch.utils.data._utils.collate import default_collate
+
     ds = dl.dataset
-    bs = getattr(dl, "batch_size", 128)
+    bs = getattr(dl, "batch_size", 128) or 128
     pf_collate = getattr(ds, "_collate_fn", None)  # PF's own collate, if present
 
     def _massage_samples(samples):
         fixed = []
         for s in samples:
+            if s is None:
+                continue
             # target formats we see: (x, y), (x, (y,)), (x, (y, w)), (x, y, w)
             if isinstance(s, tuple):
                 if len(s) == 3:
@@ -785,16 +793,29 @@ def make_export_loader(dl):
                         y = (y, None)
                     fixed.append((x, y))
                     continue
+            # Drop truly empty containers
+            if isinstance(s, (list, tuple, dict)) and len(s) == 0:
+                continue
             fixed.append(s)
         return fixed
 
     def fixed_collate(samples):
+        # 1) filter Nones up-front
+        samples = [s for s in samples if s is not None]
+        # 2) normalise structure
         samples = _massage_samples(samples)
+        if not samples:
+            # return a dummy minimal batch the downstream loop will skip
+            import torch
+            return {"groups": torch.empty(0, dtype=torch.long)}
+
+        # 3) Prefer PF's collate if available; else fall back to a "safe" default collate
         if pf_collate is not None:
             try:
                 return pf_collate(samples)
             except Exception as e:
                 print(f"[EXPORT] PF collate failed ({e}); falling back to default_collate.")
+        # Default collate after cleaning
         return default_collate(samples)
 
     return DataLoader(
@@ -804,7 +825,7 @@ def make_export_loader(dl):
         num_workers=0,              # single worker to avoid hangs
         pin_memory=False,
         drop_last=False,
-        collate_fn=fixed_collate,   # our normalized collate
+        collate_fn=fixed_collate,   # our normalized + safe collate
     )
 
 @torch.no_grad()
@@ -840,17 +861,7 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
     # Resolve normalizer from THIS dataset (good1 style: use dataset’s own)
     vol_norm = _extract_norm_from_dataset(dataloader.dataset)
 
-    # Rebuild a simple, single-worker loader (same dataset, no shuffles)
-    from torch.utils.data import DataLoader
-    base_bs = getattr(dataloader, "batch_size", 128) or 128
-    export_loader = DataLoader(
-        dataloader.dataset,
-        batch_size=base_bs,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=False,
-        drop_last=False,
-    )
+    export_loader = make_export_loader(dataloader)
 
     # Collect predictions (classic/simple)
     df = _classic_collect(model, export_loader, vol_norm=vol_norm, id_to_name=id_to_name or {})
