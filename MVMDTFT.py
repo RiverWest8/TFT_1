@@ -96,7 +96,7 @@ def _clean_none(obj):
     if isinstance(obj, dict):
         return {k: _clean_none(v) for k, v in obj.items() if v is not None}
     if isinstance(obj, (list, tuple)):
-        cleaned = [ _clean_none(v) for v in obj if v is not None ]
+        cleaned = [_clean_none(v) for v in obj if v is not None]
         return type(obj)(v for v in cleaned if v is not None)
     return obj
 
@@ -105,9 +105,7 @@ def make_safe_collate(base=None):
     def _safe(batch):
         batch = [b for b in batch if b is not None]
         batch = [_clean_none(b) for b in batch]
-        # drop any samples that turned entirely empty
         batch = [b for b in batch if b not in (None, (), [], {})]
-        print("DEBUG batch lens:", [len(b) if isinstance(b,(list,tuple)) else type(b) for b in batch])
         return base(batch)
     return _safe
 
@@ -3852,9 +3850,9 @@ try:
     df_val_preds = _collect_predictions(
         best_model,
         val_export_loader,
-        vol_normalizer=vol_norm_val,
+        vol_norm=vol_norm_val,          # <-- use alias the function already accepts
         id_to_name=metrics_cb.id_to_name,
-        out_path=None,   # return a DataFrame
+        out_path=None,
     )
 
     # Pick column names provided by the collector
@@ -3930,11 +3928,10 @@ try:
     test_export_loader = make_export_loader(test_dataloader)
     vol_norm_test = _extract_norm_from_dataset(test_export_loader.dataset)
 
-    # Collect DF (uncalibrated)
     df_test_preds = _collect_predictions(
         best_model,
         test_export_loader,
-        vol_normalizer=vol_norm_test,
+        vol_norm=vol_norm_test,         # <-- alias
         id_to_name=metrics_cb.id_to_name,
         out_path=None,
     )
@@ -3982,112 +3979,220 @@ def _safe_prob(t: torch.Tensor) -> torch.Tensor:
     return torch.clamp(t, 0.0, 1.0)
 
 @torch.no_grad()
-def _collect_predictions(model, dl, id_to_name, vol_norm):
-    model_device = next(model.parameters()).device
-    assets_all, t_idx_all = [], []
-    yv_all, pv_all, yd_all, pdprob_all = [], [], [], []
+def _collect_predictions(model, dataloader, vol_normalizer=None, vol_norm=None, id_to_name=None, out_path=None, cal_scale=None, per_asset_scales=None, **kwargs):
+    # Accept either name for the normalizer
+    if vol_normalizer is None:
+        vol_normalizer = vol_norm or kwargs.get("vol_norm", None)
+    if vol_normalizer is None:
+        raise RuntimeError("vol_normalizer/vol_norm must be provided to _collect_predictions")
 
-    for batch in dl:
-        if not isinstance(batch, (list, tuple)) or len(batch) < 2:
+    import pandas as pd
+    model.eval()
+
+    all_g, all_yv, all_pv, all_yd, all_pd, all_t = [], [], [], [], [], []
+
+    for batch in dataloader:
+        # ---- Normalise batch shape safely ----
+        # PF most commonly yields: (x_dict, y_tensor, weight?)  OR  (x_dict, y_tensor)
+        # Some collates produce nested tuples/lists; peel down to get x as dict and y as tensor if present.
+        if batch is None:
             continue
-        x, y = batch[0], batch[1]
+
+        x = None
+        yb = None
+
+        try:
+            # Case 1: (x_dict, y, *rest)
+            if isinstance(batch, (list, tuple)) and len(batch) >= 1:
+                cand = batch[0]
+                # Sometimes the first element is itself (x_dict, y)
+                if isinstance(cand, (list, tuple)) and len(cand) >= 1 and isinstance(cand[0], dict):
+                    x = cand[0]
+                    if len(cand) > 1 and torch.is_tensor(cand[1]):
+                        yb = cand[1]
+                elif isinstance(cand, dict):
+                    x = cand
+                    if len(batch) > 1 and torch.is_tensor(batch[1]):
+                        yb = batch[1]
+            # Case 2: batch IS the dict
+            if x is None and isinstance(batch, dict):
+                x = batch
+        except Exception:
+            x = None
+            yb = None
+
         if not isinstance(x, dict):
+            # Unable to parse this batch; skip defensively
             continue
 
-        # groups / time_idx
-        g = x.get("groups")
-        if g is None:
-            g = x.get("group_ids")
-        if isinstance(g, (list, tuple)):
-            g = g[0] if g else None
-        if torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
-            g = g.squeeze(-1)
-        if not torch.is_tensor(g):
+        # ---- Find group ids ----
+        groups = None
+        for k in ("groups", "group_ids", "group_id"):
+            try:
+                if k in x and x[k] is not None:
+                    groups = x[k]
+                    break
+            except Exception:
+                pass
+        if groups is None:
             continue
 
-        t_idx = x.get("decoder_time_idx")
-        if t_idx is None:
-            t_idx = x.get("time_idx")
-        if torch.is_tensor(t_idx) and t_idx.ndim > 1 and t_idx.size(-1) == 1:
-            t_idx = t_idx.squeeze(-1)
+        # groups might be a Tensor or a sequence of Tensors
+        try:
+            g = groups[0] if isinstance(groups, (list, tuple)) and len(groups) > 0 else groups
+            while torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
+                g = g.squeeze(-1)
+            if not torch.is_tensor(g):
+                continue
+        except Exception:
+            continue
 
-        # true targets (encoded)
-        yv, yd = None, None
-        if torch.is_tensor(y):
-            t = y
-            if t.ndim == 3 and t.size(1) == 1:
-                t = t[:, 0, :]
-            if t.ndim == 2 and t.size(1) >= 1:
-                yv = t[:, 0]
-                yd = (t[:, 1] if t.size(1) > 1 else None)
+        # ---- Pull decoder targets (vol, dir) from x or fallback yb ----
+        y_vol_t, y_dir_t = None, None
+        try:
+            dec_t = x.get("decoder_target", None)
+        except Exception:
+            dec_t = None
 
-        # forward
-        x_dev = {k: (v.to(model_device, non_blocking=True) if torch.is_tensor(v)
-                     else [vv.to(model_device, non_blocking=True) if torch.is_tensor(vv) else vv for vv in v]
-                     if isinstance(v, (list, tuple)) else v)
-                 for k, v in x.items()}
-        out = model(x_dev)
-        pred = getattr(out, "prediction", out)
+        if torch.is_tensor(dec_t):
+            y = dec_t
+            if y.ndim == 3 and y.size(-1) == 1: y = y[..., 0]
+            if y.ndim == 2 and y.size(1) >= 1:
+                y_vol_t = y[:, 0]
+                if y.size(1) > 1: y_dir_t = y[:, 1]
+        elif isinstance(dec_t, (list, tuple)) and len(dec_t) >= 1:
+            y_vol_t = dec_t[0]
+            if torch.is_tensor(y_vol_t):
+                if y_vol_t.ndim == 3 and y_vol_t.size(-1) == 1: y_vol_t = y_vol_t[..., 0]
+                if y_vol_t.ndim == 2 and y_vol_t.size(-1) == 1: y_vol_t = y_vol_t[:, 0]
+            if len(dec_t) > 1 and torch.is_tensor(dec_t[1]):
+                y_dir_t = dec_t[1]
+                if y_dir_t.ndim == 3 and y_dir_t.size(-1) == 1: y_dir_t = y_dir_t[..., 0]
+                if y_dir_t.ndim == 2 and y_dir_t.size(-1) == 1: y_dir_t = y_dir_t[:, 0]
+
+        # Fallback to yb (batch[1]) if needed
+        if (y_vol_t is None or y_dir_t is None) and torch.is_tensor(yb):
+            yy = yb
+            if yy.ndim == 3 and yy.size(1) == 1: yy = yy[:, 0, :]
+            if yy.ndim == 2 and yy.size(1) >= 1:
+                if y_vol_t is None:
+                    y_vol_t = yy[:, 0]
+                if y_dir_t is None and yy.size(1) > 1:
+                    y_dir_t = yy[:, 1]
+
+        if y_vol_t is None:
+            # No realised_vol target → skip this batch
+            continue
+
+        # ---- Forward pass and head extraction ----
+        try:
+            y_hat = model(x)
+        except Exception:
+            continue
+        pred = getattr(y_hat, "prediction", y_hat)
         if isinstance(pred, dict) and "prediction" in pred:
             pred = pred["prediction"]
 
-        # split heads
-        if isinstance(pred, (list, tuple)):
-            vol_q = pred[0]
-            d_log = pred[1] if len(pred) > 1 else None
-        else:
-            t = pred
-            if t.ndim >= 4 and t.size(1) == 1:
-                t = t.squeeze(1)
-            if t.ndim == 3 and t.size(1) == 1:
-                t = t[:, 0, :]
-            vol_q, d_log = t[:, : t.size(-1)-1], t[:, -1]
-        p_vol = _median_from_quantiles(vol_q) if torch.is_tensor(vol_q) else vol_q
+        p_vol, p_dir = _extract_heads(pred)
+        if p_vol is None:
+            continue
 
-        # decode to physical scale
-        y_dec = None
-        if torch.is_tensor(yv):
-            y_dec = safe_decode_vol(yv.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
-        p_dec = safe_decode_vol(p_vol.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
-        p_dec = torch.clamp(p_dec, min=1e-8)
-        y_dec = torch.clamp(y_dec, min = 1e-8)
+        # ---- Accumulate on CPU ----
+        try:
+            L = g.shape[0]
+            all_g.append(g.reshape(L).detach().cpu())
+            all_yv.append(y_vol_t.reshape(L).detach().cpu())
+            all_pv.append(p_vol.reshape(L).detach().cpu())
+            if y_dir_t is not None and p_dir is not None:
+                y_flat = y_dir_t.reshape(-1)
+                p_flat = p_dir.reshape(-1)
+                L2 = min(L, y_flat.numel(), p_flat.numel())
+                if L2 > 0:
+                    all_yd.append(y_flat[:L2].detach().cpu())
+                    all_pd.append(p_flat[:L2].detach().cpu())
+        except Exception:
+            # If shapes are inconsistent, skip this batch
+            continue
 
-        # direction prob
-        p_dir_prob = _safe_prob(d_log) if torch.is_tensor(d_log) else None
+        # Optional time index
+        try:
+            dec_time = x.get("decoder_time_idx", None) or x.get("decoder_relative_idx", None)
+            if torch.is_tensor(dec_time):
+                tvec = dec_time
+                while tvec.ndim > 1 and tvec.size(-1) == 1:
+                    tvec = tvec.squeeze(-1)
+                all_t.append(tvec.reshape(-1)[:L].detach().cpu())
+        except Exception:
+            pass
 
-        # append
-        gn_list = g.detach().cpu().long().tolist()
-        assets_all.extend([id_to_name.get(int(i), str(int(i))) for i in gn_list])
+    if not all_g:
+        raise RuntimeError("No predictions collected — dataloader yielded no usable batches.")
 
-        if torch.is_tensor(t_idx):
-            t_idx_all.extend(t_idx.detach().cpu().long().tolist())
-        else:
-            t_idx_all.extend([None] * len(gn_list))
+    g_cpu  = torch.cat(all_g)
+    yv_cpu = torch.cat(all_yv)
+    pv_cpu = torch.cat(all_pv)
 
-        if y_dec is not None:
-            yv_all.append(y_dec.detach().cpu())
-        pv_all.append(p_dec.detach().cpu())
+    # ---- Decode to physical scale (robust) ----
+    yv_dec = safe_decode_vol(yv_cpu.unsqueeze(-1), vol_normalizer, g_cpu.unsqueeze(-1)).squeeze(-1)
+    pv_dec = safe_decode_vol(pv_cpu.unsqueeze(-1), vol_normalizer, g_cpu.unsqueeze(-1)).squeeze(-1)
 
-        if torch.is_tensor(yd):
-            yd_all.append(yd.detach().cpu())
-        if p_dir_prob is not None:
-            pdprob_all.append(p_dir_prob.detach().cpu())
+    floor_val = float(globals().get("EVAL_VOL_FLOOR", 1e-6))
+    yv_dec = torch.clamp(yv_dec, min=floor_val)
+    pv_dec = torch.clamp(pv_dec, min=floor_val)
 
-    # stack safely
-    yv_list = torch.cat(yv_all).numpy().tolist() if yv_all else [None] * len(assets_all)
-    pv_list = torch.cat(pv_all).numpy().tolist() if pv_all else []
-    yd_list = torch.cat(yd_all).numpy().tolist() if yd_all else [None] * len(assets_all)
-    pd_list = torch.cat(pdprob_all).numpy().tolist() if pdprob_all else [None] * len(assets_all)
+    # Optional global / per-asset calibration (no look-ahead if from val)
+    if cal_scale is None:
+        cal_scale = kwargs.get("calibration_scale", None)
+    if cal_scale is not None:
+        try:
+            pv_dec = pv_dec * float(cal_scale)
+        except Exception:
+            pass
 
-    L = min(len(assets_all), len(t_idx_all), len(pv_list), len(yv_list), len(yd_list), len(pd_list))
-    return pd.DataFrame({
-        "asset":             assets_all[:L],
-        "time_idx":          t_idx_all[:L],
-        "realised_vol":      yv_list[:L],
-        "pred_realised_vol": pv_list[:L],
-        "direction":         yd_list[:L],
-        "pred_direction":    pd_list[:L],
+    if per_asset_scales is None:
+        per_asset_scales = kwargs.get("per_asset_calibration", None)
+
+    id_to_name = id_to_name or {}
+    assets = [id_to_name.get(int(i), str(int(i))) for i in g_cpu.numpy().tolist()]
+
+    if isinstance(per_asset_scales, dict) and len(per_asset_scales) > 0:
+        try:
+            _map = {str(k): float(v) for k, v in per_asset_scales.items()}
+            scales_vec = torch.tensor([_map.get(str(a), 1.0) for a in assets], dtype=pv_dec.dtype)
+            pv_dec = pv_dec * scales_vec
+        except Exception as _e:
+            print(f"[WARN] per-asset calibration failed, skipping: {_e}")
+
+    t_cpu = torch.cat(all_t) if all_t else None
+
+    df = pd.DataFrame({
+        "asset": assets,
+        "time_idx": t_cpu.numpy().tolist() if t_cpu is not None else [None] * len(assets),
+        "y_vol": yv_dec.numpy().tolist(),
+        "y_vol_pred": pv_dec.numpy().tolist(),
     })
+
+    if all_yd and all_pd:
+        yd_all = torch.cat(all_yd)
+        pd_all = torch.cat(all_pd)
+        try:
+            if torch.isfinite(pd_all).any() and (pd_all.min() < 0 or pd_all.max() > 1):
+                pd_all = torch.sigmoid(pd_all)
+        except Exception:
+            pd_all = torch.sigmoid(pd_all)
+        pd_all = torch.clamp(pd_all, 0.0, 1.0)
+        Lm = min(len(df), yd_all.numel(), pd_all.numel())
+        df = df.iloc[:Lm].copy()
+        df["y_dir"] = yd_all[:Lm].numpy().tolist()
+        df["y_dir_prob"] = pd_all[:Lm].numpy().tolist()
+
+    if out_path is not None:
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(out_path, index=False)
+        print(f"✓ Saved {len(df)} predictions → {out_path}")
+        return out_path
+    return df
 
 # ==== TEST predictions + metrics on decoded scale ====
 try:
