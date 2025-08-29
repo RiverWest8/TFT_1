@@ -3414,7 +3414,7 @@ if __name__ == "__main__":
     print("▶ Building TimeSeriesDataSets …")
 
     training_dataset = build_dataset(train_df, predict=False)
-    id_to_name = {int(i): str(s) for i, s in enumerate(training_dataset.data["asset"].cat.categories)}
+
 
     # Build validation/test from TRAIN template so group ID mapping and normalizer stats MATCH
     validation_dataset = TimeSeriesDataSet.from_dataset(
