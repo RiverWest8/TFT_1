@@ -40,6 +40,7 @@ Adjust hyper‑parameters in the CONFIG section below.
 """
 
 import warnings
+from lightning.pytorch.callbacks import ModelCheckpoint, StochasticWeightAveraging
 warnings.filterwarnings("ignore")
 from lightning.pytorch.callbacks import TQDMProgressBar
 import os
@@ -2454,9 +2455,7 @@ else:
 # -----------------------------------------------------------------------
 # CLI overrides for common CONFIG knobs
 # -----------------------------------------------------------------------
-# -----------------------------------------------------------------------
-# CLI overrides for common CONFIG knobs
-# -----------------------------------------------------------------------
+
 parser = argparse.ArgumentParser(description="TFT training with optional permutation importance", add_help=True)
 parser.add_argument("--disable_warmups", type=lambda s: str(s).lower() in ("1","true","t","yes","y","on"),
                     default=False, help="Disable bias/QLIKE warm-ups and tail ramp")
@@ -2923,51 +2922,62 @@ class ReduceLROnPlateauCallback(pl.Callback):
                 self.bad, self.cool = 0, self.cooldown
 
 
+# ---------------- Callback bundle (bias warm-up, tail ramp, LR control) ----------------
 VOL_LOSS = AsymmetricQuantileLoss(
     quantiles=VOL_QUANTILES,
     underestimation_factor=float(ARGS.underestimation_factor_start),
     mean_bias_weight=float(ARGS.vol_mean_bias_weight),
-    tail_q=0.85,                 # keep your current value if you prefer
-    tail_weight=1.0,             # you ramp this elsewhere
-    qlike_weight=0.0,            # keep 0.0 (we don’t decode in-loss)
+    tail_q=0.85,
+    tail_weight=1.0,
+    qlike_weight=0.0,
     reduction="mean",
 )
-# ---------------- Callback bundle (bias warm-up, tail ramp, LR control) ----------------
-EXTRA_CALLBACKS = [
-    BiasWarmupCallback(
-        vol_loss=VOL_LOSS,
-        target_under=float(ARGS.bw_target_under),
-        alpha_step=float(ARGS.bw_alpha_step),
-        warmup_epochs=int(ARGS.bw_warmup_epochs),
-        target_mean_bias=float(ARGS.bw_target_mean_bias),
-        qlike_target_weight=0.0,                 # diagnostics outside the loss
-        guard_patience=int(getattr(ARGS, "warmup_guard_patience", 100)),
-        guard_tol=float(getattr(ARGS, "warmup_guard_tol", 0.0)),
-    ),
-    TailWeightRamp(
-        vol_loss=VOL_LOSS,
-        start=1.0,
-        end=float(args.tail_end),
-        ramp_epochs=15,
-        gate_by_calibration=bool(args.tail_gate_by_cal),
-        gate_low=float(args.tail_gate_low),
-        gate_high=float(args.tail_gate_high),
-        gate_patience=2,
-    ),
-      ReduceLROnPlateauCallback(
-          monitor="val_mae_overall", factor=0.5, patience=4, min_lr=3e-5, cooldown=1, stop_after_epoch=None
-      ),
-      ModelCheckpoint(
-          dirpath=str(LOCAL_CKPT_DIR),
-          filename="tft-{epoch:02d}-{val_mae_overall:.4f}",
-          monitor="val_mae_overall",
-          mode="min",
-          save_top_k=3,
-          save_last=True,
-      ),
-      StochasticWeightAveraging(swa_lrs = 0.00091, swa_epoch_start=max(1, int(0.8 * MAX_EPOCHS))),
-      CosineLR(start_epoch=8, eta_min_ratio=5e-6, hold_last_epochs=2, warmup_steps=0),
-  ]
+
+# Bias warmup (uses ARGS)
+_bias_cb = BiasWarmupCallback(
+    vol_loss=VOL_LOSS,
+    target_under=float(ARGS.bw_target_under),
+    alpha_step=float(ARGS.bw_alpha_step),
+    warmup_epochs=int(ARGS.bw_warmup_epochs),
+    target_mean_bias=float(ARGS.bw_target_mean_bias),
+    qlike_target_weight=0.0,
+    guard_patience=int(getattr(ARGS, "warmup_guard_patience", 100)),
+    guard_tol=float(getattr(ARGS, "warmup_guard_tol", 0.0)),
+)
+
+# Tail ramp (ALL from ARGS — no undefined `args`)
+_tail_cb = TailWeightRamp(
+    vol_loss=VOL_LOSS,
+    start=1.0,
+    end=float(getattr(ARGS, "tail_end", 1.15)),
+    ramp_epochs=15,
+    gate_by_calibration=bool(getattr(ARGS, "tail_gate_by_cal", False)),
+    gate_low=float(getattr(ARGS, "tail_gate_low", 0.99)),
+    gate_high=float(getattr(ARGS, "tail_gate_high", 1.01)),
+    gate_patience=2,
+)
+
+_plateau_cb = ReduceLROnPlateauCallback(
+    monitor="val_mae_overall", factor=0.5, patience=4, min_lr=3e-5, cooldown=1, stop_after_epoch=None
+)
+_ckpt_cb = ModelCheckpoint(
+    dirpath=str(LOCAL_CKPT_DIR),
+    filename="tft-{epoch:02d}-{val_mae_overall:.4f}",
+    monitor="val_mae_overall",
+    mode="min",
+    save_top_k=3,
+    save_last=True,
+)
+_swa_cb = StochasticWeightAveraging(swa_lrs=0.00091, swa_epoch_start=max(1, int(0.8 * MAX_EPOCHS)))
+_cosine_cb = CosineLR(start_epoch=8, eta_min_ratio=5e-6, hold_last_epochs=2, warmup_steps=0)
+
+
+# Optional: include a TQDM progress bar (safe to remove if PF already logs)
+try:
+    from lightning.pytorch.callbacks import TQDMProgressBar
+    _callbacks.insert(0, TQDMProgressBar(refresh_rate=int(getattr(ARGS, "log_every_n_steps", 200))))
+except Exception:
+    pass
 
 class ValLossHistory(pl.Callback):
     """
@@ -3582,14 +3592,38 @@ def _objective_run_once(args_for_trial):
 
 def _optuna_objective(base_args):
     def obj(trial):
-        a = _trial_to_args(base_args, trial)
+        a = copy.deepcopy(base_args)
+
+        # --- Hyperparameters to tune with reasonable ranges ---
+        a.learning_rate = trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True)   # LR
+        a.dropout = trial.suggest_float("dropout", 0.05, 0.3, step=0.05)               # dropout
+        a.hidden_size = trial.suggest_int("hidden_size", 32, 128, step=16)             # hidden units
+        a.attention_head_size = trial.suggest_int("attention_head_size", 2, 8, step=2) # heads
+        a.hidden_continuous_size = trial.suggest_int("hidden_continuous_size", 8, 64, step=8)
+
+        # Bias warmup / tail ramp knobs
+        a.bw_target_under = trial.suggest_float("bw_target_under", 0.7, 1.0, step=0.05)
+        a.bw_alpha_step = trial.suggest_float("bw_alpha_step", 0.001, 0.05, log=True)
+        a.bw_warmup_epochs = trial.suggest_int("bw_warmup_epochs", 3, 10)
+        a.tail_end = trial.suggest_float("tail_end", 1.05, 1.25, step=0.05)
+
+        # Regularisation knobs
+        a.grad_accum_steps = trial.suggest_int("grad_accum_steps", 1, 4)
+        a.underestimation_factor_start = trial.suggest_float("underestimation_factor_start", 0.5, 1.5, step=0.1)
+
+        # You said you’d train ~20–25 epochs per tuner
+        a.max_epochs = trial.suggest_int("max_epochs", 20, 25)
+
+        # --- Run a short training with these sampled params ---
         qlike, mean_scale = _objective_run_once(a)
-        # Scale-aware objective: good QLIKE and ratio ~ 1
+
+        # Scale-aware objective
         lam = 0.5
-        score = qlike + lam * abs(math.log(max(1e-12, float(1.0 / max(1e-12, mean_scale)))))  # |log(y/p)| == |log(mean_scale)|
+        score = qlike + lam * abs(math.log(max(1e-12, float(1.0 / max(1e-12, mean_scale)))))
         trial.set_user_attr("val_qlike_uncal", qlike)
         trial.set_user_attr("val_mean_scale", mean_scale)
         return score
+
     return obj
 
 def _run_optuna(args):
@@ -3622,20 +3656,6 @@ if __name__ == "__main__":
     if args.optuna:
         _run_optuna(args)
         sys.exit(0)
-
-    # otherwise run your normal single training/eval
-    run_experiment(
-        max_epochs=args.max_epochs,
-        batch_size=args.batch_size,
-        perm_len=args.perm_len,
-        fi_max_batches=args.fi_max_batches,
-        resume=args.resume,
-        predict=args.predict,
-        tail_gate_low=float(args.tail_gate_low),
-        tail_gate_high=float(args.tail_gate_high),
-        end=float(args.tail_end),
-        # … plus whatever else your training call expects
-    )
     print(
         f"[CONFIG] batch_size={BATCH_SIZE} | encoder={MAX_ENCODER_LENGTH} | epochs={MAX_EPOCHS} | "
         f"perm_importance={'on' if ENABLE_FEATURE_IMPORTANCE else 'off'} | fi_max_batches={FI_MAX_BATCHES} | "
@@ -3981,7 +4001,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[TQDMProgressBar(refresh_rate=50), es_cb, metrics_cb, mirror_cb, lr_cb, val_hist_cb] + EXTRA_CALLBACKS,
+        callbacks=[es_cb, metrics_cb, mirror_cb, lr_cb, val_hist_cb, _bias_cb, _tail_cb, _plateau_cb, _ckpt_cb, _swa_cb, _cosine_cb]
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
         enable_progress_bar=True,
