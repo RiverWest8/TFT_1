@@ -811,52 +811,211 @@ def make_export_loader(dl):
 def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: Path | str,
                                 id_to_name: dict | None = None):
     """
-    Load the best checkpoint and write UNCALIBRATED predictions for `dataloader` to `out_path` (Parquet).
-    (We deliberately skip global/per-asset calibrated copies.)
+    GOOD1-STYLE EXPORT:
+      • load best ckpt on CPU
+      • iterate dataloader with num_workers=0
+      • forward pass
+      • take median RV quantile (+ optional direction)
+      • decode with dataset.target_normalizer
+      • write ONE parquet at out_path
     """
     ckpt = _get_best_ckpt_path(trainer)
     if ckpt is None:
         raise RuntimeError("Could not resolve best checkpoint path.")
     print(f"Loading best checkpoint for {split_name}: {ckpt}")
 
-    # Safe load for PyTorch 2.6 (weights_only default)
-    if _safe_globals_ctx is not None and _PFMultiNormalizer is not None:
-        with _safe_globals_ctx([_PFMultiNormalizer]):
-            try:
+    # Safe load for PyTorch 2.6 (weights_only=True default)
+    try:
+        if _safe_globals_ctx is not None and _PFMultiNormalizer is not None:
+            with _safe_globals_ctx([_PFMultiNormalizer]):
                 model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu")
-            except TypeError:
-                model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu", weights_only=False)
-    else:
-        try:
+        else:
             model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu")
-        except TypeError:
-            model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu", weights_only=False)
+    except TypeError:
+        # Older Lightning/PyTorch
+        model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu", weights_only=False)
 
-    # Resolve volatility normalizer from this dataloader's dataset
-    try:
-        vol_norm = _extract_norm_from_dataset(dataloader.dataset)
-    except Exception as e:
-        raise RuntimeError(f"Could not resolve normalizer from dataset: {e}")
+    model.eval()
 
-    # Build a *safe* single-worker export loader with normalized collate
-    export_loader = make_export_loader(dataloader)
-    try:
-        n_batches = len(export_loader)
-    except Exception:
-        n_batches = "?"
-    bs = getattr(export_loader, "batch_size", None)
-    print(f"[EXPORT] using single-worker export loader: batches={n_batches}, bs={bs}")
+    # Resolve normalizer from THIS dataset (good1 style: use dataset’s own)
+    vol_norm = _extract_norm_from_dataset(dataloader.dataset)
 
-    # Collect & write parquet (uncalibrated only)
-    out = _collect_predictions(
-        model,
-        export_loader,
-        vol_norm=vol_norm,           # alias accepted by collector
-        id_to_name=id_to_name or {},
-        out_path=out_path,
-        cal_scale=None,              # do not apply any calibration here
+    # Rebuild a simple, single-worker loader (same dataset, no shuffles)
+    from torch.utils.data import DataLoader
+    base_bs = getattr(dataloader, "batch_size", 128) or 128
+    export_loader = DataLoader(
+        dataloader.dataset,
+        batch_size=base_bs,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
     )
-    return out
+
+    # Collect predictions (classic/simple)
+    df = _classic_collect(model, export_loader, vol_norm=vol_norm, id_to_name=id_to_name or {})
+
+    # Save
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(out_path, index=False)
+    print(f"✓ Saved {len(df)} predictions → {out_path}")
+
+    return out_path
+
+@torch.no_grad()
+def _classic_collect(model, dataloader, vol_norm, id_to_name: dict):
+    """
+    Minimal, robust collector (good1.py style):
+      • supports PF batch layouts (x, y, …) or dict-only (x)
+      • pulls groups & decoder_target from x
+      • forward once per batch; extract heads with _extract_heads(...)
+      • decode realised_vol via vol_norm
+    """
+    import pandas as pd
+    all_assets, all_tidx, all_y_dec, all_p_dec, all_yd, all_pd = [], [], [], [], [], []
+
+    def _get_x_y(batch):
+        # Accept (x, y, …) or x
+        if isinstance(batch, (list, tuple)) and len(batch) >= 1:
+            x = batch[0]
+            y = batch[1] if len(batch) > 1 else None
+            return x, y
+        if isinstance(batch, dict):
+            return batch, None
+        return None, None
+
+    for batch in dataloader:
+        x, y = _get_x_y(batch)
+        if not isinstance(x, dict):
+            continue
+
+        # groups (asset ids)
+        g = None
+        for k in ("groups", "group_ids", "group_id"):
+            if k in x and x[k] is not None:
+                g = x[k]
+                break
+        if g is None:
+            continue
+        if isinstance(g, (list, tuple)) and len(g) > 0:
+            g = g[0]
+        if torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
+            g = g.squeeze(-1)
+        if not torch.is_tensor(g):
+            continue
+
+        # time index (optional)
+        t = x.get("decoder_time_idx", None) or x.get("decoder_relative_idx", None)
+        if torch.is_tensor(t) and t.ndim > 1 and t.size(-1) == 1:
+            t = t.squeeze(-1)
+
+        # targets from decoder_target if present; else fall back to y
+        y_vol_t, y_dir_t = None, None
+        dec_t = x.get("decoder_target", None)
+        if torch.is_tensor(dec_t):
+            yy = dec_t
+            if yy.ndim == 3 and yy.size(-1) == 1:
+                yy = yy[..., 0]  # [B, n_targets]
+            if yy.ndim == 2 and yy.size(1) >= 1:
+                y_vol_t = yy[:, 0]
+                if yy.size(1) > 1:
+                    y_dir_t = yy[:, 1]
+        elif isinstance(dec_t, (list, tuple)) and len(dec_t) >= 1:
+            y_vol_t = dec_t[0]
+            if torch.is_tensor(y_vol_t) and y_vol_t.ndim == 3 and y_vol_t.size(-1) == 1:
+                y_vol_t = y_vol_t[..., 0]
+            if len(dec_t) > 1 and torch.is_tensor(dec_t[1]):
+                y_dir_t = dec_t[1]
+                if y_dir_t.ndim == 3 and y_dir_t.size(-1) == 1:
+                    y_dir_t = y_dir_t[..., 0]
+
+        if y_vol_t is None and torch.is_tensor(y):
+            yy = y
+            if yy.ndim == 3 and yy.size(1) == 1:
+                yy = yy[:, 0, :]
+            if yy.ndim == 2 and yy.size(1) >= 1:
+                y_vol_t = yy[:, 0]
+                if y_dir_t is None and yy.size(1) > 1:
+                    y_dir_t = yy[:, 1]
+
+        # forward
+        try:
+            out = model(x)
+        except Exception:
+            continue
+        pred = getattr(out, "prediction", out)
+        if isinstance(pred, dict) and "prediction" in pred:
+            pred = pred["prediction"]
+
+        p_vol, p_dir = _extract_heads(pred)
+        if p_vol is None:
+            continue
+
+        # shape guards
+        L = g.shape[0]
+        if y_vol_t is not None:
+            y_vol_t = y_vol_t.reshape(-1)[:L]
+        p_vol = p_vol.reshape(-1)[:L]
+
+        # decode realised_vol
+        y_dec = None
+        if y_vol_t is not None:
+            y_dec = safe_decode_vol(y_vol_t.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+        p_dec = safe_decode_vol(p_vol.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+
+        # clamp tiny vols to avoid qlike blow-ups when consuming later
+        floor_val = float(globals().get("EVAL_VOL_FLOOR", 1e-6))
+        if y_dec is not None:
+            y_dec = torch.clamp(y_dec, min=floor_val)
+        p_dec = torch.clamp(p_dec, min=floor_val)
+
+        # map asset ids
+        assets = [id_to_name.get(int(a), str(int(a))) for a in g.detach().cpu().numpy().tolist()]
+        all_assets.extend(assets)
+
+        # time index (optional)
+        if torch.is_tensor(t):
+            all_tidx.extend(t.detach().cpu().numpy().tolist()[:L])
+        else:
+            all_tidx.extend([None] * L)
+
+        # store decoded rv
+        if y_dec is not None:
+            all_y_dec.extend(y_dec.detach().cpu().numpy().tolist())
+        else:
+            all_y_dec.extend([None] * L)
+        all_p_dec.extend(p_dec.detach().cpu().numpy().tolist())
+
+        # optional direction (convert to prob if needed)
+        if (y_dir_t is not None) and (p_dir is not None):
+            y_dir_t = y_dir_t.reshape(-1)[:L]
+            p_dir   = p_dir.reshape(-1)[:L]
+            pd = p_dir
+            try:
+                if torch.isfinite(pd).any() and (pd.min() < 0 or pd.max() > 1):
+                    pd = torch.sigmoid(pd)
+            except Exception:
+                pd = torch.sigmoid(pd)
+            pd = torch.clamp(pd, 0.0, 1.0)
+            all_yd.extend(y_dir_t.detach().cpu().int().numpy().tolist())
+            all_pd.extend(pd.detach().cpu().numpy().tolist())
+        else:
+            all_yd.extend([None] * L)
+            all_pd.extend([None] * L)
+
+    # build dataframe
+    df = pd.DataFrame({
+        "asset": all_assets,
+        "time_idx": all_tidx,
+        "realised_vol": all_y_dec,           # may include None if y not present for this split
+        "pred_realised_vol": all_p_dec,
+        "direction": all_yd,
+        "pred_direction": all_pd,            # probability in [0,1] if available
+    })
+    return df
+
+
 @torch.no_grad()
 def safe_decode_vol(y: torch.Tensor, normalizer, group_ids: torch.Tensor | None):
     """
