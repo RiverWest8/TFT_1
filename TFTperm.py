@@ -3612,11 +3612,30 @@ def _run_optuna(args):
 # -----------------------------------------------------------------------
 # --- Early exit into Optuna mode without disturbing the normal run ---
 if __name__ == "__main__":
-    ARGS, _UNKNOWN = parser.parse_known_args()
-    if getattr(ARGS, "optuna", False):
-        _run_optuna(ARGS)
+    import argparse
+    ap = argparse.ArgumentParser()
+
+    # all your `ap.add_argument(...)` go here
+
+    args = ap.parse_args()
+
+    if args.optuna:
+        _run_optuna(args)
         sys.exit(0)
 
+    # otherwise run your normal single training/eval
+    run_experiment(
+        max_epochs=args.max_epochs,
+        batch_size=args.batch_size,
+        perm_len=args.perm_len,
+        fi_max_batches=args.fi_max_batches,
+        resume=args.resume,
+        predict=args.predict,
+        tail_gate_low=float(args.tail_gate_low),
+        tail_gate_high=float(args.tail_gate_high),
+        end=float(args.tail_end),
+        # … plus whatever else your training call expects
+    )
     print(
         f"[CONFIG] batch_size={BATCH_SIZE} | encoder={MAX_ENCODER_LENGTH} | epochs={MAX_EPOCHS} | "
         f"perm_importance={'on' if ENABLE_FEATURE_IMPORTANCE else 'off'} | fi_max_batches={FI_MAX_BATCHES} | "
