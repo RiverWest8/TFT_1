@@ -107,6 +107,7 @@ def make_safe_collate(base=None):
         batch = [_clean_none(b) for b in batch]
         # drop any samples that turned entirely empty
         batch = [b for b in batch if b not in (None, (), [], {})]
+        print("DEBUG batch lens:", [len(b) if isinstance(b,(list,tuple)) else type(b) for b in batch])
         return base(batch)
     return _safe
 
@@ -3413,6 +3414,7 @@ if __name__ == "__main__":
     print("▶ Building TimeSeriesDataSets …")
 
     training_dataset = build_dataset(train_df, predict=False)
+    id_to_name = {int(i): str(s) for i, s in enumerate(training_dataset.data["asset"].cat.categories)}
 
     # Build validation/test from TRAIN template so group ID mapping and normalizer stats MATCH
     validation_dataset = TimeSeriesDataSet.from_dataset(
@@ -3488,9 +3490,6 @@ if __name__ == "__main__":
         pin_memory=False,
         **prefetch_kw,
     )
-    train_dataloader.collate_fn = make_safe_collate(getattr(train_dataloader, "collate_fn", None))
-    val_dataloader.collate_fn   = make_safe_collate(getattr(val_dataloader,   "collate_fn",   None))
-    test_dataloader.collate_fn  = make_safe_collate(getattr(test_dataloader,  "collate_fn",  None))
     # ---- derive id→asset-name mapping for callbacks ----
     asset_vocab = (
         training_dataset.get_parameters()["categorical_encoders"]["asset"].classes_
@@ -3801,14 +3800,9 @@ print(f"Best checkpoint (local or remote): {best_model_path}")
 # --- Save VALIDATION predictions from the BEST checkpoint (overwrites any earlier "final" predictions) ---
 try:
     print("Generating validation predictions from best checkpoint …")
-    try:
-        val_pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_best_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
-        _save_predictions_from_best(trainer, val_dataloader, "val", val_pred_path)
-    except Exception as e:
-        print(f"[WARN] Failed to save validation predictions from best checkpoint: {e}")
-    df_val_preds = _collect_predictions(
-        best_model, val_dataloader, id_to_name=metrics_cb.id_to_name, vol_norm=metrics_cb.vol_norm
-    )
+
+    _save_predictions_from_best(trainer, val_dataloader, "val", val_pred_path, id_to_name=metrics_cb.id_to_name, vol_norm=metrics_cb.vol_norm)
+
 
     # Compute decoded validation metrics for reference
     _vy = [v for v in df_val_preds.get("realised_vol", []).tolist() if v is not None]
@@ -4020,7 +4014,14 @@ try:
     # Also save “best-ckpt reloaded” exports (uncalibrated + calibrated if available)
     try:
         test_pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_best_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
-        _save_predictions_from_best(trainer, test_dataloader, "test", test_pred_path, id_to_name=metrics_cb.id_to_name)
+        _save_predictions_from_best(
+            trainer,
+            test_dataloader,
+            "test",
+            test_pred_path,
+            id_to_name=metrics_cb.id_to_name,
+            vol_norm=metrics_cb.vol_norm
+        )
     except Exception as e:
         print(f"[WARN] Failed to save test predictions from best checkpoint: {e}")
 
