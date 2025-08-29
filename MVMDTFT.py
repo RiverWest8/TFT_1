@@ -509,107 +509,178 @@ def _get_best_ckpt_path(trainer) -> str | None:
 
 
 @torch.no_grad()
-def _collect_predictions(model, dataloader, vol_normalizer=None, vol_norm=None, id_to_name=None, out_path=None, cal_scale=None, per_asset_scales=None, **kwargs):
-    if vol_normalizer is None:
-        vol_normalizer = vol_norm or kwargs.get("vol_norm", None)
+def _collect_predictions(
+    model,
+    dataloader,
+    vol_normalizer=None,
+    vol_norm=None,
+    id_to_name=None,
+    out_path=None,
+    cal_scale=None,
+    per_asset_scales=None,
+    **kwargs
+):
     """
-    Iterate a dataloader, run model in eval, extract:
-      • realised_vol median prediction (q=0.50) & target
-      • optional direction probability
-    Decode vol using `vol_normalizer`, clamp floors, and save to Parquet.
+    Robust exporter that tolerates PF's different batch shapes:
+      (x, y, *rest), ((x, y), *rest), dict-only, or nested lists/tuples.
     """
     import pandas as pd
-    # Accept alias vol_norm from legacy call-sites
-    if vol_normalizer is None:
-        vol_normalizer = kwargs.get("vol_norm", None)
-    if vol_normalizer is None:
-        raise RuntimeError("vol_normalizer (or vol_norm) must be provided to _collect_predictions")
-
     model.eval()
+
+    # accept either alias
+    if vol_normalizer is None:
+        vol_normalizer = vol_norm or kwargs.get("vol_norm", None)
+    if vol_normalizer is None:
+        raise RuntimeError("vol_normalizer/vol_norm must be provided to _collect_predictions")
+
+    # --- helpers to peel nested structures safely ---
+    def _find_first_dict(obj):
+        if isinstance(obj, dict):
+            return obj
+        if isinstance(obj, (list, tuple)):
+            for it in obj:
+                got = _find_first_dict(it)
+                if got is not None:
+                    return got
+        return None
+
+    def _find_first_tensor(obj):
+        import torch
+        if torch.is_tensor(obj):
+            return obj
+        if isinstance(obj, (list, tuple)):
+            for it in obj:
+                got = _find_first_tensor(it)
+                if got is not None:
+                    return got
+        return None
+
     all_g, all_yv, all_pv, all_yd, all_pd, all_t = [], [], [], [], [], []
 
     for batch in dataloader:
-        if not isinstance(batch, (list, tuple)):
-            continue
-        x = batch[0]
-        yb = batch[1] if len(batch) > 1 else None
-        if not isinstance(x, dict):
+        if batch is None:
             continue
 
-        # asset group ids
+        # 1) locate x dict and (optional) y tensor anywhere inside the batch
+        x = None
+        yb = None
+        if isinstance(batch, dict):
+            x = batch
+        else:
+            x = _find_first_dict(batch)
+            yb = _find_first_tensor(batch)
+
+        if not isinstance(x, dict):
+            # can’t use this batch
+            continue
+
+        # 2) group ids
         groups = None
         for k in ("groups", "group_ids", "group_id"):
-            if k in x and x[k] is not None:
-                groups = x[k]; break
+            try:
+                if k in x and x[k] is not None:
+                    groups = x[k]
+                    break
+            except Exception:
+                pass
         if groups is None:
             continue
-        g = groups[0] if isinstance(groups, (list, tuple)) else groups
+        g = groups[0] if isinstance(groups, (list, tuple)) and len(groups) > 0 else groups
+        import torch
         while torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
             g = g.squeeze(-1)
         if not torch.is_tensor(g):
             continue
 
-        # targets from decoder or fallback batch[1]
-        dec_t = x.get("decoder_target")
+        # 3) targets from decoder, else fallback to yb
         y_vol_t, y_dir_t = None, None
+        try:
+            dec_t = x.get("decoder_target", None)
+        except Exception:
+            dec_t = None
+
         if torch.is_tensor(dec_t):
             y = dec_t
-            if y.ndim == 3 and y.size(-1) == 1: y = y[..., 0]
+            if y.ndim == 3 and y.size(-1) == 1:
+                y = y[..., 0]
             if y.ndim == 2 and y.size(1) >= 1:
                 y_vol_t = y[:, 0]
-                if y.size(1) > 1: y_dir_t = y[:, 1]
+                if y.size(1) > 1:
+                    y_dir_t = y[:, 1]
         elif isinstance(dec_t, (list, tuple)) and len(dec_t) >= 1:
             y_vol_t = dec_t[0]
             if torch.is_tensor(y_vol_t):
-                if y_vol_t.ndim == 3 and y_vol_t.size(-1) == 1: y_vol_t = y_vol_t[..., 0]
-                if y_vol_t.ndim == 2 and y_vol_t.size(-1) == 1: y_vol_t = y_vol_t[:, 0]
+                if y_vol_t.ndim == 3 and y_vol_t.size(-1) == 1:
+                    y_vol_t = y_vol_t[..., 0]
+                if y_vol_t.ndim == 2 and y_vol_t.size(-1) == 1:
+                    y_vol_t = y_vol_t[:, 0]
             if len(dec_t) > 1 and torch.is_tensor(dec_t[1]):
                 y_dir_t = dec_t[1]
-                if y_dir_t.ndim == 3 and y_dir_t.size(-1) == 1: y_dir_t = y_dir_t[..., 0]
-                if y_dir_t.ndim == 2 and y_dir_t.size(-1) == 1: y_dir_t = y_dir_t[:, 0]
-        if (y_vol_t is None) and torch.is_tensor(yb):
+                if y_dir_t.ndim == 3 and y_dir_t.size(-1) == 1:
+                    y_dir_t = y_dir_t[..., 0]
+                if y_dir_t.ndim == 2 and y_dir_t.size(-1) == 1:
+                    y_dir_t = y_dir_t[:, 0]
+
+        if y_vol_t is None and torch.is_tensor(yb):
             yy = yb
-            if yy.ndim == 3 and yy.size(1) == 1: yy = yy[:, 0, :]
+            if yy.ndim == 3 and yy.size(1) == 1:
+                yy = yy[:, 0, :]
             if yy.ndim == 2 and yy.size(1) >= 1:
                 y_vol_t = yy[:, 0]
-                if yy.size(1) > 1: y_dir_t = yy[:, 1]
+                if y_dir_t is None and yy.size(1) > 1:
+                    y_dir_t = yy[:, 1]
+
         if y_vol_t is None:
+            # no realised_vol target — skip
             continue
 
-        # forward
-        y_hat = model(x)
+        # 4) forward + head extraction
+        try:
+            y_hat = model(x)
+        except Exception:
+            continue
         pred = getattr(y_hat, "prediction", y_hat)
         if isinstance(pred, dict) and "prediction" in pred:
             pred = pred["prediction"]
+
         p_vol, p_dir = _extract_heads(pred)
         if p_vol is None:
             continue
 
+        # 5) accumulate on CPU
         L = g.shape[0]
         all_g.append(g.reshape(L).detach().cpu())
         all_yv.append(y_vol_t.reshape(L).detach().cpu())
         all_pv.append(p_vol.reshape(L).detach().cpu())
-        if y_dir_t is not None and p_dir is not None:
-            all_yd.append(y_dir_t.reshape(-1)[:L].detach().cpu())
-            all_pd.append(p_dir.reshape(-1)[:L].detach().cpu())
 
-        dec_time = x.get("decoder_time_idx", None)
-        if dec_time is None:
-            dec_time = x.get("decoder_relative_idx", None)
-        if dec_time is not None and torch.is_tensor(dec_time):
-            tvec = dec_time
-            while tvec.ndim > 1 and tvec.size(-1) == 1:
-                tvec = tvec.squeeze(-1)
-            all_t.append(tvec.reshape(-1)[:L].detach().cpu())
+        if y_dir_t is not None and p_dir is not None:
+            y_flat = y_dir_t.reshape(-1)
+            p_flat = p_dir.reshape(-1)
+            L2 = min(L, y_flat.numel(), p_flat.numel())
+            if L2 > 0:
+                all_yd.append(y_flat[:L2].detach().cpu())
+                all_pd.append(p_flat[:L2].detach().cpu())
+
+        # Optional time index
+        try:
+            dec_time = x.get("decoder_time_idx", None) or x.get("decoder_relative_idx", None)
+            if torch.is_tensor(dec_time):
+                tvec = dec_time
+                while tvec.ndim > 1 and tvec.size(-1) == 1:
+                    tvec = tvec.squeeze(-1)
+                all_t.append(tvec.reshape(-1)[:L].detach().cpu())
+        except Exception:
+            pass
 
     if not all_g:
         raise RuntimeError("No predictions collected — dataloader yielded no usable batches.")
 
+    # assemble
     g_cpu  = torch.cat(all_g)
     yv_cpu = torch.cat(all_yv)
     pv_cpu = torch.cat(all_pv)
 
-    # decode to physical scale (robust)
+    # decode (robust)
     yv_dec = safe_decode_vol(yv_cpu.unsqueeze(-1), vol_normalizer, g_cpu.unsqueeze(-1)).squeeze(-1)
     pv_dec = safe_decode_vol(pv_cpu.unsqueeze(-1), vol_normalizer, g_cpu.unsqueeze(-1)).squeeze(-1)
 
@@ -617,7 +688,7 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, vol_norm=None, 
     yv_dec = torch.clamp(yv_dec, min=floor_val)
     pv_dec = torch.clamp(pv_dec, min=floor_val)
 
-    # Optional global multiplicative calibration (derived from validation only)
+    # global/per-asset calib (optional)
     if cal_scale is None:
         cal_scale = kwargs.get("calibration_scale", None)
     if cal_scale is not None:
@@ -625,8 +696,7 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, vol_norm=None, 
             pv_dec = pv_dec * float(cal_scale)
         except Exception:
             pass
-        # Optional per-asset multiplicative calibration (derived from validation only)
-        
+
     if per_asset_scales is None:
         per_asset_scales = kwargs.get("per_asset_calibration", None)
 
@@ -640,7 +710,6 @@ def _collect_predictions(model, dataloader, vol_normalizer=None, vol_norm=None, 
             pv_dec = pv_dec * scales_vec
         except Exception as _e:
             print(f"[WARN] per-asset calibration failed, skipping: {_e}")
-
 
     t_cpu = torch.cat(all_t) if all_t else None
 
@@ -727,60 +796,24 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
         raise RuntimeError(f"Could not resolve normalizer from dataset: {e}")
 
     # 1) Save the uncalibrated predictions
+    # Rebuild a safe, single-worker loader for export
+    export_loader = make_export_loader(dataloader)
+    try:
+        n_batches = len(export_loader)
+    except Exception:
+        n_batches = "?"
+    bs = getattr(export_loader, "batch_size", None)
+    print(f"[EXPORT] using single-worker export loader: batches={n_batches}, bs={bs}")
+
+    # 1) Save the uncalibrated predictions
     out_uncal = _collect_predictions(
         model,
-        dataloader,
-        vol_normalizer=vol_norm,
+        export_loader,
+        vol_norm=vol_norm,          # accepts either vol_norm or vol_normalizer
         id_to_name=id_to_name,
         out_path=out_path,
         cal_scale=None,
     )
-
-    # 2) Save calibrated predictions (global scale if available)
-    try:
-        s = GLOBAL_CAL_SCALE if (GLOBAL_CAL_SCALE is not None) else _load_val_cal_scale()
-    except Exception:
-        s = None
-
-    if s is not None:
-        out_path = Path(out_path)
-        cal_name = f"calibrated_{out_path.name}"
-        cal_path = out_path.with_name(cal_name)
-        print(f"Saving calibrated predictions for {split_name} with s={float(s):.6g} → {cal_path}")
-        _collect_predictions(
-            model,
-            dataloader,
-            vol_normalizer=vol_norm,
-            id_to_name=id_to_name,
-            out_path=cal_path,
-            cal_scale=float(s),
-        )
-    else:
-        print(f"[WARN] No validation calibration scale available; skipping calibrated parquet for {split_name}")
-
-    # 3) Save per-asset calibrated predictions if scales exist
-    try:
-        per_asset = _load_val_per_asset_scales()
-    except Exception:
-        per_asset = None
-
-    if isinstance(per_asset, dict) and len(per_asset) > 0:
-        out_path = Path(out_path)
-        pa_name = f"calibrated_pa_{out_path.name}"
-        pa_path = out_path.with_name(pa_name)
-        print(f"Saving per-asset calibrated predictions for {split_name} → {pa_path}")
-        _collect_predictions(
-            model,
-            dataloader,
-            vol_normalizer=vol_norm,
-            id_to_name=id_to_name,
-            out_path=pa_path,
-            cal_scale=None,  # don't double-apply global scale
-            per_asset_scales=per_asset,
-        )
-    else:
-        print(f"[WARN] No per-asset scales available; skipping per-asset calibrated parquet for {split_name}")
-
     return out_uncal
 
 @torch.no_grad()
