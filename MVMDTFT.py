@@ -1699,18 +1699,7 @@ class PerAssetMetrics(pl.Callback):
             + (f" | AUROC={auroc:.3f}" if auroc is not None else "")
             + f" | N={N}"
         )
-        print(msg)
-        # Print calibrated summary on a separate line for clarity
-        if overall_mae_cal is not None and overall_qlike_cal is not None:
-            msg_cal = (
-                f"[VAL EPOCH {epoch_num}] CALIBRATED "
-                f"MAE={overall_mae_cal:.6f} "
-                f"RMSE={overall_rmse_cal:.6f} "
-                f"MSE={overall_mse_cal:.6f} "
-                f"QLIKE={overall_qlike_cal:.6f} "
-                f"| N={N}"
-            )
-            print(msg_cal)
+       
 
         # --- Per-asset metrics table (so on_fit_end can print it) ---
         self._last_rows = []
