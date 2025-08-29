@@ -214,49 +214,6 @@ COMP_WEIGHTS = (1.0, 1.0, 0.333)  # default: slightly emphasise QLIKE for RV foc
 from pathlib import Path as _Path
 import os as _os, math as _math, json as _json
 
-def _latest_val_csv() -> _Path | None:
-    # 1) local first
-    try:
-        local_dir = _Path("/tmp/tft_run")
-        local_dir.mkdir(parents=True, exist_ok=True)
-        cand = sorted(local_dir.glob("tft_val_history_*.csv"),
-                      key=lambda p: p.stat().st_mtime, reverse=True)
-        if cand:
-            return cand[0]
-    except Exception:
-        pass
-
-    # 2) fallback: look in GCS if an output prefix is provided
-    try:
-        gcs_prefix = _os.environ.get("GCS_OUTPUT_PREFIX", "").rstrip("/")
-        if not gcs_prefix:
-            return None
-
-        import fsspec
-        fs, _, _ = fsspec.get_fs_token_paths(gcs_prefix)
-        files = [p for p in fs.glob(f"{gcs_prefix}/tft_val_history_*.csv")]
-        if not files:
-            return None
-
-        # newest by modified time if available, else by name
-        def _mtime(p):
-            try:
-                return fs.info(p).get("mtime") or ""
-            except Exception:
-                return ""
-        files = sorted(files, key=_mtime, reverse=True)
-        newest = files[0]
-        # download to /tmp so _read_metrics_from_csv can use pandas normally
-        local_dir = _Path("/tmp/tft_run")
-        local_dir.mkdir(parents=True, exist_ok=True)
-        local_path = local_dir / (_Path(newest).name)
-        with fs.open(newest, "rb") as rf, open(local_path, "wb") as wf:
-            wf.write(rf.read())
-        return local_path
-    except Exception:
-        return None
-
-
 def _read_metrics_from_csv(csv_path: _Path):
     import pandas as _pd_local
     df = _pd_local.read_csv(csv_path)
@@ -345,6 +302,71 @@ def _latest_val_csv() -> _Path | None:
         return local_path
     except Exception:
         return None
+    
+def _objective_run_once(args_for_trial):
+    """
+    Run a single child training process with the trial's args and
+    return (val_qlike_uncal, val_mean_scale). Prints child tails for debugging.
+    """
+    import shlex
+
+    env = _os.environ.copy()
+    # Ensure child knows where to write/read
+    gcs_prefix = getattr(args_for_trial, "gcs_output_prefix", None)
+    if gcs_prefix:
+        env["GCS_OUTPUT_PREFIX"] = str(gcs_prefix)
+    env.setdefault("PYTHONHASHSEED", "0")
+
+    script_path = __file__
+    argv = _build_trial_argv(args_for_trial, script_path)
+
+    print("\n[OPTUNA/TRIAL] launching child process:")
+    print("  ", " ".join(shlex.quote(a) for a in argv))
+
+    # Reasonable timeout: 60s + 90s/epoch
+    timeout_s = 60 + 90 * int(getattr(args_for_trial, "optuna_max_epochs", 12))
+    try:
+        cp = subprocess.run(
+            argv,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired as e:
+        tail_err = "\n".join((e.stderr or "").splitlines()[-80:])
+        print("[OPTUNA/TRIAL] TIMEOUT. Child stderr tail:\n", tail_err)
+        raise
+
+    def _tail(txt, n=80):
+        lines = (txt or "").splitlines()
+        return "\n".join(lines[-n:]) if lines else ""
+
+    print(f"[OPTUNA/TRIAL] child returncode = {cp.returncode}")
+    print("[OPTUNA/TRIAL] --- child stderr (tail) ---\n" + _tail(cp.stderr))
+    print("[OPTUNA/TRIAL] --- child stdout (tail) ---\n" + _tail(cp.stdout))
+    print("[OPTUNA/TRIAL] ----------------------------")
+
+    if cp.returncode != 0:
+        raise RuntimeError(f"Child training failed (exit {cp.returncode}). See stderr tail above.")
+
+    # Allow object store to settle
+    csv = None
+    for _ in range(10):
+        csv = _latest_val_csv()
+        if csv and csv.exists():
+            break
+        time.sleep(1.0)
+
+    if not csv:
+        raise RuntimeError(
+            "No validation history CSV found (local /tmp/tft_run or GCS via GCS_OUTPUT_PREFIX)."
+        )
+
+    qlike, mean_scale = _read_metrics_from_csv(csv)
+    print(f"[OPTUNA/TRIAL] metrics: val_qlike_uncal={qlike:.6f} | val_mean_scale={mean_scale:.6f} | csv={csv}")
+    return qlike, mean_scale
 
 
 def _optuna_objective(base_args):
@@ -376,7 +398,13 @@ def _run_optuna(args):
     if optuna is None:
         print("[WARN] Optuna not installed. Run `pip install optuna`.")
         return
-    pruner = optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=0)
+
+    try:
+        optuna.logging.set_verbosity(optuna.logging.INFO)
+    except Exception:
+        pass
+
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=2, n_warmup_steps=0)
     study = optuna.create_study(
         direction="minimize",
         study_name=(args.study_name or f"mvmdtft_{int(time.time())}"),
@@ -384,10 +412,20 @@ def _run_optuna(args):
         load_if_exists=True,
         pruner=pruner,
     )
-    study.optimize(_optuna_objective(args),
-                   n_trials=int(args.optuna_trials),
-                   timeout=int(args.optuna_timeout) if int(args.optuna_timeout) > 0 else None,
-                   gc_after_trial=True)
+    print(f"[OPTUNA] Study ready: {study.study_name}")
+
+    # Make sure the parent env exposes GCS_OUTPUT_PREFIX for CSV discovery
+    if getattr(args, "gcs_output_prefix", None):
+        _os.environ["GCS_OUTPUT_PREFIX"] = str(args.gcs_output_prefix)
+
+    study.optimize(
+        _optuna_objective(args),
+        n_trials=int(args.optuna_trials),
+        timeout=int(args.optuna_timeout) if int(args.optuna_timeout) > 0 else None,
+        gc_after_trial=True,
+        catch=(Exception,),  # ensure we see failures but continue other trials
+    )
+
     print("=== Optuna Best Params ===")
     try:
         print(_json.dumps(study.best_params, indent=2))
