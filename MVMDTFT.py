@@ -511,7 +511,9 @@ def _get_best_ckpt_path(trainer) -> str | None:
 
 
 @torch.no_grad()
-def _collect_predictions(model, dataloader, vol_normalizer=None, id_to_name: dict | None = None, out_path: Path | str | None = None, cal_scale: float | None = None, per_asset_scales: dict | None = None, **kwargs):
+def _collect_predictions(model, dataloader, vol_normalizer=None, vol_norm=None, id_to_name=None, out_path=None, cal_scale=None, per_asset_scales=None, **kwargs):
+    if vol_normalizer is None:
+        vol_normalizer = vol_norm or kwargs.get("vol_norm", None)
     """
     Iterate a dataloader, run model in eval, extract:
       • realised_vol median prediction (q=0.50) & target
@@ -3797,18 +3799,78 @@ if best_model is None:
     raise RuntimeError("No model available for testing (checkpoint and in-memory both unavailable).")
 
 print(f"Best checkpoint (local or remote): {best_model_path}")
-# --- Save VALIDATION predictions from the BEST checkpoint (overwrites any earlier "final" predictions) ---
+
+
+# --- Save VALIDATION predictions from the BEST checkpoint and compute decoded metrics ---
 try:
+    # Resolve path to best checkpoint
+    ckpt = _get_best_ckpt_path(trainer)
+    if ckpt is None:
+        raise RuntimeError("Could not resolve best checkpoint path.")
+    print(f"Best checkpoint (local or remote): {ckpt}")
     print("Generating validation predictions from best checkpoint …")
 
-    _save_predictions_from_best(trainer, val_dataloader, "val", val_pred_path, id_to_name=metrics_cb.id_to_name, vol_norm=metrics_cb.vol_norm)
+    # Load best model safely (PyTorch 2.6 weights_only guard)
+    if _safe_globals_ctx is not None and _PFMultiNormalizer is not None:
+        with _safe_globals_ctx([_PFMultiNormalizer]):
+            try:
+                best_model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu")
+            except TypeError:
+                best_model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu", weights_only=False)
+    else:
+        try:
+            best_model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu")
+        except TypeError:
+            best_model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu", weights_only=False)
 
+    # Get the volatility normalizer from the validation dataset
+    vol_norm_val = _extract_norm_from_dataset(val_dataloader.dataset)
 
-    # Compute decoded validation metrics for reference
-    _vy = [v for v in df_val_preds.get("realised_vol", []).tolist() if v is not None]
-    if _vy:
-        _vy_t = torch.tensor(_vy, dtype=torch.float32)
-        _vp_t = torch.tensor(df_val_preds["pred_realised_vol"].tolist(), dtype=torch.float32)[: _vy_t.numel()]
+    # 1) Collect a DataFrame of validation predictions (UNCALIBRATED) for metrics & saving
+    df_val_preds = _collect_predictions(
+        best_model,
+        val_dataloader,
+        vol_normalizer=vol_norm_val,
+        id_to_name=metrics_cb.id_to_name,   # uses your callback's mapping
+        out_path=None,                      # return a DataFrame (do NOT write here)
+    )
+
+    # Harmonize column names expected below
+    y_col = "y_vol" if "y_vol" in df_val_preds.columns else ("realised_vol" if "realised_vol" in df_val_preds.columns else None)
+    p_col = "y_vol_pred" if "y_vol_pred" in df_val_preds.columns else ("pred_realised_vol" if "pred_realised_vol" in df_val_preds.columns else None)
+    if y_col is None or p_col is None:
+        raise RuntimeError(f"Collector returned unexpected columns: {list(df_val_preds.columns)}")
+
+    # 2) Save the uncalibrated parquet (our canonical validation parquet)
+    pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+    df_val_preds.to_parquet(pred_path, index=False)
+    print(f"✓ Saved validation predictions (best ckpt, Parquet) → {pred_path}")
+    try:
+        upload_file_to_gcs(str(pred_path), f"{GCS_OUTPUT_PREFIX}/{pred_path.name}")
+    except Exception as e:
+        print(f"[WARN] Could not upload validation predictions: {e}")
+
+    # 3) Also write calibrated / per-asset calibrated copies via helper (these write files)
+    try:
+        _save_predictions_from_best(
+            trainer,
+            val_dataloader,
+            "val",
+            pred_path,                         # base file to mirror naming beside
+            id_to_name=metrics_cb.id_to_name   # mapping for human asset ids
+        )
+    except Exception as e:
+        print(f"[WARN] Auxiliary calibrated exports failed: {e}")
+
+    # 4) Compute decoded metrics on the DF we just saved
+    # (Guard against Nones and length mismatches)
+    import torch
+    _vy = [v for v in df_val_preds[y_col].tolist() if v is not None]
+    _vp = [v for v in df_val_preds[p_col].tolist() if v is not None]
+    L = min(len(_vy), len(_vp))
+    if L > 0:
+        _vy_t = torch.tensor(_vy[:L], dtype=torch.float32)
+        _vp_t = torch.tensor(_vp[:L], dtype=torch.float32)
         eps = 1e-8
         v_mae  = torch.mean(torch.abs(_vp_t - _vy_t)).item()
         v_mse  = torch.mean((_vp_t - _vy_t) ** 2).item()
@@ -3819,25 +3881,10 @@ try:
         v_qlike = torch.mean(ratio - torch.log(ratio) - 1.0).item()
         print(f"[VAL (best ckpt)] (decoded) MAE={v_mae:.6f} RMSE={v_rmse:.6f} MSE={v_mse:.6f} QLIKE={v_qlike:.6f}")
     else:
-        print("[VAL (best ckpt)] WARNING: could not compute decoded metrics (no ground-truth available in DataLoader).")
+        print("[VAL (best ckpt)] WARNING: could not compute decoded metrics (no valid pairs).")
 
-    # Save parquet & upload (same filename scheme as earlier so the 'best' overwrites the 'final')
-    val_pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
-    df_val_preds.to_parquet(val_pred_path, index=False)
-    print(f"✓ Saved validation predictions (best ckpt, Parquet) → {val_pred_path}")
-    try:
-        upload_file_to_gcs(str(val_pred_path), f"{GCS_OUTPUT_PREFIX}/{val_pred_path.name}")
-    except Exception as e:
-        print(f"[WARN] Could not upload validation predictions: {e}")
 except Exception as e:
     print(f"[WARN] Failed to save validation predictions from best checkpoint: {e}")
-
-# --- Run TEST loop with the best checkpoint & print decoded metrics ---
-try:
-    test_results = trainer.test(best_model, dataloaders=test_dataloader, verbose=True)
-    print(f"Test results (trainer.test): {test_results}")
-except Exception as e:
-    print(f"[WARN] Test evaluation failed: {e}")
 
 # Helpers
 def _median_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
