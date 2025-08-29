@@ -230,14 +230,14 @@ def _build_trial_argv(base_args, script_path: str):
     argv = [
         sys.executable, script_path,
         "--predict", "True",
-        "--max_epochs", str(int(getattr(base_args, "optuna_max_epochs", 12))),
+        "--max_epochs", str(int(getattr(base_args, "optuna_max_epochs", 25))),
+        # parameter-level knobs
         "--bw_target_under", str(float(getattr(base_args, "bw_target_under", 1.15))),
         "--bw_alpha_step", str(float(getattr(base_args, "bw_alpha_step", 0.05))),
         "--bw_warmup_epochs", str(int(getattr(base_args, "bw_warmup_epochs", 3))),
         "--bw_target_mean_bias", str(float(getattr(base_args, "bw_target_mean_bias", 0.05))),
         "--vol_mean_bias_weight", str(float(getattr(base_args, "vol_mean_bias_weight", 0.01))),
         "--underestimation_factor_start", str(float(getattr(base_args, "underestimation_factor_start", 1.10))),
-        "--underestimation_kick_epochs", str(int(getattr(base_args, "underestimation_kick_epochs", 3))),
         "--tail_gate_low", str(float(getattr(base_args, "tail_gate_low", 0.99))),
         "--tail_gate_high", str(float(getattr(base_args, "tail_gate_high", 1.01))),
         "--tail_end", str(float(getattr(base_args, "tail_end", 1.15))),
@@ -246,7 +246,7 @@ def _build_trial_argv(base_args, script_path: str):
     if bool(getattr(base_args, "tail_gate_by_cal", False)):
         argv.append("--tail_gate_by_cal")
 
-    # pass-throughs you may want to keep fixed during trials
+    # pass-throughs to keep MODEL HPs & runtime fixed
     passthru = {
         "--data_dir": getattr(base_args, "data_dir", None),
         "--gcs_data_prefix": getattr(base_args, "gcs_data_prefix", None),
@@ -255,11 +255,23 @@ def _build_trial_argv(base_args, script_path: str):
         "--max_encoder_length": getattr(base_args, "max_encoder_length", None),
         "--check_val_every_n_epoch": getattr(base_args, "check_val_every_n_epoch", None),
         "--log_every_n_steps": getattr(base_args, "log_every_n_steps", None),
+        "--num_workers": getattr(base_args, "num_workers", None),
+        "--prefetch_factor": getattr(base_args, "prefetch_factor", None),
+        "--enable_perm_importance": getattr(base_args, "enable_perm_importance", None),
+        "--perm_len": getattr(base_args, "perm_len", None),
+        "--fi_max_batches": getattr(base_args, "fi_max_batches", None),
+        "--resume": getattr(base_args, "resume", None),
     }
     for k, v in passthru.items():
-        if v is not None:
+        if v is None:
+            continue
+        if isinstance(v, bool):
+            if v:
+                argv += [k, "True"]
+        else:
             argv += [k, str(v)]
-    return [a for a in argv if a != "" and a is not None]
+
+    return [a for a in argv if a not in ("", None)]
 
 def _latest_val_csv() -> _Path | None:
     # 1) local first
@@ -370,28 +382,57 @@ def _objective_run_once(args_for_trial):
 
 
 def _optuna_objective(base_args):
+    """
+    Tune *parameter-level* controls only (loss/warmup/tail). Model HPs remain fixed.
+    """
     def obj(trial):
         a = copy.deepcopy(base_args)
-        # targeted, fast search space
-        a.bw_target_under = trial.suggest_float("bw_target_under", 1.10, 1.30)
-        a.bw_alpha_step   = trial.suggest_float("bw_alpha_step",   0.02, 0.08)
-        a.bw_warmup_epochs = trial.suggest_int("bw_warmup_epochs", 2, 5)
-        a.bw_target_mean_bias = trial.suggest_float("bw_target_mean_bias", 0.03, 0.07)
-        a.vol_mean_bias_weight = trial.suggest_float("vol_mean_bias_weight", 0.008, 0.02)
-        a.underestimation_factor_start = trial.suggest_float("underestimation_factor_start", 1.00, 1.15)
-        a.tail_gate_by_cal = trial.suggest_categorical("tail_gate_by_cal", [True, False])
-        a.tail_gate_low  = trial.suggest_float("tail_gate_low",  0.985, 0.995)
-        a.tail_gate_high = trial.suggest_float("tail_gate_high", 1.005, 1.015)
-        a.tail_end       = trial.suggest_float("tail_end", 1.10, 1.18)
-        a.grad_accum_steps = trial.suggest_categorical("grad_accum_steps", [1, 2])
-        a.optuna_max_epochs = int(getattr(base_args, "optuna_max_epochs", 12))
+
+        # ===== Quantized search spaces =====
+        # big knobs in 0.1 steps
+        a.bw_target_under              = trial.suggest_float("bw_target_under", 1.0, 1.3, step=0.1)      # {1.0,1.1,1.2,1.3}
+        a.underestimation_factor_start = trial.suggest_float("underestimation_factor_start", 1.0, 1.2, step=0.1)
+
+        # medium knobs
+        a.bw_alpha_step                = trial.suggest_float("bw_alpha_step", 0.01, 0.08, step=0.01)     # 0.01..0.08 by 0.01
+        a.bw_warmup_epochs             = trial.suggest_int("bw_warmup_epochs", 2, 5, step=1)             # 2,3,4,5
+        a.bw_target_mean_bias          = trial.suggest_float("bw_target_mean_bias", 0.03, 0.07, step=0.01)
+        a.vol_mean_bias_weight         = trial.suggest_float("vol_mean_bias_weight", 0.005, 0.02, step=0.005)
+
+        # tail gating
+        a.tail_gate_by_cal             = trial.suggest_categorical("tail_gate_by_cal", [True, False])
+        a.tail_gate_low                = trial.suggest_float("tail_gate_low", 0.985, 0.995, step=0.005)  # 0.985/0.99/0.995
+        a.tail_gate_high               = trial.suggest_float("tail_gate_high", 1.005, 1.015, step=0.005) # 1.005/1.01/1.015
+        a.tail_end                     = trial.suggest_float("tail_end", 1.10, 1.22, step=0.02)          # include 1.22
+
+        # keep trials fast & consistent
+        a.optuna_max_epochs = int(getattr(base_args, "optuna_max_epochs", 25))
+        a.max_epochs = a.optuna_max_epochs
+        a.predict = True
+
+        print(f"[TRIAL {trial.number}] start → "
+              f"under={a.bw_target_under}, α_step={a.bw_alpha_step}, warmup={a.bw_warmup_epochs}, "
+              f"μbias_tgt={a.bw_target_mean_bias}, μbias_w={a.vol_mean_bias_weight}, "
+              f"under_start={a.underestimation_factor_start}, "
+              f"gate_by_cal={a.tail_gate_by_cal}, gate_low={a.tail_gate_low}, gate_high={a.tail_gate_high}, "
+              f"tail_end={a.tail_end}, epochs={a.max_epochs}")
 
         qlike, mean_scale = _objective_run_once(a)
-        lam = 0.5  # scale penalty weight
-        score = qlike + lam * abs(_math.log(max(1e-12, float(mean_scale))))
+
+        # Scale-aware objective (comp_loss)
+        lam = 0.5
+        comp_loss = qlike + lam * abs(math.log(max(1e-12, float(mean_scale))))
+
+        # record attrs for callbacks
         trial.set_user_attr("val_qlike_uncal", qlike)
-        trial.set_user_attr("val_mean_scale", mean_scale)
-        return score
+        trial.set_user_attr("val_mean_scale",  mean_scale)
+        trial.set_user_attr("comp_loss",       comp_loss)
+
+        # per-trial printout
+        print(f"[TRIAL {trial.number}] complete — comp_loss={comp_loss:.6f} | qlike={qlike:.6f} | mean_scale={mean_scale:.4f}")
+
+        return comp_loss
+
     return obj
 
 def _run_optuna(args):
@@ -399,12 +440,21 @@ def _run_optuna(args):
         print("[WARN] Optuna not installed. Run `pip install optuna`.")
         return
 
-    try:
-        optuna.logging.set_verbosity(optuna.logging.INFO)
-    except Exception:
-        pass
+    total = int(getattr(args, "optuna_trials", 50))
 
-    pruner = optuna.pruners.MedianPruner(n_startup_trials=2, n_warmup_steps=0)
+    # progress callback
+    _state = {"done": 0}
+    def _progress_cb(study, trial):
+        _state["done"] += 1
+        comp = trial.user_attrs.get("comp_loss", trial.value)
+        ql   = trial.user_attrs.get("val_qlike_uncal")
+        ms   = trial.user_attrs.get("val_mean_scale")
+        print(f"[OPTUNA] {_state['done']}/{total} — Trial {trial.number} finished "
+              f"(comp_loss={None if comp is None else f'{comp:.6f}'}, "
+              f"qlike={None if ql is None else f'{ql:.6f}'}, "
+              f"mean_scale={None if ms is None else f'{ms:.4f}'})")
+
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=0)
     study = optuna.create_study(
         direction="minimize",
         study_name=(args.study_name or f"mvmdtft_{int(time.time())}"),
@@ -412,27 +462,28 @@ def _run_optuna(args):
         load_if_exists=True,
         pruner=pruner,
     )
-    print(f"[OPTUNA] Study ready: {study.study_name}")
 
-    # Make sure the parent env exposes GCS_OUTPUT_PREFIX for CSV discovery
-    if getattr(args, "gcs_output_prefix", None):
-        _os.environ["GCS_OUTPUT_PREFIX"] = str(args.gcs_output_prefix)
+    print(f"[OPTUNA] Starting: trials={total}, max_epochs={int(args.optuna_max_epochs)}, "
+          f"storage={args.optuna_storage}, study={study.study_name}")
 
     study.optimize(
         _optuna_objective(args),
-        n_trials=int(args.optuna_trials),
+        n_trials=total,
         timeout=int(args.optuna_timeout) if int(args.optuna_timeout) > 0 else None,
         gc_after_trial=True,
-        catch=(Exception,),  # ensure we see failures but continue other trials
+        callbacks=[_progress_cb],
     )
 
     print("=== Optuna Best Params ===")
     try:
-        print(_json.dumps(study.best_params, indent=2))
+        print(json.dumps(study.best_params, indent=2))
     except Exception:
         print(study.best_params)
     print("Best value:", study.best_value)
-    print("Best attrs:", {k: study.best_trial.user_attrs.get(k) for k in ["val_qlike_uncal", "val_mean_scale"]})
+    print("Best attrs:", {
+        k: study.best_trial.user_attrs.get(k)
+        for k in ["comp_loss", "val_qlike_uncal", "val_mean_scale"]
+    })
 # ========================== end Optuna harness =========================
 
 def composite_score(mae, rmse, qlike,
@@ -2532,6 +2583,9 @@ parser = argparse.ArgumentParser(
 )
 
 # Core training knobs
+# Optuna harness (update defaults)
+parser.add_argument("--optuna_trials", type=int, default=50)
+parser.add_argument("--optuna_max_epochs", type=int, default=25)
 parser.add_argument("--max_encoder_length", type=int, default=None, help="Max encoder length")
 parser.add_argument("--max_epochs", type=int, default=None, help="Max training epochs")
 parser.add_argument("--batch_size", type=int, default=None, help="Training batch size")
@@ -3632,86 +3686,119 @@ def _resolve_best_model(trainer, fallback):
     return fallback
 
 
+import tempfile, signal  # <- add near other imports
+
+def _print_log_tails(stdout_path: _Path, stderr_path: _Path, n: int = 120):
+    try:
+        if stdout_path and stdout_path.exists():
+            with open(stdout_path, "r") as f:
+                lines = f.read().splitlines()
+                print("[OPTUNA/TRIAL] --- child stdout (tail) ---")
+                print("\n".join(lines[-n:]))
+        if stderr_path and stderr_path.exists():
+            with open(stderr_path, "r") as f:
+                lines = f.read().splitlines()
+                print("[OPTUNA/TRIAL] --- child stderr (tail) ---")
+                print("\n".join(lines[-n:]))
+        print("[OPTUNA/TRIAL] ----------------------------")
+    except Exception as _e:
+        print(f"[OPTUNA/TRIAL] log tail read failed: {_e}")
 
 def _objective_run_once(args_for_trial):
     """
-    Runs one short training. We assume your normal main() trains and writes a
-    '/tmp/tft_run/tft_val_history_*.csv'. If your entrypoint is named differently,
-    call it here directly. Keep predict=True so validation hooks run.
+    Run one child training process and return (val_qlike_uncal, val_mean_scale).
+
+    Robustness:
+      • Uses Popen + timeout; kills child on timeout/CTRL-C
+      • Streams child logs to temp files; we print tails afterwards
+      • Waits/retries for the val CSV (local or GCS-backed)
     """
-    # If your project uses a function like run_experiment(args), call it here:
-    # run_experiment(args_for_trial)
+    import shlex
 
-    # Otherwise, fallback: spawn a subprocess to run this script with the trial args.
-    argv = [sys.executable, __file__,
-            "--predict", str(args_for_trial.predict),
-            "--bw_target_under", str(args_for_trial.bw_target_under),
-            "--bw_alpha_step", str(args_for_trial.bw_alpha_step),
-            "--bw_warmup_epochs", str(args_for_trial.bw_warmup_epochs),
-            "--bw_target_mean_bias", str(args_for_trial.bw_target_mean_bias),
-            "--vol_mean_bias_weight", str(args_for_trial.vol_mean_bias_weight),
-            "--underestimation_factor_start", str(args_for_trial.underestimation_factor_start),
-            "--underestimation_kick_epochs", str(args_for_trial.underestimation_kick_epochs),
-            "--tail_gate_by_cal" if args_for_trial.tail_gate_by_cal else "",
-            "--tail_gate_low", str(args_for_trial.tail_gate_low),
-            "--tail_gate_high", str(args_for_trial.tail_gate_high),
-            "--tail_end", str(args_for_trial.tail_end),
-            "--grad_accum_steps", str(args_for_trial.grad_accum_steps),
-            "--max_epochs", str(args_for_trial.max_epochs),
-        ]
-    argv = [x for x in argv if x != ""]  # remove empty flag if gate_by_cal=False
-    # Add any other flags you normally pass (data paths, etc.)
-    env = os.environ.copy()
-    env["PYTHONHASHSEED"] = env.get("PYTHONHASHSEED", "0")
+    env = _os.environ.copy()
+    # Make logs unbuffered and pass GCS prefix to child
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    env.setdefault("PYTHONHASHSEED", "0")
+    gcs_prefix = getattr(args_for_trial, "gcs_output_prefix", None)
+    if gcs_prefix:
+        env["GCS_OUTPUT_PREFIX"] = str(gcs_prefix)
 
-    # Run
-    cp = subprocess.run(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    # You can inspect cp.stdout if needed.
+    script_path = __file__
+    argv = _build_trial_argv(args_for_trial, script_path)
+    print("\n[OPTUNA/TRIAL] launching child:")
+    print("  ", " ".join(shlex.quote(a) for a in argv))
 
-    # Read latest CSV
-    path = _latest_val_csv()
-    if not path:
-        raise RuntimeError("No validation history CSV found. Ensure your run writes /tmp/tft_run/tft_val_history_*.csv")
-    qlike, mean_scale = _read_metrics_from_csv(path)
-    if qlike is None or mean_scale is None:
-        raise RuntimeError(f"Could not read QLIKE/mean_scale from: {path}")
+    # Reasonable wall-clock guard: ~75s/epoch + 45s startup, unless user overrides
+    timeout_s = int(getattr(args_for_trial, "optuna_child_timeout", 0)) \
+                or (45 + 75 * int(getattr(args_for_trial, "optuna_max_epochs", 12)))
+
+    with tempfile.TemporaryDirectory() as td:
+        out_p = _Path(td) / "child_stdout.log"
+        err_p = _Path(td) / "child_stderr.log"
+        with open(out_p, "w") as out_f, open(err_p, "w") as err_f:
+            proc = None
+            try:
+                proc = subprocess.Popen(
+                    argv,
+                    env=env,
+                    stdout=out_f,
+                    stderr=err_f,
+                    text=True,
+                )
+                try:
+                    proc.wait(timeout=timeout_s)
+                except subprocess.TimeoutExpired:
+                    print(f"[OPTUNA/TRIAL] TIMEOUT after {timeout_s}s — terminating child…")
+                    try:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=15)
+                        except subprocess.TimeoutExpired:
+                            print("[OPTUNA/TRIAL] Child did not terminate; killing…")
+                            proc.kill()
+                            proc.wait(timeout=10)
+                    finally:
+                        _print_log_tails(out_p, err_p)
+                    raise
+            except KeyboardInterrupt:
+                print("[OPTUNA/TRIAL] Parent received KeyboardInterrupt — terminating child…")
+                if proc and proc.poll() is None:
+                    try:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.wait(timeout=5)
+                    except Exception:
+                        pass
+                _print_log_tails(out_p, err_p)
+                raise
+            except Exception as e:
+                print(f"[OPTUNA/TRIAL] Subprocess failed early: {e}")
+                _print_log_tails(out_p, err_p)
+                raise
+            finally:
+                # Always print the log tails for visibility
+                _print_log_tails(out_p, err_p)
+
+    if proc.returncode != 0:
+        raise RuntimeError(f"Child training failed (exit {proc.returncode}). See log tails above.")
+
+    # Allow object storage to settle and then locate the newest val CSV
+    csv = None
+    for _ in range(15):
+        csv = _latest_val_csv()
+        if csv and csv.exists():
+            break
+        time.sleep(1.0)
+
+    if not csv:
+        raise RuntimeError("No validation history CSV found (local /tmp/tft_run or GCS via GCS_OUTPUT_PREFIX).")
+
+    qlike, mean_scale = _read_metrics_from_csv(csv)
+    print(f"[OPTUNA/TRIAL] metrics: val_qlike_uncal={qlike:.6f} | val_mean_scale={mean_scale:.6f} | csv={csv}")
     return qlike, mean_scale
-
-def _optuna_objective(base_args):
-    def obj(trial):
-        a = copy.deepcopy(base_args)
-
-        # --- Hyperparameters to tune with reasonable ranges ---
-        a.learning_rate = trial.suggest_float("learning_rate", 1e-4, 5e-3, log=True)   # LR
-        a.dropout = trial.suggest_float("dropout", 0.05, 0.3, step=0.05)               # dropout
-        a.hidden_size = trial.suggest_int("hidden_size", 32, 128, step=16)             # hidden units
-        a.attention_head_size = trial.suggest_int("attention_head_size", 2, 8, step=2) # heads
-        a.hidden_continuous_size = trial.suggest_int("hidden_continuous_size", 8, 64, step=8)
-
-        # Bias warmup / tail ramp knobs
-        a.bw_target_under = trial.suggest_float("bw_target_under", 0.7, 1.0, step=0.05)
-        a.bw_alpha_step = trial.suggest_float("bw_alpha_step", 0.001, 0.05, log=True)
-        a.bw_warmup_epochs = trial.suggest_int("bw_warmup_epochs", 3, 10)
-        a.tail_end = trial.suggest_float("tail_end", 1.05, 1.25, step=0.05)
-
-        # Regularisation knobs
-        a.grad_accum_steps = trial.suggest_int("grad_accum_steps", 1, 4)
-        a.underestimation_factor_start = trial.suggest_float("underestimation_factor_start", 0.5, 1.5, step=0.1)
-
-        # You said you’d train ~20–25 epochs per tuner
-        a.max_epochs = trial.suggest_int("max_epochs", 20, 25)
-
-        # --- Run a short training with these sampled params ---
-        qlike, mean_scale = _objective_run_once(a)
-
-        # Scale-aware objective
-        lam = 0.5
-        score = qlike + lam * abs(math.log(max(1e-12, float(1.0 / max(1e-12, mean_scale)))))
-        trial.set_user_attr("val_qlike_uncal", qlike)
-        trial.set_user_attr("val_mean_scale", mean_scale)
-        return score
-
-    return obj
 
 def _run_optuna(args):
     if optuna is None:
