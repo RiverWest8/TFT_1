@@ -1010,15 +1010,15 @@ def _classic_collect(model, dataloader, vol_norm, id_to_name: dict):
         if (y_dir_t is not None) and (p_dir is not None):
             y_dir_t = y_dir_t.reshape(-1)[:L]
             p_dir   = p_dir.reshape(-1)[:L]
-            pd = p_dir
+            p_prob = p_dir
             try:
-                if torch.isfinite(pd).any() and (pd.min() < 0 or pd.max() > 1):
-                    pd = torch.sigmoid(pd)
+                if torch.isfinite(p_prob).any() and (p_prob.min() < 0 or p_prob.max() > 1):
+                    p_prob = torch.sigmoid(p_prob)
             except Exception:
-                pd = torch.sigmoid(pd)
-            pd = torch.clamp(pd, 0.0, 1.0)
+                p_prob = torch.sigmoid(p_prob)
+            p_prob = torch.clamp(p_prob, 0.0, 1.0)
             all_yd.extend(y_dir_t.detach().cpu().int().numpy().tolist())
-            all_pd.extend(pd.detach().cpu().numpy().tolist())
+            all_pd.extend(p_prob.detach().cpu().numpy().tolist())
         else:
             all_yd.extend([None] * L)
             all_pd.extend([None] * L)
@@ -4161,19 +4161,19 @@ try:
     except Exception as e:
         print(f"[WARN] Could not upload validation predictions: {e}")
 
-    # 3) Also write calibrated & per-asset calibrated copies beside it
-    #    NOTE: do NOT pass vol_norm=... here — the saver resolves it from the dataset.
+    # --- Write VALIDATION parquet (uncalibrated, single file) ---
+    _save_predictions_from_best(
+        trainer,
+        val_export_loader,
+        "val",
+        val_pred_path,
+        id_to_name=metrics_cb.id_to_name,
+    )
+    print(f"✓ Wrote validation parquet → {val_pred_path}")
     try:
-        _save_predictions_from_best(
-            trainer,
-            val_export_loader,
-            "val",
-            val_pred_path,
-            id_to_name=metrics_cb.id_to_name,
-        )
+        upload_file_to_gcs(str(val_pred_path), f"{GCS_OUTPUT_PREFIX}/{val_pred_path.name}")
     except Exception as e:
-        print(f"[WARN] Auxiliary calibrated exports failed: {e}")
-
+        print(f"[WARN] Could not upload validation parquet: {e}")
     # 4) Compute decoded metrics from the saved DF (guard against Nones)
     import torch
     _vy = [v for v in df_val_preds[y_col].tolist() if v is not None]
