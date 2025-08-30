@@ -2742,7 +2742,7 @@ VOL_LOSS = AsymmetricQuantileLoss(
     mean_bias_weight=0.006,        # small centering on the median for MAE
     tail_q=0.9,
     tail_weight=0,              # will be ramped by TailWeightRamp
-    qlike_weight=0.01,             # QLIKE weight is ramped safely in BiasWarmupCallback
+    qlike_weight=0.1,             # QLIKE weight is ramped safely in BiasWarmupCallback
     reduction="mean",
 )
 # ---------------- Callback bundle (bias warm-up, tail ramp, LR control) ----------------
@@ -2752,7 +2752,7 @@ EXTRA_CALLBACKS = [
           target_under=1.15,
           target_mean_bias=0.05,
           warmup_epochs=5,
-          qlike_target_weight=0.1,   # keep out of the loss; diagnostics only
+          qlike_target_weight=0.15,   # keep out of the loss; diagnostics only
           start_mean_bias=0.02,
           mean_bias_ramp_until=10,
           guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
