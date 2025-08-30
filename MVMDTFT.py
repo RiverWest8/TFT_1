@@ -2065,7 +2065,7 @@ class BiasWarmupCallback(pl.Callback):
         guard_patience: int = 2,
         guard_tol: float = 0.0,
         alpha_step: float = 0.05,
-        scale_ema_alpha: float = 0.6,
+        scale_ema_alpha: float = 0.99,
     ):
         super().__init__()
         self._vol_loss_hint = vol_loss
@@ -2739,7 +2739,7 @@ class ReduceLROnPlateauCallback(pl.Callback):
 VOL_LOSS = AsymmetricQuantileLoss(
     quantiles=VOL_QUANTILES,
     underestimation_factor=1.06,  # managed by BiasWarmupCallback
-    mean_bias_weight=0.006,        # small centering on the median for MAE
+    mean_bias_weight=0.002,        # small centering on the median for MAE
     tail_q=0.9,
     tail_weight=0,              # will be ramped by TailWeightRamp
     qlike_weight=0.02,             # QLIKE weight is ramped safely in BiasWarmupCallback
@@ -2751,7 +2751,7 @@ EXTRA_CALLBACKS = [
           vol_loss=VOL_LOSS,
           target_under=1.12,
           target_mean_bias=0.05,
-          warmup_epochs=5,
+          warmup_epochs=3,
           qlike_target_weight=0.15,   # keep out of the loss; diagnostics only
           start_mean_bias=0.02,
           mean_bias_ramp_until=10,
@@ -2763,7 +2763,7 @@ EXTRA_CALLBACKS = [
           vol_loss=VOL_LOSS,
           start=1.0,
           end=1.25,
-          ramp_epochs=4,
+          ramp_epochs=32,
           gate_by_calibration=True,
           gate_low=0.9,
           gate_high=1.2,
@@ -2781,7 +2781,7 @@ EXTRA_CALLBACKS = [
           save_last=True,
       ),
       StochasticWeightAveraging(swa_lrs = 0.00091, swa_epoch_start=max(1, int(0.8 * MAX_EPOCHS))),
-      CosineLR(start_epoch=6, eta_min_ratio=5e-6, hold_last_epochs=2, warmup_steps=0),
+      CosineLR(start_epoch=4, eta_min_ratio=5e-6, hold_last_epochs=2, warmup_steps=0),
       ]
 
 class ValLossHistory(pl.Callback):
