@@ -390,13 +390,13 @@ def _optuna_objective(base_args):
 
         # ===== Quantized search spaces =====
         # big knobs in 0.1 steps
-        a.bw_target_under              = trial.suggest_float("bw_target_under", 1.0, 1.3, step=0.1)      # {1.0,1.1,1.2,1.3}
-        a.underestimation_factor_start = trial.suggest_float("underestimation_factor_start", 1.0, 1.2, step=0.1)
+        a.bw_target_under              = trial.suggest_float("bw_target_under", 1.0, 1.3, step=0.02)      # {1.0,1.1,1.2,1.3}
+        a.underestimation_factor_start = trial.suggest_float("underestimation_factor_start", 1.0, 1.2, step=0.04)
 
         # medium knobs
         a.bw_alpha_step                = trial.suggest_float("bw_alpha_step", 0.01, 0.08, step=0.01)     # 0.01..0.08 by 0.01
         a.bw_warmup_epochs             = trial.suggest_int("bw_warmup_epochs", 2, 5, step=1)             # 2,3,4,5
-        a.bw_target_mean_bias          = trial.suggest_float("bw_target_mean_bias", 0.03, 0.07, step=0.01)
+        a.bw_target_mean_bias          = trial.suggest_float("bw_target_mean_bias", 0.03, 0.07, step=0.008)
         a.vol_mean_bias_weight         = trial.suggest_float("vol_mean_bias_weight", 0.005, 0.02, step=0.005)
 
         # tail gating
@@ -3996,15 +3996,15 @@ if __name__ == "__main__":
 
     print("▶ Building TimeSeriesDataSets …")
 
-    training_dataset = build_dataset(train_df, predict=False)
+    training_dataset = build_dataset(train_df, predict=True)
 
 
     # Build validation/test from TRAIN template so group ID mapping and normalizer stats MATCH
     validation_dataset = TimeSeriesDataSet.from_dataset(
-        training_dataset, val_df, predict=False, stop_randomization=True
+        training_dataset, val_df, predict=True, stop_randomization=True
     )
     test_dataset = TimeSeriesDataSet.from_dataset(
-        training_dataset, test_df, predict=False, stop_randomization=True
+        training_dataset, test_df, predict=True, stop_randomization=True
     )
     vol_normalizer = _extract_norm_from_dataset(training_dataset)  # must be from TRAIN
     # make it available to both the model and the metrics callback
@@ -4060,7 +4060,7 @@ if __name__ == "__main__":
     test_dataset = TimeSeriesDataSet.from_dataset(
         training_dataset,
         test_df,
-        predict=False,
+        predict=True,
         stop_randomization=True,
     )
 
