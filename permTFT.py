@@ -307,7 +307,7 @@ def _latest_val_csv() -> _Path | None:
         local_dir = _Path("/tmp/tft_run")
         local_dir.mkdir(parents=True, exist_ok=True)
         cand = sorted(local_dir.glob("tft_val_history_*.csv"),# with other Optuna args
-parser.add_argument("--optuna_stream_logs",
+parser.add_argument("--optuna_stream_logs"),
     type=lambda s: str(s).lower() in ("1","true","t","yes","y","on"),
     default=True,
     help="Stream child stdout/stderr live instead of temp files (default: on)"
