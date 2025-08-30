@@ -427,10 +427,8 @@ def _objective_run_once(args_for_trial):
         raise RuntimeError("No validation history CSV found in /tmp/tft_run.")
 
     metrics = _read_metrics_from_csv(csv)
-    qlike = float(metrics.get("val_qlike_overall", float("inf")))
-    mean_scale = float(metrics.get("val_mean_scale", 1.0))
     print("[OPTUNA/TRIAL] metrics:", _json.dumps(metrics, indent=2))
-    return qlike, mean_scale
+    return metrics
 
 def _append_optuna_row(metrics: dict, params: dict, gcs_output_prefix: str | None):
     """
@@ -516,11 +514,7 @@ def _optuna_objective(base_args):
         _append_optuna_row(metrics, params_dict, getattr(a, "gcs_output_prefix", None))
 
         # Console summary
-        print(f"[TRIAL {trial.number}] done → "
-              f"score={score:.6f} | QLIKE={qlike:.6f} | mean_scale={mean_scale:.6f} | "
-              f"MAE={metrics.get('val_mae_overall')}, ACC={metrics.get('val_acc_overall')}, "
-              f"RMSE={metrics.get('val_rmse_overall')}, Brier={metrics.get('val_brier_overall')}, "
-              f"AUROC={metrics.get('val_auroc_overall')}")
+        # Removed console printout of uncalibrated and calibrated metrics at end of trial.
 
         return score
     return obj
