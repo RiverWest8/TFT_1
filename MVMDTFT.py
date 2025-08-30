@@ -2507,8 +2507,8 @@ class TailWeightRamp(pl.Callback):
         end: float = 1.25,
         ramp_epochs: int = 12,
         gate_by_calibration: bool = True,
-        gate_low: float = 0.95,
-        gate_high: float = 1.05,
+        gate_low: float = 0.9,
+        gate_high: float = 1.2,
         gate_patience: int = 2,
     ):
         super().__init__()
@@ -2749,7 +2749,7 @@ VOL_LOSS = AsymmetricQuantileLoss(
 EXTRA_CALLBACKS = [
       BiasWarmupCallback(
           vol_loss=VOL_LOSS,
-          target_under=1.15,
+          target_under=1.12,
           target_mean_bias=0.05,
           warmup_epochs=5,
           qlike_target_weight=0.15,   # keep out of the loss; diagnostics only
@@ -2770,7 +2770,7 @@ EXTRA_CALLBACKS = [
           gate_patience=1,
       ),
       ReduceLROnPlateauCallback(
-          monitor="val_composite_overall", factor=0.5, patience=3, min_lr=3e-5, cooldown=1, stop_after_epoch=None
+          monitor="val_composite_overall", factor=0.5, patience=5, min_lr=3e-5, cooldown=1, stop_after_epoch=None
       ),
       ModelCheckpoint(
           dirpath=str(LOCAL_CKPT_DIR),
