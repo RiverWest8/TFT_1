@@ -4115,7 +4115,7 @@ if __name__ == "__main__":
 
 
 
-    training_dataset = build_dataset(train_df, predict=False)
+    training_dataset = build_dataset(train_df, predict=True)
 
 
     # Build validation/test from TRAIN template so group ID mapping and normalizer stats MATCH
