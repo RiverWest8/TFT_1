@@ -59,7 +59,7 @@ import lightning.pytorch as pl
 
 BATCH_SIZE   = 128
 MAX_EPOCHS   = 35
-EARLY_STOP_PATIENCE = 15
+EARLY_STOP_PATIENCE = 10
 PERM_BLOCK_SIZE = 288
 
 # --- Allowlist PF objects for torch.load under PyTorch>=2.6 (weights_only=True default) ---
@@ -200,7 +200,7 @@ Q50_IDX = VOL_QUANTILES.index(0.50)
 EVAL_VOL_FLOOR = 1e-6
 
 # Composite metric weights (override via --metric_weights "w_mae,w_rmse,w_qlike")
-COMP_WEIGHTS = (1.0, 1.0, 0.333)  # default: slightly emphasise QLIKE for RV focus
+COMP_WEIGHTS = (1.0, 1.0, 0.004)  # default: slightly emphasise QLIKE for RV focus
 
 def composite_score(mae, rmse, qlike,
                     b_mae=None, b_rmse=None, b_qlike=None,
@@ -2738,46 +2738,46 @@ class ReduceLROnPlateauCallback(pl.Callback):
 
 VOL_LOSS = AsymmetricQuantileLoss(
     quantiles=VOL_QUANTILES,
-    underestimation_factor=1.04,  # managed by BiasWarmupCallback
-    mean_bias_weight=0.004,        # small centering on the median for MAE
+    underestimation_factor=1.06,  # managed by BiasWarmupCallback
+    mean_bias_weight=0.006,        # small centering on the median for MAE
     tail_q=0.9,
     tail_weight=0,              # will be ramped by TailWeightRamp
-    qlike_weight=0.0,             # QLIKE weight is ramped safely in BiasWarmupCallback
+    qlike_weight=0.02,             # QLIKE weight is ramped safely in BiasWarmupCallback
     reduction="mean",
 )
 # ---------------- Callback bundle (bias warm-up, tail ramp, LR control) ----------------
 EXTRA_CALLBACKS = [
       BiasWarmupCallback(
           vol_loss=VOL_LOSS,
-          target_under=1.14,
-          target_mean_bias=0.03,
+          target_under=1.1115,
+          target_mean_bias=0.05,
           warmup_epochs=5,
-          qlike_target_weight=0.08,   # keep out of the loss; diagnostics only
+          qlike_target_weight=0.02,   # keep out of the loss; diagnostics only
           start_mean_bias=0.02,
-          mean_bias_ramp_until=9,
+          mean_bias_ramp_until=10,
           guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
           guard_tol=getattr(ARGS, "warmup_guard_tol", 0.0),
-          alpha_step=0.015,
+          alpha_step=0.05,
       ),
       TailWeightRamp(
           vol_loss=VOL_LOSS,
           start=1.0,
-          end=1.25,
-          ramp_epochs=3,
+          end=1.3,
+          ramp_epochs=4,
           gate_by_calibration=True,
           gate_low=0.98,
           gate_high=1.02,
           gate_patience=1,
       ),
       ReduceLROnPlateauCallback(
-          monitor="val_mae_overall", factor=0.5, patience=4, min_lr=3e-5, cooldown=1, stop_after_epoch=None
+          monitor="val_composite_overall", factor=0.5, patience=3, min_lr=3e-5, cooldown=1, stop_after_epoch=None
       ),
       ModelCheckpoint(
           dirpath=str(LOCAL_CKPT_DIR),
           filename="tft-{epoch:02d}-{val_mae_overall:.4f}",
-          monitor="val_mae_overall",
+          monitor="val_composite_overall",
           mode="min",
-          save_top_k=3,
+          save_top_k=2,
           save_last=True,
       ),
       StochasticWeightAveraging(swa_lrs = 0.00091, swa_epoch_start=max(1, int(0.8 * MAX_EPOCHS))),
@@ -3619,10 +3619,10 @@ if __name__ == "__main__":
     print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.0017978}")
     
     es_cb = EarlyStopping(
-    monitor="val_mae_overall",
+    monitor="val_qlike_overall",
     patience=EARLY_STOP_PATIENCE,
     mode="min",
-    min_delta = 1e-4
+    min_delta = 1e-3
     )
 
 
