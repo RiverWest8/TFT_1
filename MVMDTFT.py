@@ -486,7 +486,7 @@ def _get_best_ckpt_path(trainer) -> str | None:
             if isinstance(cb, ModelCheckpoint):
                 mon = getattr(cb, "monitor", None)
                 bmp = getattr(cb, "best_model_path", "")
-                if mon == "val_mae_overall" and bmp:
+                if mon == "val_qlike_overall" and bmp:
                     return bmp
         if not best_path:
             for cb in getattr(trainer, "callbacks", []):
@@ -2775,7 +2775,7 @@ EXTRA_CALLBACKS = [
       ModelCheckpoint(
           dirpath=str(LOCAL_CKPT_DIR),
           filename="tft-{epoch:02d}-{val_mae_overall:.4f}",
-          monitor="val_composite_overall",
+          monitor="val_qlike_overall",
           mode="min",
           save_top_k=2,
           save_last=True,
@@ -3301,7 +3301,7 @@ def _resolve_best_model(trainer, fallback):
             if isinstance(cb, ModelCheckpoint):
                 mon = getattr(cb, "monitor", None)
                 bmp = getattr(cb, "best_model_path", "")
-                if mon == "val_mae_overall" and bmp:
+                if mon == "val_qlike_overall" and bmp:
                     best_path = bmp
                     break
         # ---- Otherwise any checkpoint with a best path ----
@@ -3343,7 +3343,7 @@ def _resolve_best_model(trainer, fallback):
 
     if best_path:
         try:
-            print(f"Best checkpoint (min val_mae_overall): {best_path}")
+            print(f"Best checkpoint (min val_qlike_overall): {best_path}")
             return TemporalFusionTransformer.load_from_checkpoint(best_path)
         except Exception as e:
             print(f"[WARN] load_from_checkpoint failed: {e}")
