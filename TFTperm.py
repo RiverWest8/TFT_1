@@ -226,52 +226,47 @@ def _read_metrics_from_csv(csv_path: _Path):
         s = 1.0
     return float(q), float(s)
 
-def _build_trial_argv(base_args, script_path: str):
+def _build_trial_argv(args_for_trial, script_path: str):
+    # ALWAYS read from args_for_trial (the mutated copy), not defaults
     argv = [
         sys.executable, script_path,
         "--predict", "True",
-        "--max_epochs", str(int(getattr(base_args, "optuna_max_epochs", 25))),
-        # parameter-level knobs
-        "--bw_target_under", str(float(getattr(base_args, "bw_target_under", 1.15))),
-        "--bw_alpha_step", str(float(getattr(base_args, "bw_alpha_step", 0.05))),
-        "--bw_warmup_epochs", str(int(getattr(base_args, "bw_warmup_epochs", 3))),
-        "--bw_target_mean_bias", str(float(getattr(base_args, "bw_target_mean_bias", 0.05))),
-        "--vol_mean_bias_weight", str(float(getattr(base_args, "vol_mean_bias_weight", 0.01))),
-        "--underestimation_factor_start", str(float(getattr(base_args, "underestimation_factor_start", 1.10))),
-        "--tail_gate_low", str(float(getattr(base_args, "tail_gate_low", 0.99))),
-        "--tail_gate_high", str(float(getattr(base_args, "tail_gate_high", 1.01))),
-        "--tail_end", str(float(getattr(base_args, "tail_end", 1.15))),
-        "--grad_accum_steps", str(int(getattr(base_args, "grad_accum_steps", 1))),
+        "--max_epochs", str(int(getattr(args_for_trial, "optuna_max_epochs", 12))),
+        "--bw_target_under", str(float(getattr(args_for_trial, "bw_target_under", 1.15))),
+        "--bw_alpha_step", str(float(getattr(args_for_trial, "bw_alpha_step", 0.05))),
+        "--bw_warmup_epochs", str(int(getattr(args_for_trial, "bw_warmup_epochs", 3))),
+        "--bw_target_mean_bias", str(float(getattr(args_for_trial, "bw_target_mean_bias", 0.05))),
+        "--vol_mean_bias_weight", str(float(getattr(args_for_trial, "vol_mean_bias_weight", 0.01))),
+        "--underestimation_factor_start", str(float(getattr(args_for_trial, "underestimation_factor_start", 1.10))),
+        "--underestimation_kick_epochs", str(int(getattr(args_for_trial, "underestimation_kick_epochs", 3))),
+        "--tail_gate_low", str(float(getattr(args_for_trial, "tail_gate_low", 0.99))),
+        "--tail_gate_high", str(float(getattr(args_for_trial, "tail_gate_high", 1.01))),
+        "--tail_end", str(float(getattr(args_for_trial, "tail_end", 1.15))),
+        "--grad_accum_steps", str(int(getattr(args_for_trial, "grad_accum_steps", 1))),
+        "--check_val_every_n_epoch", str(int(getattr(args_for_trial, "check_val_every_n_epoch", 1))),
+        "--log_every_n_steps", str(int(getattr(args_for_trial, "log_every_n_steps", 200))),
+        "--prefetch_factor", str(int(getattr(args_for_trial, "prefetch_factor", 8))),
+        "--fi_max_batches", str(int(getattr(args_for_trial, "fi_max_batches", 20))),
     ]
-    if bool(getattr(base_args, "tail_gate_by_cal", False)):
+    if bool(getattr(args_for_trial, "tail_gate_by_cal", False)):
         argv.append("--tail_gate_by_cal")
 
-    # pass-throughs to keep MODEL HPs & runtime fixed
+    # pass-throughs
     passthru = {
-        "--data_dir": getattr(base_args, "data_dir", None),
-        "--gcs_data_prefix": getattr(base_args, "gcs_data_prefix", None),
-        "--gcs_output_prefix": getattr(base_args, "gcs_output_prefix", None),
-        "--batch_size": getattr(base_args, "batch_size", None),
-        "--max_encoder_length": getattr(base_args, "max_encoder_length", None),
-        "--check_val_every_n_epoch": getattr(base_args, "check_val_every_n_epoch", None),
-        "--log_every_n_steps": getattr(base_args, "log_every_n_steps", None),
-        "--num_workers": getattr(base_args, "num_workers", None),
-        "--prefetch_factor": getattr(base_args, "prefetch_factor", None),
-        "--enable_perm_importance": getattr(base_args, "enable_perm_importance", None),
-        "--perm_len": getattr(base_args, "perm_len", None),
-        "--fi_max_batches": getattr(base_args, "fi_max_batches", None),
-        "--resume": getattr(base_args, "resume", None),
+        "--data_dir": getattr(args_for_trial, "data_dir", None),
+        "--gcs_data_prefix": getattr(args_for_trial, "gcs_data_prefix", None),
+        "--gcs_output_prefix": getattr(args_for_trial, "gcs_output_prefix", None),
+        "--batch_size": getattr(args_for_trial, "batch_size", None),
+        "--max_encoder_length": getattr(args_for_trial, "max_encoder_length", None),
+        "--num_workers": getattr(args_for_trial, "num_workers", None),
+        "--enable_perm_importance": getattr(args_for_trial, "enable_perm_importance", None),
+        "--perm_len": getattr(args_for_trial, "perm_len", None),
+        "--resume": "True" if getattr(args_for_trial, "resume", False) else None,
     }
     for k, v in passthru.items():
-        if v is None:
-            continue
-        if isinstance(v, bool):
-            if v:
-                argv += [k, "True"]
-        else:
+        if v is not None:
             argv += [k, str(v)]
-
-    return [a for a in argv if a not in ("", None)]
+    return argv
 
 def _latest_val_csv() -> _Path | None:
     # 1) local first
@@ -317,69 +312,93 @@ def _latest_val_csv() -> _Path | None:
     
 def _objective_run_once(args_for_trial):
     """
-    Run a single child training process with the trial's args and
-    return (val_qlike_uncal, val_mean_scale). Prints child tails for debugging.
+    Spawn a child run and stream its logs live so you see Lightning's progress bar.
+    Also enforce a wall-clock timeout and isolate from Ctrl-C.
     """
-    import shlex
+    import shlex, threading, queue, signal
 
     env = _os.environ.copy()
-    # Ensure child knows where to write/read
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    env.setdefault("PYTHONHASHSEED", "0")
     gcs_prefix = getattr(args_for_trial, "gcs_output_prefix", None)
     if gcs_prefix:
         env["GCS_OUTPUT_PREFIX"] = str(gcs_prefix)
-    env.setdefault("PYTHONHASHSEED", "0")
 
-    script_path = __file__
-    argv = _build_trial_argv(args_for_trial, script_path)
-
-    print("\n[OPTUNA/TRIAL] launching child process:")
+    argv = _build_trial_argv(args_for_trial, __file__)
+    print("\n[OPTUNA/TRIAL] launching child:")
     print("  ", " ".join(shlex.quote(a) for a in argv))
 
-    # Reasonable timeout: 60s + 90s/epoch
-    timeout_s = 60 + 90 * int(getattr(args_for_trial, "optuna_max_epochs", 12))
+    # Timeout: default ~ (10s startup + 8s/epoch)
+    timeout_s = int(getattr(args_for_trial, "optuna_child_timeout", 0)) \
+                or (10 + 8 * int(getattr(args_for_trial, "optuna_max_epochs", 12)))
+
+    # Non-blocking reader
+    def _reader(src, sink, tag):
+        for line in iter(src.readline, ''):
+            try:
+                # print as-is so tqdm bars render
+                sink.write(line)
+                sink.flush()
+            except Exception:
+                pass
+
+    # Start process and stream both stdout and stderr
+    proc = subprocess.Popen(
+        argv,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,               # line-buffered
+        universal_newlines=True,
+        start_new_session=True,  # isolate from parent signals
+    )
+
+    t_out = threading.Thread(target=_reader, args=(proc.stdout, sys.stdout, "OUT"), daemon=True)
+    t_err = threading.Thread(target=_reader, args=(proc.stderr, sys.stderr, "ERR"), daemon=True)
+    t_out.start(); t_err.start()
+
     try:
-        cp = subprocess.run(
-            argv,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout_s,
-        )
-    except subprocess.TimeoutExpired as e:
-        tail_err = "\n".join((e.stderr or "").splitlines()[-80:])
-        print("[OPTUNA/TRIAL] TIMEOUT. Child stderr tail:\n", tail_err)
+        proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        print(f"\n[OPTUNA/TRIAL] TIMEOUT after {timeout_s}s — terminating child…")
+        try:
+            _os.killpg(proc.pid, signal.SIGTERM)
+        except Exception:
+            proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            print("[OPTUNA/TRIAL] Child did not terminate; killing…")
+            try:
+                _os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                proc.kill()
+            proc.wait(timeout=5)
         raise
+    finally:
+        try:
+            if proc.stdout: proc.stdout.close()
+            if proc.stderr: proc.stderr.close()
+        except Exception:
+            pass
 
-    def _tail(txt, n=80):
-        lines = (txt or "").splitlines()
-        return "\n".join(lines[-n:]) if lines else ""
+    if proc.returncode != 0:
+        raise RuntimeError(f"Child training failed (exit {proc.returncode}).")
 
-    print(f"[OPTUNA/TRIAL] child returncode = {cp.returncode}")
-    print("[OPTUNA/TRIAL] --- child stderr (tail) ---\n" + _tail(cp.stderr))
-    print("[OPTUNA/TRIAL] --- child stdout (tail) ---\n" + _tail(cp.stdout))
-    print("[OPTUNA/TRIAL] ----------------------------")
-
-    if cp.returncode != 0:
-        raise RuntimeError(f"Child training failed (exit {cp.returncode}). See stderr tail above.")
-
-    # Allow object store to settle
+    # locate latest CSV (quick poll)
     csv = None
-    for _ in range(10):
+    for _ in range(20):
         csv = _latest_val_csv()
         if csv and csv.exists():
             break
-        time.sleep(1.0)
-
+        time.sleep(0.5)
     if not csv:
-        raise RuntimeError(
-            "No validation history CSV found (local /tmp/tft_run or GCS via GCS_OUTPUT_PREFIX)."
-        )
+        raise RuntimeError("No validation history CSV found in /tmp/tft_run.")
 
     qlike, mean_scale = _read_metrics_from_csv(csv)
     print(f"[OPTUNA/TRIAL] metrics: val_qlike_uncal={qlike:.6f} | val_mean_scale={mean_scale:.6f} | csv={csv}")
     return qlike, mean_scale
-
 
 def _optuna_objective(base_args):
     """
