@@ -2738,7 +2738,7 @@ class ReduceLROnPlateauCallback(pl.Callback):
 
 VOL_LOSS = AsymmetricQuantileLoss(
     quantiles=VOL_QUANTILES,
-    underestimation_factor=1.00,  # managed by BiasWarmupCallback
+    underestimation_factor=1.10,  # managed by BiasWarmupCallback
     mean_bias_weight=0.01,        # small centering on the median for MAE
     tail_q=0.85,
     tail_weight=1.0,              # will be ramped by TailWeightRamp
@@ -2749,7 +2749,7 @@ VOL_LOSS = AsymmetricQuantileLoss(
 EXTRA_CALLBACKS = [
       BiasWarmupCallback(
           vol_loss=VOL_LOSS,
-          target_under=1.00,
+          target_under=1.20,
           target_mean_bias=0.01,
           warmup_epochs=3,
           qlike_target_weight=0.25,   # keep out of the loss; diagnostics only
@@ -3349,158 +3349,6 @@ def _resolve_best_model(trainer, fallback):
             print(f"[WARN] load_from_checkpoint failed: {e}")
     return fallback
 
-@torch.no_grad()
-def run_permutation_importance(
-    model,
-    template_ds,
-    base_df: pd.DataFrame,
-    features: List[str],
-    block_size: int,
-    batch_size: int,
-    max_batches: int,
-    num_workers: int,
-    prefetch: int,
-    pin_memory: bool,
-    vol_norm,                       # 👈 pass GroupNormalizer from TRAIN
-    out_csv_path: str,
-    uploader,
-    build_ds_fn=lambda: None,       # compatibility; unused
-) -> None:
-    """
-    Permutation Feature Importance on **decoded** metrics with a **baseline-normalised composite**:
-
-        Comp = w_mae*(MAE/MAE0) + w_rmse*(RMSE/RMSE0) + w_qlike*(QLIKE/QLIKE0)
-
-    We log per-feature deltas:
-        Δ_COMP = Comp_perm - Comp_base  (positive = harmful; negative = helpful)
-    """
-
-    import os
-
-    # ---------- optional RESUME ----------
-    already = set()
-    existing_rows = []
-    if out_csv_path and os.path.exists(out_csv_path):
-        try:
-            prev = pd.read_csv(out_csv_path)
-            if "feature" in prev.columns:
-                already = set(prev["feature"].astype(str).tolist())
-                existing_rows = prev.to_dict("records")
-                print(f"[FI] Resuming — {len(already)} features already in {out_csv_path}")
-        except Exception as e:
-            print(f"[FI WARN] Could not read existing FI CSV for resume: {e}")
-
-    # ---------- BASELINE (predict=True, last step) ----------
-    ds_base = TimeSeriesDataSet.from_dataset(
-        template_ds,
-        base_df,
-        predict=False,
-        stop_randomization=True,
-    )
-
-    b_mae, b_rmse, b_brier, b_qlike, n_base = _evaluate_decoded_metrics(
-        model=model,
-        ds=ds_base,
-        batch_size=batch_size,
-        max_batches=max_batches,
-        num_workers=num_workers,
-        prefetch=prefetch,
-        pin_memory=pin_memory,
-        vol_norm=vol_norm,
-    )
-
-    base_comp = composite_score(b_mae, b_rmse, b_qlike, b_mae, b_rmse, b_qlike, COMP_WEIGHTS)
-
-
-
-    print(
-        f"[FI] Dataset size (samples): {len(base_df)} | batch_size={batch_size}\n"
-        f"[FI] Baseline: QLIKE={b_qlike:.6f} | MAE={b_mae:.6f} | RMSE={b_rmse:.6f} | "
-        f"COMPOSITE(base)={base_comp:.4f} | N={n_base}"
-    )
-    if b_mae > 0.01:
-        print("[FI DEBUG] WARNING: baseline decoded MAE unusually large (expected ~0.001–0.003). "
-              "Check vol_norm and decode pipeline.")
-
-    new_rows = []
-    work_df = base_df.copy()
-
-    # ---------- PERMUTE LOOP ----------
-    for feat in features:
-        if str(feat) in already:
-            print(f"[FI] {feat:>20s} | SKIP (already present)")
-            continue
-
-        df_perm = work_df.copy()
-        _permute_series_inplace(df_perm, feat, block=block_size, group_col="asset")
-
-        ds_perm = TimeSeriesDataSet.from_dataset(
-            template_ds,
-            df_perm,
-            predict=False,
-            stop_randomization=True,
-        )
-
-        p_mae, p_rmse, p_brier, p_qlike, n_p = _evaluate_decoded_metrics(
-            model=model,
-            ds=ds_perm,
-            batch_size=batch_size,
-            max_batches=max_batches,
-            num_workers=num_workers,
-            prefetch=prefetch,
-            pin_memory=pin_memory,
-            vol_norm=vol_norm,
-        )
-
-        # individual deltas (lower is better)
-        d_mae   = float(p_mae   - b_mae)
-        d_rmse  = float(p_rmse  - b_rmse)
-        d_qlike = float(p_qlike - b_qlike)
-
-        # baseline-normalised composite
-        p_comp = composite_score(p_mae, p_rmse, p_qlike, b_mae, b_rmse, b_qlike, COMP_WEIGHTS)
-        d_comp = float(p_comp - base_comp)  # + = harmful (we minimise)
-
-        print(
-            f"[FI] {feat:>20s} | QLIKE={p_qlike:.6f} Δ_QLIKE={d_qlike:+.6f} | "
-            f"Δ_MAE={d_mae:+.6f} Δ_RMSE={d_rmse:+.6f} | "
-            f"COMPOSITE={p_comp:.4f} Δ_COMP={d_comp:+.4f} "
-            f"{'(↑ worse ⇒ useful)' if d_comp > 0 else '(↓ better ⇒ harmful/redundant)'}"
-        )
-
-        new_rows.append({
-            "feature": str(feat),
-            "baseline_mae": float(b_mae),
-            "baseline_rmse": float(b_rmse),
-            "baseline_qlike": float(b_qlike),
-            "permuted_mae": float(p_mae),
-            "permuted_rmse": float(p_rmse),
-            "permuted_qlike": float(p_qlike),
-            "delta_mae": float(d_mae),
-            "delta_rmse": float(d_rmse),
-            "delta_qlike": float(d_qlike),
-            "composite_base": float(base_comp),
-            "composite_perm": float(p_comp),
-            "delta_composite": float(d_comp),
-            "brier": (float(p_brier) if p_brier == p_brier else None),
-            "weights": f"mae={COMP_WEIGHTS[0]},rmse={COMP_WEIGHTS[1]},qlike={COMP_WEIGHTS[2]}",
-            "n": int(n_p),
-        })
-
-    # ---------- SAVE / UPLOAD ----------
-    try:
-        out_df = pd.DataFrame((existing_rows or []) + new_rows)
-        out_df.to_csv(out_csv_path, index=False)
-        print(f"[FI] wrote {out_csv_path}")
-        if uploader is not None:
-            try:
-                uploader(out_csv_path, f"{GCS_OUTPUT_PREFIX}/{Path(out_csv_path).name}")
-            except Exception as e:
-                print(f"[FI WARN] upload failed: {e}")
-    except Exception as e:
-        print(f"[FI WARN] could not save FI CSV: {e}")
-
-
 
 # Data preparation
 # -----------------------------------------------------------------------
@@ -3831,10 +3679,6 @@ if __name__ == "__main__":
     lr_cb = LearningRateMonitor(logging_interval="step")
 
 
-
-
-  
-
     val_hist_csv = LOCAL_RUN_DIR / f"tft_val_history_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv"
     val_hist_cb  = ValLossHistory(val_hist_csv)
 
@@ -3951,91 +3795,9 @@ if __name__ == "__main__":
 
 
 
-# ---- Permutation Importance (decoded) ----
-if ENABLE_FEATURE_IMPORTANCE:
-    fi_csv = str(LOCAL_OUTPUT_DIR / f"TFTPFI_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")
-    feats = time_varying_unknown_reals.copy()
-    # optional: drop calendar features from FI
-    feats = [f for f in feats if f not in ("sin_tod", "cos_tod", "sin_dow", "cos_dow", "Is_Weekend")]
 
-    # Prefer TRAIN dataset as template → guarantees same encoders & normalizers
-    try:
-        train_vol_norm = _extract_norm_from_dataset(training_dataset)
-    except Exception:
-        # fallback to validation dataset if needed
-        train_vol_norm = _extract_norm_from_dataset(validation_dataset)
 
-    run_permutation_importance(
-        model=model_for_fi,
-        template_ds=training_dataset,          # 👈 use TRAIN template
-        base_df=val_df,
-        features=feats,
-        block_size=int(PERM_BLOCK_SIZE) if PERM_BLOCK_SIZE else 1,
-        batch_size=256,
-        max_batches=int(FI_MAX_BATCHES) if FI_MAX_BATCHES else 40,
-        num_workers=4,
-        prefetch=2,
-        pin_memory=pin,
-        vol_norm=train_vol_norm,               # 👈 ensure decoded metrics
-        out_csv_path=fi_csv,
-        uploader=upload_file_to_gcs,
-    )
-    # --- Safe plotting/logging: deep-cast any nested tensors to CPU float32 ---
-    # --- Safe plotting/logging: class-level patch to handle bf16 + integer lengths robustly ---
 
-    from pytorch_forecasting.models.base._base_model import BaseModel # type: ignore
-
-    def _deep_cpu_float(x):
-        if torch.is_tensor(x):
-            # keep integer tensors as int64; cast others to float32 for matplotlib
-            if x.dtype in (
-                torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8,
-                getattr(torch, "long", torch.int64)
-            ):
-                return x.detach().to(device="cpu", dtype=torch.int64)
-            return x.detach().to(device="cpu", dtype=torch.float32)
-        if isinstance(x, list):
-            return [_deep_cpu_float(v) for v in x]
-        if isinstance(x, tuple):
-            casted = tuple(_deep_cpu_float(v) for v in x)
-            try:
-                # preserve namedtuple types
-                return x.__class__(*casted)
-            except Exception:
-                return casted
-        if isinstance(x, dict):
-            return {k: _deep_cpu_float(v) for k, v in x.items()}
-        if isinstance(x, np.ndarray) and np.issubdtype(x.dtype, np.number):
-            if np.issubdtype(x.dtype, np.integer):
-                return x.astype(np.int64, copy=False)
-            return x.astype(np.float32, copy=False)
-        return x
-
-    def _to_numpy_int64_array(v):
-        if torch.is_tensor(v):
-            return v.detach().cpu().long().numpy()
-        if isinstance(v, np.ndarray):
-            return v.astype(np.int64, copy=False)
-        if isinstance(v, (list, tuple)):
-            out = []
-            for el in v:
-                if torch.is_tensor(el):
-                    out.append(int(el.detach().cpu().item()))
-                else:
-                    out.append(int(el))
-            return np.asarray(out, dtype=np.int64)
-        if isinstance(v, (int, np.integer)):
-            return np.asarray([int(v)], dtype=np.int64)
-        return v  # leave unknowns as-is
-
-    def _fix_lengths_in_x(x):
-        # PF expects max() & python slicing with these; make them numpy int64 arrays
-        if isinstance(x, dict):
-            for key in ("encoder_lengths", "decoder_lengths"):
-                if key in x and x[key] is not None:
-                    x[key] = _to_numpy_int64_array(x[key])
-        return x
-    
 from lightning.pytorch.callbacks import ModelCheckpoint
 from pathlib import Path
 import fsspec
