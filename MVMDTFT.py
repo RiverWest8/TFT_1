@@ -2189,7 +2189,7 @@ class BiasWarmupCallback(pl.Callback):
         if hasattr(vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
             q_target = float(self.qlike_target_weight)
             q_prog = min(1.0, float(e) / float(max(self.warm, 8)))
-            near_ok = (self._scale_ema is None) or (0.97 <= self._scale_ema <= 1.03)
+            near_ok = (self._scale_ema is None) or (0.5 <= self._scale_ema <= 1.5)
             vol_loss.qlike_weight = (q_target * q_prog) if near_ok else 0.0
 
         try:
@@ -2755,8 +2755,8 @@ EXTRA_CALLBACKS = [
           qlike_target_weight=0.15,   # keep out of the loss; diagnostics only
           start_mean_bias=0.02,
           mean_bias_ramp_until=10,
-          guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
-          guard_tol=getattr(ARGS, "warmup_guard_tol", 0.0),
+          guard_patience=getattr(ARGS, "warmup_guard_patience", 5),
+          guard_tol=getattr(ARGS, "warmup_guard_tol", 0.005),
           alpha_step=0.05,
       ),
       TailWeightRamp(
