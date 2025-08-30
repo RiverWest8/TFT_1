@@ -430,7 +430,7 @@ def _objective_run_once(args_for_trial):
     qlike = float(metrics.get("val_qlike_overall", float("inf")))
     mean_scale = float(metrics.get("val_mean_scale", 1.0))
     print("[OPTUNA/TRIAL] metrics:", _json.dumps(metrics, indent=2))
-    return qlike,mean_scale
+    return qlike, mean_scale
 
 def _append_optuna_row(metrics: dict, params: dict, gcs_output_prefix: str | None):
     """
