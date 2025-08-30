@@ -4191,7 +4191,7 @@ if __name__ == "__main__":
     )
     # --- Test dataset ---
     test_dataset = TimeSeriesDataSet.from_dataset(
-        training_dataset, test_df, predict=True, stop_randomization=True
+        training_dataset, test_df, predict=False, stop_randomization=True
     )
 
     # use the same loader knobs as train/val to avoid None / tensor-bool pitfalls
@@ -4547,67 +4547,8 @@ try:
         print(f"[VAL (best ckpt)] (decoded) MAE={v_mae:.6f} RMSE={v_rmse:.6f} MSE={v_mse:.6f} QLIKE={v_qlike:.6f}")
     else:
         print("[VAL (best ckpt)] WARNING: could not compute decoded metrics (no valid pairs).")
-
 except Exception as e:
     print(f"[WARN] Failed to save validation predictions from best checkpoint: {e}")
-
-
-    # --- TEST export (best ckpt) ---
-try:
-    ckpt = _get_best_ckpt_path(trainer)
-    if ckpt is None:
-        raise RuntimeError("Could not resolve best checkpoint path.")
-    print(f"Loading best checkpoint for test: {ckpt}")
-
-    # Load best model (safe)
-    if _safe_globals_ctx is not None and _PFMultiNormalizer is not None:
-        with _safe_globals_ctx([_PFMultiNormalizer]):
-            try:
-                best_model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu")
-            except TypeError:
-                best_model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu", weights_only=False)
-    else:
-        try:
-            best_model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu")
-        except TypeError:
-            best_model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu", weights_only=False)
-
-    test_export_loader = make_export_loader(test_dataloader)
-    vol_norm_test = _extract_norm_from_dataset(test_export_loader.dataset)
-
-    df_test_preds = _collect_predictions(
-        best_model,
-        test_export_loader,
-        vol_norm=vol_norm_test,         # <-- alias
-        id_to_name=metrics_cb.id_to_name,
-        out_path=None,
-    )
-
-    y_col = "y_vol" if "y_vol" in df_test_preds.columns else "realised_vol"
-    p_col = "y_vol_pred" if "y_vol_pred" in df_test_preds.columns else "pred_realised_vol"
-
-    test_pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
-    df_test_preds.to_parquet(test_pred_path, index=False)
-    print(f"✓ Saved TEST predictions (Parquet) → {test_pred_path}")
-    try:
-        upload_file_to_gcs(str(test_pred_path), f"{GCS_OUTPUT_PREFIX}/{test_pred_path.name}")
-    except Exception as e:
-        print(f"[WARN] Could not upload test predictions: {e}")
-
-    # Also write calibrated/per-asset calibrated copies beside it
-    try:
-        _save_predictions_from_best(
-            trainer,
-            test_export_loader,
-            "test",
-            test_pred_path,
-            id_to_name=metrics_cb.id_to_name,
-        )
-    except Exception as e:
-        print(f"[WARN] Auxiliary calibrated TEST exports failed: {e}")
-
-except Exception as e:
-    print(f"[WARN] Failed to collect or save test metrics/predictions: {e}")
 
 
 # Helpers
