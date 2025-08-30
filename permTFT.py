@@ -4112,7 +4112,7 @@ if __name__ == "__main__":
 
     print("▶ Building TimeSeriesDataSets …")
     from pytorch_forecasting.data import TimeSeriesDataSet
-    from pytorch_forecasting.data.samplers import PredictLastNSampler
+
 
 
     training_dataset = build_dataset(train_df, predict=False)
@@ -4120,10 +4120,10 @@ if __name__ == "__main__":
 
     # Build validation/test from TRAIN template so group ID mapping and normalizer stats MATCH
     validation_dataset = TimeSeriesDataSet.from_dataset(
-        training_dataset, val_df, predict=False, stop_randomization=True
+        training_dataset, val_df, predict=True, stop_randomization=True
     )
     test_dataset = TimeSeriesDataSet.from_dataset(
-        training_dataset, test_df, predict=False, stop_randomization=True
+        training_dataset, test_df, predict=True, stop_randomization=True
     )
     vol_normalizer = _extract_norm_from_dataset(training_dataset)  # must be from TRAIN
     # make it available to both the model and the metrics callback
@@ -4149,6 +4149,21 @@ if __name__ == "__main__":
     use_persist = worker_cnt > 0
     # Only pass prefetch_factor when num_workers > 0
     prefetch_kw = ({"prefetch_factor": prefetch} if worker_cnt > 0 else {})
+    # --- Predict-only dataloader helper (no external sampler needed) ---
+    def build_predict_loader(ds, batch_size: int, num_workers: int = 0):
+        """
+        For TimeSeriesDataSet built with predict=True, use PF's own to_dataloader.
+        This yields only the last decoder step per sample (fast eval/training).
+        """
+        # train=False so PF doesn't do train-time shuffles/augmentations
+        return ds.to_dataloader(
+            train=False,
+            batch_size=int(batch_size),
+            shuffle=False,
+            num_workers=int(num_workers),
+            drop_last=False,
+            pin_memory=False,
+        )
 
     test_loader = test_dataset.to_dataloader(
         train=False,
@@ -4165,7 +4180,6 @@ if __name__ == "__main__":
         num_workers=worker_cnt,
         persistent_workers=use_persist,
         pin_memory=pin,
-        train_sampler=PredictLastNSampler(n=1),  # only last window per series
         **prefetch_kw,
     )
     val_dataloader = validation_dataset.to_dataloader(
@@ -4173,17 +4187,11 @@ if __name__ == "__main__":
         batch_size=batch_size,
         num_workers=worker_cnt,
         persistent_workers=use_persist,
-        pin_memory=False,
-        train_sampler=PredictLastNSampler(n=1)
         **prefetch_kw,
     )
     # --- Test dataset ---
     test_dataset = TimeSeriesDataSet.from_dataset(
-        training_dataset,
-        test_df,
-        predict=True,
-        stop_randomization=True,
-        train_sampler=PredictLastNSampler(n=1)
+        training_dataset, test_df, predict=True, stop_randomization=True
     )
 
     # use the same loader knobs as train/val to avoid None / tensor-bool pitfalls
