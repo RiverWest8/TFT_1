@@ -215,13 +215,6 @@ COMP_WEIGHTS = (1.0, 1.0, 0.333)  # default: slightly emphasise QLIKE for RV foc
 from pathlib import Path as _Path
 import os as _os, math as _math, json as _json, time
 
-def _latest_val_csv() -> _Path | None:
-    try:
-        cand = sorted(_Path("/tmp/tft_run").glob("tft_val_history_*.csv"),
-                      key=lambda p: p.stat().st_mtime, reverse=True)
-        return cand[0] if cand else None
-    except Exception:
-        return None
 
 def _read_metrics_from_csv(csv_path: _Path) -> dict:
     """
@@ -306,13 +299,11 @@ def _latest_val_csv() -> _Path | None:
     try:
         local_dir = _Path("/tmp/tft_run")
         local_dir.mkdir(parents=True, exist_ok=True)
-        cand = sorted(local_dir.glob("tft_val_history_*.csv"),# with other Optuna args
-parser.add_argument("--optuna_stream_logs"),
-    type=lambda s: str(s).lower() in ("1","true","t","yes","y","on"),
-    default=True,
-    help="Stream child stdout/stderr live instead of temp files (default: on)"
-)
-                      key=lambda p: p.stat().st_mtime, reverse=True)
+        cand = sorted(
+            local_dir.glob("tft_val_history_*.csv"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
         if cand:
             return cand[0]
     except Exception:
@@ -324,20 +315,25 @@ parser.add_argument("--optuna_stream_logs"),
         if not gcs_prefix:
             return None
 
-        import fsspec
-        fs, _, _ = fsspec.get_fs_token_paths(gcs_prefix)
-        files = [p for p in fs.glob(f"{gcs_prefix}/tft_val_history_*.csv")]
+        import fsspec as _fsspec
+        fs, _, _ = _fsspec.get_fs_token_paths(gcs_prefix)
+
+        files = fs.glob(f"{gcs_prefix}/tft_val_history_*.csv")
         if not files:
             return None
 
         # newest by modified time if available, else by name
         def _mtime(p):
             try:
-                return fs.info(p).get("mtime") or ""
+                info = fs.info(p)
+                # some backends use 'mtime' (str) or 'updated' (str/ts)
+                return info.get("mtime") or info.get("updated") or ""
             except Exception:
                 return ""
+
         files = sorted(files, key=_mtime, reverse=True)
         newest = files[0]
+
         # download to /tmp so _read_metrics_from_csv can use pandas normally
         local_dir = _Path("/tmp/tft_run")
         local_dir.mkdir(parents=True, exist_ok=True)
