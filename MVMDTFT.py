@@ -3659,7 +3659,7 @@ if __name__ == "__main__":
         attention_head_size=4,
         dropout=0.13, #0.0833704625250354,
         hidden_continuous_size=24,
-        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.00035), #0.0019 0017978
+        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.0017978), #0.0019 0017978
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
         output_size=[7, 1],  # 7 quantiles + 1 logit
