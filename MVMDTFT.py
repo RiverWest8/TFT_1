@@ -2189,7 +2189,7 @@ class BiasWarmupCallback(pl.Callback):
         if hasattr(vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
             q_target = float(self.qlike_target_weight)
             q_prog = min(1.0, float(e) / float(max(self.warm, 8)))
-            near_ok = (self._scale_ema is None) or (0.5 <= self._scale_ema <= 1.5)
+            near_ok = (self._scale_ema is None) or (0.775 <= self._scale_ema <= 1.2)
             vol_loss.qlike_weight = (q_target * q_prog) if near_ok else 0.0
 
         try:
@@ -2742,7 +2742,7 @@ VOL_LOSS = AsymmetricQuantileLoss(
     mean_bias_weight=0.006,        # small centering on the median for MAE
     tail_q=0.9,
     tail_weight=0,              # will be ramped by TailWeightRamp
-    qlike_weight=0.1,             # QLIKE weight is ramped safely in BiasWarmupCallback
+    qlike_weight=0.02,             # QLIKE weight is ramped safely in BiasWarmupCallback
     reduction="mean",
 )
 # ---------------- Callback bundle (bias warm-up, tail ramp, LR control) ----------------
