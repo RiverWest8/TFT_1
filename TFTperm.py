@@ -2584,7 +2584,7 @@ parser = argparse.ArgumentParser(
 
 # Core training knobs
 # Optuna harness (update defaults)
-parser.add_argument("--optuna_trials", type=int, default=50)
+
 parser.add_argument("--optuna_max_epochs", type=int, default=25)
 parser.add_argument("--max_encoder_length", type=int, default=None, help="Max encoder length")
 parser.add_argument("--max_epochs", type=int, default=None, help="Max training epochs")
@@ -2648,7 +2648,7 @@ parser.add_argument("--warmup_guard_tol", type=float, default=0.0,
 parser.add_argument("--optuna", action="store_true", help="Run Optuna hyperparameter search")
 parser.add_argument("--optuna_trials", type=int, default=15)
 parser.add_argument("--optuna_timeout", type=int, default=0, help="Seconds; 0 disables")
-parser.add_argument("--optuna_max_epochs", type=int, default=12, help="Short fit for trial")
+
 parser.add_argument("--study_name", type=str, default=None, help="Optuna study name (optional)")
 parser.add_argument("--optuna_storage", type=str, default=None,
                     help='Optuna storage URL, e.g. "sqlite:////tmp/tftperm_optuna.db"')
