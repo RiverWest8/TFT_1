@@ -427,8 +427,10 @@ def _objective_run_once(args_for_trial):
         raise RuntimeError("No validation history CSV found in /tmp/tft_run.")
 
     metrics = _read_metrics_from_csv(csv)
+    qlike = float(metrics.get("val_qlike_overall", float("inf")))
+    mean_scale = float(metrics.get("val_mean_scale", 1.0))
     print("[OPTUNA/TRIAL] metrics:", _json.dumps(metrics, indent=2))
-    return metrics
+    return qlike,mean_scale
 
 def _append_optuna_row(metrics: dict, params: dict, gcs_output_prefix: str | None):
     """
@@ -4109,16 +4111,19 @@ if __name__ == "__main__":
         )
 
     print("▶ Building TimeSeriesDataSets …")
+    from pytorch_forecasting.data import TimeSeriesDataSet
+    from pytorch_forecasting.data.samplers import PredictLastNSampler
 
-    training_dataset = build_dataset(train_df, predict=True)
+
+    training_dataset = build_dataset(train_df, predict=False)
 
 
     # Build validation/test from TRAIN template so group ID mapping and normalizer stats MATCH
     validation_dataset = TimeSeriesDataSet.from_dataset(
-        training_dataset, val_df, predict=True, stop_randomization=True
+        training_dataset, val_df, predict=False, stop_randomization=True
     )
     test_dataset = TimeSeriesDataSet.from_dataset(
-        training_dataset, test_df, predict=True, stop_randomization=True
+        training_dataset, test_df, predict=False, stop_randomization=True
     )
     vol_normalizer = _extract_norm_from_dataset(training_dataset)  # must be from TRAIN
     # make it available to both the model and the metrics callback
@@ -4160,6 +4165,7 @@ if __name__ == "__main__":
         num_workers=worker_cnt,
         persistent_workers=use_persist,
         pin_memory=pin,
+        train_sampler=PredictLastNSampler(n=1),  # only last window per series
         **prefetch_kw,
     )
     val_dataloader = validation_dataset.to_dataloader(
@@ -4168,6 +4174,7 @@ if __name__ == "__main__":
         num_workers=worker_cnt,
         persistent_workers=use_persist,
         pin_memory=False,
+        train_sampler=PredictLastNSampler(n=1)
         **prefetch_kw,
     )
     # --- Test dataset ---
@@ -4176,6 +4183,7 @@ if __name__ == "__main__":
         test_df,
         predict=True,
         stop_randomization=True,
+        train_sampler=PredictLastNSampler(n=1)
     )
 
     # use the same loader knobs as train/val to avoid None / tensor-bool pitfalls
