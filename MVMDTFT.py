@@ -59,7 +59,7 @@ import lightning.pytorch as pl
 
 BATCH_SIZE   = 128
 MAX_EPOCHS   = 35
-EARLY_STOP_PATIENCE = 10
+EARLY_STOP_PATIENCE = 15
 PERM_BLOCK_SIZE = 288
 
 # --- Allowlist PF objects for torch.load under PyTorch>=2.6 (weights_only=True default) ---
@@ -2186,11 +2186,17 @@ class BiasWarmupCallback(pl.Callback):
             vol_loss.mean_bias_weight = self.target_mean_bias
 
         # qlike: only when calibration is roughly correct
+        # qlike: only when calibration is roughly correct
         if hasattr(vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
             q_target = float(self.qlike_target_weight)
-            q_prog = min(1.0, float(e) / float(max(self.warm, 8)))
-            near_ok = (self._scale_ema is None) or (0.775 <= self._scale_ema <= 1.2)
-            vol_loss.qlike_weight = (q_target * q_prog) if near_ok else 0.0
+            q_prog   = min(1.0, float(e) / float(max(self.warm, 8)))
+            near_ok  = (self._scale_ema is None) or (0.9 <= self._scale_ema <= 1.1)
+
+            qlike_floor = 0.05  # keep some scale pressure even when gated
+            if near_ok:
+                vol_loss.qlike_weight = max(qlike_floor, q_target * q_prog)
+            else:
+                vol_loss.qlike_weight = max(qlike_floor, 0.33 * q_target)  # gentle anchor when “closed”
 
         try:
             lr0 = trainer.optimizers[0].param_groups[0]["lr"]
@@ -2523,6 +2529,7 @@ class TailWeightRamp(pl.Callback):
         self._ok_streak = 0
         self._trigger_epoch = None
 
+
     def _get_scale_ema(self, trainer):
         for cb in getattr(trainer, "callbacks", []):
             if isinstance(cb, BiasWarmupCallback):
@@ -2555,14 +2562,17 @@ class TailWeightRamp(pl.Callback):
             if (scale_ema is None) or not (self.gate_low <= float(scale_ema) <= self.gate_high):
                 self._ok_streak = 0
                 self._trigger_epoch = None
-                self.vol_loss.tail_weight = self.start
-                print(f"[TAIL] epoch={e} gated (scale_ema={scale_ema}); tail_weight={self.vol_loss.tail_weight}")
+                tw_prev = float(getattr(self.vol_loss, "tail_weight", self.start))
+                # GENTLE DECAY toward start (prevents big jumps)
+                self.vol_loss.tail_weight = max(self.start, 0.9 * tw_prev + 0.1 * self.start)
+                print(f"[TAIL] epoch={e} gated (scale_ema={scale_ema}); tail_weight={self.vol_loss.tail_weight} (decay→start)")
                 return
             else:
                 self._ok_streak = min(self.gate_patience, self._ok_streak + 1)
                 if self._ok_streak < self.gate_patience:
-                    self.vol_loss.tail_weight = self.start
-                    print(f"[TAIL] epoch={e} gating warm-up {self._ok_streak}/{self.gate_patience}; tail_weight={self.vol_loss.tail_weight}")
+                    tw_prev = float(getattr(self.vol_loss, "tail_weight", self.start))
+                    self.vol_loss.tail_weight = max(self.start, 0.9 * tw_prev + 0.1 * self.start)
+                    print(f"[TAIL] epoch={e} gating warm-up {self._ok_streak}/{self.gate_patience}; tail_weight={self.vol_loss.tail_weight} (decay→start)")
                     return
                 if self._trigger_epoch is None:
                     self._trigger_epoch = e
@@ -2740,8 +2750,8 @@ VOL_LOSS = AsymmetricQuantileLoss(
     quantiles=VOL_QUANTILES,
     underestimation_factor=1.06,  # managed by BiasWarmupCallback
     mean_bias_weight=0.002,        # small centering on the median for MAE
-    tail_q=0.9,
-    tail_weight=0,              # will be ramped by TailWeightRamp
+    tail_q=0.85,
+    tail_weight=1.0,              # will be ramped by TailWeightRamp
     qlike_weight=0.02,             # QLIKE weight is ramped safely in BiasWarmupCallback
     reduction="mean",
 )
@@ -2749,13 +2759,13 @@ VOL_LOSS = AsymmetricQuantileLoss(
 EXTRA_CALLBACKS = [
       BiasWarmupCallback(
           vol_loss=VOL_LOSS,
-          target_under=1.12,
-          target_mean_bias=0.05,
-          warmup_epochs=3,
+          target_under=1.09,
+          target_mean_bias=0.04,
+          warmup_epochs=6,
           qlike_target_weight=0.15,   # keep out of the loss; diagnostics only
           start_mean_bias=0.02,
-          mean_bias_ramp_until=10,
-          guard_patience=getattr(ARGS, "warmup_guard_patience", 5),
+          mean_bias_ramp_until=12,
+          guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
           guard_tol=getattr(ARGS, "warmup_guard_tol", 0.005),
           alpha_step=0.05,
       ),
@@ -2763,14 +2773,14 @@ EXTRA_CALLBACKS = [
           vol_loss=VOL_LOSS,
           start=1.0,
           end=1.25,
-          ramp_epochs=32,
+          ramp_epochs=48,
           gate_by_calibration=True,
           gate_low=0.9,
           gate_high=1.2,
           gate_patience=1,
       ),
       ReduceLROnPlateauCallback(
-          monitor="val_composite_overall", factor=0.5, patience=5, min_lr=3e-5, cooldown=1, stop_after_epoch=None
+          monitor="val_composite_overall", factor=0.5, patience=7, min_lr=3e-5, cooldown=1, stop_after_epoch=9
       ),
       ModelCheckpoint(
           dirpath=str(LOCAL_CKPT_DIR),
@@ -3616,7 +3626,7 @@ if __name__ == "__main__":
     seed_everything(SEED, workers=True)
     # Loss and output_size for multi-target: realised_vol (quantile regression), direction (classification)
     print("▶ Building model …")
-    print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.0017978}")
+    print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.00057978}")
     
     es_cb = EarlyStopping(
     monitor="val_qlike_overall",
@@ -3646,11 +3656,11 @@ if __name__ == "__main__":
     pos_weight = float(n_neg / n_pos)
 
     # then build the loss with:
-    DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.1, pos_weight=pos_weight)
+    DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.02, pos_weight=pos_weight)
 
 
     FIXED_VOL_WEIGHT = 1.0
-    FIXED_DIR_WEIGHT = 0.1
+    FIXED_DIR_WEIGHT = 0.2
  
 
     tft = TemporalFusionTransformer.from_dataset(
@@ -3659,7 +3669,7 @@ if __name__ == "__main__":
         attention_head_size=4,
         dropout=0.13, #0.0833704625250354,
         hidden_continuous_size=24,
-        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.0017978), #0.0019 0017978
+        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.00047978), #0.0019 0017978
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
         output_size=[7, 1],  # 7 quantiles + 1 logit
