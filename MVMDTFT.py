@@ -2777,7 +2777,7 @@ EXTRA_CALLBACKS = [
           gate_by_calibration=True,
           gate_low=0.9,
           gate_high=1.2,
-          gate_patience=1,
+          gate_patience=2,
       ),
       ReduceLROnPlateauCallback(
           monitor="val_composite_overall", factor=0.5, patience=7, min_lr=3e-5, cooldown=1, stop_after_epoch=9
