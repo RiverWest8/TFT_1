@@ -2160,9 +2160,11 @@ class BiasWarmupCallback(pl.Callback):
         if self._frozen:
             vol_loss.underestimation_factor = 1.0
             if hasattr(vol_loss, "qlike_weight"):
-                vol_loss.qlike_weight = max(qlike_floor, q_target * q_prog)
+                # keep a small, non-zero qlike weight to maintain well-posedness
+                current_qw = float(getattr(vol_loss, "qlike_weight", 0.0) or 0.0)
+                vol_loss.qlike_weight = max(0.05, current_qw)
             vol_loss.mean_bias_weight = min(getattr(vol_loss, "mean_bias_weight", 0.0), self.target_mean_bias)
-            print(f"[BIAS] epoch={e} FROZEN: alpha=1.0 qlike_w=0.0 mean_bias={vol_loss.mean_bias_weight:.3f}")
+            print(f"[BIAS] epoch={e} FROZEN: alpha=1.0 qlike_w={getattr(vol_loss, 'qlike_weight', 'n/a')} mean_bias={vol_loss.mean_bias_weight:.3f}")
             return
 
         # proportional (small) adjustment to alpha to avoid overshoot
