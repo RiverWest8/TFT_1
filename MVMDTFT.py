@@ -1825,17 +1825,6 @@ class PerAssetMetrics(pl.Callback):
             except Exception as _e:
                 print(f"[WARN] per-epoch per-asset print failed: {_e}")
 
-            # --- Calibrated per-epoch per-asset snapshot (top by samples) ---
-            try:
-                if rows_cal:
-                    rows_cal.sort(key=lambda r: r[5], reverse=True)
-                    k = min(5, getattr(self, "max_print", 5))
-                    print("Per-asset (CALIBRATED snapshot, top by samples):")
-                    print("asset | MAE | RMSE | MSE | QLIKE | N")
-                    for r in rows_cal[:k]:
-                        print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {r[5]}")
-            except Exception as _e:
-                print(f"[WARN] per-epoch per-asset calibrated print failed: {_e}")
 
         except Exception as e:
             print(f"[WARN] per-asset aggregation failed: {e}")
@@ -1880,16 +1869,6 @@ class PerAssetMetrics(pl.Callback):
             acc_str = "-" if r[5] is None else f"{r[5]:.3f}"
             print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {acc_str} | {r[6]}")
 
-        # Calibrated per-asset table at fit end (if available)
-        try:
-            rows_cal = getattr(self, "_last_rows_cal", [])
-            if rows_cal:
-                print("\nPer-asset validation metrics (CALIBRATED, top by samples):")
-                print("asset | MAE | RMSE | MSE | QLIKE | N")
-                for r in rows_cal[: self.max_print]:
-                    print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {r[5]}")
-        except Exception as _e:
-            print(f"[WARN] Could not print calibrated per-asset metrics at end: {_e}")
 
         dir_overall = None
         yd = overall.get("yd", None)
