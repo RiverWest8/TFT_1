@@ -2131,11 +2131,30 @@ class BiasWarmupCallback(pl.Callback):
             pass
 
         if scale is not None:
-            a = getattr(self, "scale_ema_alpha", 0.005)
-            self._scale_ema = scale if self._scale_ema is None else (1.0 - a) * self._scale_ema + a * scale
+            prev = self._scale_ema
+            beta = 0.9       # EMA smoothing
+            rel_clip = 0.05  # clamp to ±5% per epoch
+            if (prev is None) or (not np.isfinite(prev)):
+                self._scale_ema = float(scale)
+            else:
+                ema = beta * float(prev) + (1.0 - beta) * float(scale)
+                lo = float(prev) * (1.0 - rel_clip)
+                hi = float(prev) * (1.0 + rel_clip)
+                self._scale_ema = float(min(max(ema, lo), hi))
 
         e = int(getattr(trainer, "current_epoch", 0))
         prog = min(1.0, float(e) / float(max(self.warm, 1)))
+        # Decay phase starts at ~2/3 of training; hold bias terms steady thereafter
+        _decay_start = int((2.0/3.0) * MAX_EPOCHS)
+        _epoch1 = e + 1
+        _in_decay = (_epoch1 >= _decay_start)
+        # ---- HOLD STEADY IN DECAY ----
+        if _in_decay:
+            # lock underestimation factor to a calm late value
+            vol_loss.underestimation_factor = float(max(1.0, min(getattr(self, "target_under", 1.09), 1.09)))
+            # keep QLIKE pressure constant and mild in decay
+            if hasattr(vol_loss, "qlike_weight"):
+                vol_loss.qlike_weight = 0.08
 
         # Freeze if getting worse
         if self._frozen:
@@ -2557,7 +2576,19 @@ class TailWeightRamp(pl.Callback):
                 if self._trigger_epoch is None:
                     self._trigger_epoch = e
                     print(f"[TAIL] epoch={e} gate OPEN (scale_ema={scale_ema}); starting ramp")
+        # --- Gate passed (no return above): apply late, short ramp ---
+        _epoch1 = int(getattr(trainer, "current_epoch", 0)) + 1
+        _tail_start = int(0.90 * MAX_EPOCHS)
+        if _epoch1 <= _tail_start:
+            # hold near your start value until very late
+            self.vol_loss.tail_weight = float(self.start)
+        else:
+            _ramp_den = 2  # 2-epoch ramp
+            _k = min(1.0, (_epoch1 - _tail_start) / _ramp_den)
+            # ramp from start → 1.0
+            self.vol_loss.tail_weight = float(self.start + (1.0 - self.start) * _k)
 
+        print(f"[TAIL] epoch={e} ungated; tail_weight={self.vol_loss.tail_weight}")
         # Ramping once gate is open (or immediately if gate disabled)
         eff_end = min(self.end, 1.1)
         eff_ramp = max(self.ramp, 8)
@@ -2771,7 +2802,7 @@ EXTRA_CALLBACKS = [
           save_last=True,
       ),
       StochasticWeightAveraging(swa_lrs = 1e6 , annealing_epochs = 1, annealing_strategy="cos", swa_epoch_start=max(1, int(0.85 * MAX_EPOCHS))),
-      CosineLR(start_epoch=6, eta_min_ratio=5e-6, hold_last_epochs=2, warmup_steps=0),
+      CosineLR(start_epoch=6, eta_min_ratio=1e-4, hold_last_epochs=2, warmup_steps=0),
       ]
 
 class ValLossHistory(pl.Callback):
