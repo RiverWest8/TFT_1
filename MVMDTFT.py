@@ -2776,7 +2776,7 @@ EXTRA_CALLBACKS = [
           ramp_epochs=48,
           gate_by_calibration=True,
           gate_low=0.9,
-          gate_high=1.2,
+          gate_high=1.15,
           gate_patience=2,
       ),
       ReduceLROnPlateauCallback(
