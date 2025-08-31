@@ -2125,7 +2125,7 @@ class BiasWarmupCallback(pl.Callback):
             vms = trainer.callback_metrics.get("val_mean_scale", None)
             if vms is not None:
                 s = float(vms.item() if hasattr(vms, "item") else vms)
-                a = getattr(self, "scale_ema_alpha", 0.6)
+                a = getattr(self, "scale_ema_alpha", 0.005)
                 self._scale_ema = s if (self._scale_ema is None) else (1.0 - a) * self._scale_ema + a * s
         except Exception:
             pass
@@ -2153,7 +2153,7 @@ class BiasWarmupCallback(pl.Callback):
             pass
 
         if scale is not None:
-            a = getattr(self, "scale_ema_alpha", 0.7)
+            a = getattr(self, "scale_ema_alpha", 0.005)
             self._scale_ema = scale if self._scale_ema is None else (1.0 - a) * self._scale_ema + a * scale
 
         e = int(getattr(trainer, "current_epoch", 0))
@@ -2163,7 +2163,7 @@ class BiasWarmupCallback(pl.Callback):
         if self._frozen:
             vol_loss.underestimation_factor = 1.0
             if hasattr(vol_loss, "qlike_weight"):
-                vol_loss.qlike_weight = 0.0
+                vol_loss.qlike_weight = max(qlike_floor, q_target * q_prog)
             vol_loss.mean_bias_weight = min(getattr(vol_loss, "mean_bias_weight", 0.0), self.target_mean_bias)
             print(f"[BIAS] epoch={e} FROZEN: alpha=1.0 qlike_w=0.0 mean_bias={vol_loss.mean_bias_weight:.3f}")
             return
@@ -2190,7 +2190,7 @@ class BiasWarmupCallback(pl.Callback):
         if hasattr(vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
             q_target = float(self.qlike_target_weight)
             q_prog   = min(1.0, float(e) / float(max(self.warm, 8)))
-            near_ok  = (self._scale_ema is None) or (0.9 <= self._scale_ema <= 1.1)
+            near_ok  = (self._scale_ema is None) or (0.98 <= self._scale_ema <= 1.05)
 
             qlike_floor = 0.05  # keep some scale pressure even when gated
             if near_ok:
@@ -2513,8 +2513,8 @@ class TailWeightRamp(pl.Callback):
         end: float = 1.25,
         ramp_epochs: int = 12,
         gate_by_calibration: bool = True,
-        gate_low: float = 0.9,
-        gate_high: float = 1.2,
+        gate_low: float = 0.97,
+        gate_high: float = 1.05,
         gate_patience: int = 2,
     ):
         super().__init__()
@@ -2525,9 +2525,10 @@ class TailWeightRamp(pl.Callback):
         self.gate = bool(gate_by_calibration)
         self.gate_low = float(gate_low)
         self.gate_high = float(gate_high)
-        self.gate_patience = int(gate_patience)
         self._ok_streak = 0
         self._trigger_epoch = None
+
+
 
 
     def _get_scale_ema(self, trainer):
@@ -2579,7 +2580,7 @@ class TailWeightRamp(pl.Callback):
                     print(f"[TAIL] epoch={e} gate OPEN (scale_ema={scale_ema}); starting ramp")
 
         # Ramping once gate is open (or immediately if gate disabled)
-        eff_end = min(self.end, 1.5)
+        eff_end = min(self.end, 1.1)
         eff_ramp = max(self.ramp, 8)
         base = self._trigger_epoch if (self.gate and self._trigger_epoch is not None) else 0
         prog = min(1.0, max(0.0, (e - base + 1) / float(eff_ramp)))
@@ -2750,7 +2751,7 @@ VOL_LOSS = AsymmetricQuantileLoss(
     quantiles=VOL_QUANTILES,
     underestimation_factor=1.06,  # managed by BiasWarmupCallback
     mean_bias_weight=0.002,        # small centering on the median for MAE
-    tail_q=0.85,
+    tail_q=0.9,
     tail_weight=1.0,              # will be ramped by TailWeightRamp
     qlike_weight=0.02,             # QLIKE weight is ramped safely in BiasWarmupCallback
     reduction="mean",
@@ -2762,7 +2763,7 @@ EXTRA_CALLBACKS = [
           target_under=1.09,
           target_mean_bias=0.04,
           warmup_epochs=6,
-          qlike_target_weight=0.15,   # keep out of the loss; diagnostics only
+          qlike_target_weight=0.08,   # keep out of the loss; diagnostics only
           start_mean_bias=0.02,
           mean_bias_ramp_until=12,
           guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
@@ -2772,15 +2773,15 @@ EXTRA_CALLBACKS = [
       TailWeightRamp(
           vol_loss=VOL_LOSS,
           start=1.0,
-          end=1.25,
-          ramp_epochs=48,
+          end=1.1,
+          ramp_epochs=24,
           gate_by_calibration=True,
           gate_low=0.9,
-          gate_high=1.15,
+          gate_high=1.1,
           gate_patience=2,
       ),
       ReduceLROnPlateauCallback(
-          monitor="val_composite_overall", factor=0.5, patience=7, min_lr=3e-5, cooldown=1, stop_after_epoch=9
+          monitor="val_composite_overall", factor=0.5, patience=4, min_lr=3e-5, cooldown=1, stop_after_epoch=5
       ),
       ModelCheckpoint(
           dirpath=str(LOCAL_CKPT_DIR),
@@ -2791,7 +2792,7 @@ EXTRA_CALLBACKS = [
           save_last=True,
       ),
       StochasticWeightAveraging(swa_lrs = 0.00091, swa_epoch_start=max(1, int(0.8 * MAX_EPOCHS))),
-      CosineLR(start_epoch=4, eta_min_ratio=5e-6, hold_last_epochs=2, warmup_steps=0),
+      CosineLR(start_epoch=6, eta_min_ratio=5e-6, hold_last_epochs=2, warmup_steps=0),
       ]
 
 class ValLossHistory(pl.Callback):
@@ -2848,7 +2849,7 @@ EMBEDDING_CARDINALITY = {}
 
 BATCH_SIZE   = 128
 MAX_EPOCHS   = 35
-EARLY_STOP_PATIENCE = 7
+EARLY_STOP_PATIENCE = 9
 PERM_BLOCK_SIZE = 288
 
 # Artifacts are written locally then uploaded to GCS
