@@ -1860,8 +1860,7 @@ class PerAssetMetrics(pl.Callback):
         rmse_cal = overall.get('rmse_cal', None)
         mse_cal  = overall.get('mse_cal', None)
         ql_cal   = overall.get('qlike_cal', None)
-        if mae_cal is not None and ql_cal is not None:
-            print(f"CALIB — MAE: {mae_cal:.6f} | RMSE: {rmse_cal:.6f} | MSE: {mse_cal:.6f} | QLIKE: {ql_cal:.6f}")
+
 
         print("\nPer-asset validation metrics (top by samples):")
         print("asset | MAE | RMSE | MSE | QLIKE | ACC | N")
