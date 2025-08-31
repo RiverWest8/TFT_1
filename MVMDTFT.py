@@ -2503,6 +2503,7 @@ class TailWeightRamp(pl.Callback):
         self.gate = bool(gate_by_calibration)
         self.gate_low = float(gate_low)
         self.gate_high = float(gate_high)
+        self.gate_patience = int(gate_patience)
         self._ok_streak = 0
         self._trigger_epoch = None
 
