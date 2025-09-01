@@ -161,6 +161,8 @@ VOL_QUANTILES = [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95] #The quantiles whic
 #Q50_IDX = VOL_QUANTILES.index(0.50)  
 #VOL_QUANTILES = [0.05, 0.15, 0.35, 0.50, 0.65, 0.85, 0.95]
 Q50_IDX = VOL_QUANTILES.index(0.50)
+Q05_IDX = VOL_QUANTILES.index(0.05)
+Q95_IDX = VOL_QUANTILES.index(0.95)
 # Floor used when computing decoded QLIKE to avoid blow-ups when y or ŷ ~ 0
 EVAL_VOL_FLOOR = 1e-6
 
@@ -373,6 +375,43 @@ def _extract_heads(pred):
 
     return None, None
 
+def _extract_vol_quantiles(pred):
+    """Return a [B, K] tensor of vol quantiles from various PF layouts, or None."""
+    import torch
+    K = len(VOL_QUANTILES)
+
+    # list/tuple: [vol_q, dir]
+    if isinstance(pred, (list, tuple)):
+        vol_q = pred[0]
+        if torch.is_tensor(vol_q):
+            if vol_q.ndim == 3 and vol_q.size(1) == 1:
+                vol_q = vol_q.squeeze(1)  # [B,K]
+            if vol_q.ndim == 3 and vol_q.size(-1) == 1 and vol_q.size(1) == K:
+                vol_q = vol_q.squeeze(-1)  # [B,K]
+            if vol_q.ndim == 2:
+                return vol_q[:, :K] if vol_q.size(-1) >= K else vol_q
+        return None
+
+    if not torch.is_tensor(pred):
+        return None
+
+    t = pred
+    if t.ndim == 4 and t.size(1) == 1:
+        t = t.squeeze(1)
+    if t.ndim == 3 and t.size(1) == 1 and t.size(-1) >= 1:
+        t = t[:, 0, :]
+
+    if t.ndim == 3 and t.size(1) == 2:           # [B,2,K]
+        return t[:, 0, :K]
+    if t.ndim == 3 and t.size(-1) == 2 and t.size(1) >= K:  # [B,K,2]
+        return t[:, :K, 0]
+    if t.ndim == 2:
+        return t[:, :K] if t.size(-1) >= K else t
+    if t.ndim >= 1:
+        flat = t.reshape(t.size(0), -1)
+        return flat[:, :K]
+    return None
+
 @torch.no_grad()
 def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     """
@@ -449,8 +488,8 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
 
     # Accumulators
     assets_all, t_all = [], []
-    y_true_all, y_pred_all, y_dirprob_all = [], [], []
-
+    y_true_all, y_dirprob_all = [], []
+    y_pred_q05_all, y_pred_q50_all, y_pred_q95_all = [], [], []
     # Helper: extract x dict from a batch container
     def _get_x(b):
         if isinstance(b, dict):
@@ -504,11 +543,46 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             continue
         p_vol_enc = p_vol_enc.reshape(-1)[:L]
 
-        # Decode vol
-        if vol_norm is not None:
-            y_vol_pred = safe_decode_vol(p_vol_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+        # Decode q50 and q95 (uncertainty bars)
+        vol_q = _extract_vol_quantiles(pred_t)
+        q50_enc, q95_enc = None, None
+        if torch.is_tensor(vol_q) and vol_q.ndim == 2 and vol_q.size(1) >= (max(Q50_IDX, Q95_IDX) + 1):
+            vol_q = torch.cummax(vol_q, dim=-1).values
+            q50_enc = vol_q[:, Q50_IDX].reshape(-1)[:L]
+            q95_enc = vol_q[:, Q95_IDX].reshape(-1)[:L]
         else:
-            y_vol_pred = p_vol_enc
+            # fallback: use the median we already parsed
+            q50_enc = p_vol_enc.reshape(-1)[:L]
+
+        # Decode median (q50) for the point forecast
+        floor_val = float(globals().get("EVAL_VOL_FLOOR", 1e-8))
+        if vol_norm is not None:
+            y_q50 = safe_decode_vol(p_vol_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+            y_q50 = torch.clamp(y_q50, min=floor_val)
+        else:
+            y_q50 = p_vol_enc
+
+        # Also extract q05 and q95 for uncertainty bars
+        vol_q = _extract_vol_quantiles(pred_t)
+        q05_enc, q95_enc = None, None
+        if torch.is_tensor(vol_q) and vol_q.ndim == 2 and vol_q.size(1) >= (max(Q05_IDX, Q95_IDX) + 1):
+            vol_q = torch.cummax(vol_q, dim=-1).values
+            q05_enc = vol_q[:, Q05_IDX].reshape(-1)[:L]
+            q95_enc = vol_q[:, Q95_IDX].reshape(-1)[:L]
+
+        # Decode q05/q95 if present
+        y_q05, y_q95 = None, None
+        if q05_enc is not None and vol_norm is not None:
+            y_q05 = safe_decode_vol(q05_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+            y_q05 = torch.clamp(y_q05, min=floor_val)
+        elif q05_enc is not None:
+            y_q05 = q05_enc
+
+        if q95_enc is not None and vol_norm is not None:
+            y_q95 = safe_decode_vol(q95_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+            y_q95 = torch.clamp(y_q95, min=floor_val)
+        elif q95_enc is not None:
+            y_q95 = q95_enc
 
         # True targets (optional)
         y_vol_true = None
@@ -541,7 +615,16 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
         # Append accumulators
         assets_all.extend(aset)
         t_all.extend(t.detach().cpu().tolist() if isinstance(t, torch.Tensor) else [None] * L)
-        y_pred_all.extend(y_vol_pred.detach().cpu().tolist())
+        # store q05, q50, q95
+        if y_q05 is not None:
+            y_pred_q05_all.extend(y_q05.detach().cpu().tolist())
+        else:
+            y_pred_q05_all.extend([None] * L)
+        y_pred_q50_all.extend(y_q50.detach().cpu().tolist())
+        if y_q95 is not None:
+            y_pred_q95_all.extend(y_q95.detach().cpu().tolist())
+        else:
+            y_pred_q95_all.extend([None] * L)
         if y_vol_true is not None:
             y_true_all.extend(y_vol_true.detach().cpu().tolist())
         else:
@@ -551,13 +634,14 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
         else:
             y_dirprob_all.extend([None] * L)
 
-    # Build dataframe
-    import pandas as pd
     df = pd.DataFrame({
         "asset": assets_all,
         "time_idx": t_all,
         "y_vol": y_true_all,
-        "y_vol_pred": y_pred_all,
+        "y_vol_pred": y_pred_q50_all,    # point forecast = q50
+        "y_vol_pred_q05": y_pred_q05_all,
+        "y_vol_pred_q50": y_pred_q50_all,
+        "y_vol_pred_q95": y_pred_q95_all,
         "y_dir_prob": y_dirprob_all,
     })
 
@@ -588,6 +672,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_path, index=False)
     print(f"✓ Wrote {split.upper()} predictions → {out_path}")
+
     
 
 
@@ -2386,16 +2471,20 @@ def _evaluate_decoded_metrics(
 
     batches_seen = 0
     for batch in loader:
-        if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+        # Accept (x, y, *rest) or just x
+        if isinstance(batch, (list, tuple)):
             x = batch[0]
-            y = batch[1]
+            y = batch[1] if len(batch) > 1 else None
         else:
-            continue
+            x, y = batch, None
         if not isinstance(x, dict):
             continue
 
-        # --- MOVE EVERYTHING to the model's device BEFORE forward ---
+        # --- move nested tensors to the model device (helper stays unchanged) ---
         x_dev = _move_to_device(x)
+        if y is not None:
+            y = _move_to_device(y)
+
 
         # group ids (taken from x_dev so same device)
         groups = None
@@ -3417,26 +3506,24 @@ def _collect_test_predictions(model, dl, id_to_name, vol_norm):
 
 # ---------- EXPORT PREDICTIONS FROM BEST CHECKPOINT ----------
 try:
-    # VAL parquet (uncalibrated canonical export)
+    # VAL parquet
     val_pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
     _export_split_from_best(trainer, val_dataloader, "val", val_pred_path)
-    print(f"✓ Wrote validation parquet → {val_pred_path}")
     try:
         upload_file_to_gcs(str(val_pred_path), f"{GCS_OUTPUT_PREFIX}/{val_pred_path.name}")
     except Exception as e:
-        print(f"[WARN] Could not upload validation parquet: {e}")
+        print(f"[WARN] Could not upload VAL parquet: {e}")
 
-    # TEST parquet (uncalibrated canonical export)
+    # TEST parquet
     test_pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
     _export_split_from_best(trainer, test_dataloader, "test", test_pred_path)
-    print(f"✓ Wrote test parquet → {test_pred_path}")
     try:
         upload_file_to_gcs(str(test_pred_path), f"{GCS_OUTPUT_PREFIX}/{test_pred_path.name}")
     except Exception as e:
-        print(f"[WARN] Could not upload test parquet: {e}")
-
+        print(f"[WARN] Could not upload TEST parquet: {e}")
 except Exception as e:
-    print(f"[WARN] Final export failed: {e}")
+    print(f"[WARN] Export failed: {e}")
+
 
 
 # Build dataframe of predictions and compute TEST metrics on decoded scale
