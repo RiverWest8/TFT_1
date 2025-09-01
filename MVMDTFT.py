@@ -859,17 +859,7 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
         model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu", weights_only=False)
 
     model.eval()
-
-    try:
-        # prefer the normalizer bound to the loaded checkpoint model
-        vol_norm = _extract_norm_from_dataset(best_model.dataset)
-    except Exception:
-        try:
-            vol_norm = _extract_norm_from_dataset(model.dataset)  # some versions name it `model`
-        except Exception:
-            vol_norm = _extract_norm_from_dataset(dataloader.dataset)  # last-resort fallback`
-
-
+    vol_norm = _extract_norm_from_dataset(model.dataset)  # some versions name it `model`
     export_loader = make_export_loader(dataloader)
 
     # Collect predictions (classic/simple)
@@ -2342,6 +2332,7 @@ parser.add_argument(
     default=False,                       # <— make default False
     help="Resume from latest checkpoint if available"
 )
+parser.add_argument("--ckpt_path", type=str, default=None, help="Explicit checkpoint to resume from (overrides auto-detection)")
 # Quick-run subsetting for speed
 parser.add_argument("--train_max_rows", type=int, default=None, help="Limit number of rows in TRAIN for fast iterations")
 parser.add_argument("--val_max_rows", type=int, default=None, help="Limit number of rows in VAL (optional; default full)")
@@ -2458,35 +2449,44 @@ else:
         "or ensure GCS is configured (install gcsfs & correct URIs)."
     )
 
-def get_resume_ckpt_path():
-    if not RESUME_ENABLED:
-        return None
+def get_resume_ckpt_path(args=None):
+    # 1) explicit path wins
+    if args is not None and getattr(args, "ckpt_path", None):
+        return args.ckpt_path
 
+    # 2) local last.ckpt
+    base = globals().get("LOCAL_CKPT_DIR") or globals().get("LOCAL_OUTPUT_DIR") or Path("./checkpoints")
+    last = base / "last.ckpt"
     try:
-        local_ckpts = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if local_ckpts:
-            return str(local_ckpts[0])
+        if last.exists():
+            return str(last)
     except Exception:
         pass
-    # Fallback: try GCS "last.ckpt" then the lexicographically latest .ckpt
+
+    # 3) newest local *.ckpt
     try:
-        if fs is not None:
-            last_uri = f"{CKPT_GCS_PREFIX}/last.ckpt"
-            if fs.exists(last_uri):
-                dst = LOCAL_CKPT_DIR / "last.ckpt"
-                with fsspec.open(last_uri, "rb") as f_in, open(dst, "wb") as f_out:
-                    shutil.copyfileobj(f_in, f_out)
+        ckpts = sorted(base.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if ckpts:
+            return str(ckpts[0])
+    except Exception:
+        pass
+
+    # 4) optional remote last.ckpt → copy to local for Lightning
+    try:
+        import fsspec
+        prefix = globals().get("CKPT_GCS_PREFIX") or (getattr(args, "gcs_output_prefix", None) or "")
+        if prefix:
+            uri = prefix.rstrip("/") + "/last.ckpt"
+            fs = fsspec.open(uri, "rb").fs
+            if fs.exists(uri):
+                base.mkdir(parents=True, exist_ok=True)
+                dst = base / "last.ckpt"
+                with fsspec.open(uri, "rb") as f_in, open(dst, "wb") as f_out:
+                    import shutil; shutil.copyfileobj(f_in, f_out)
                 return str(dst)
-            # else get the latest by name (filenames contain ISO timestamps)
-            entries = fs.glob(f"{CKPT_GCS_PREFIX}/*.ckpt") or []
-            if entries:
-                latest = sorted(entries)[-1]
-                dst = LOCAL_CKPT_DIR / Path(latest).name
-                with fsspec.open(latest, "rb") as f_in, open(dst, "wb") as f_out:
-                    shutil.copyfileobj(f_in, f_out)
-                return str(dst)
-    except Exception as e:
-        print(f"[WARN] Could not fetch resume checkpoint from GCS: {e}")
+    except Exception:
+        pass
+
     return None
 
 def mirror_local_ckpts_to_gcs():
@@ -3754,13 +3754,15 @@ if __name__ == "__main__":
         return fig
 
     tft.plot_prediction = MethodType(_blank_plot, tft)
-    resume_ckpt = get_resume_ckpt_path() if RESUME_ENABLED else None
+
+    resume_ckpt = get_resume_ckpt_path(args=ARGS) if getattr(ARGS, "resume", False) else None
     if resume_ckpt:
         print(f"↩️  Resuming from checkpoint: {resume_ckpt}")
     else:
         print("▶ Starting a fresh run (no resume)")
 
-       # Train the model
+    # Train the model
+   
     trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
 
     # --- Evaluate using the best checkpoint (min val_mae_overall) ---
