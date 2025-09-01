@@ -831,15 +831,22 @@ def make_export_loader(dl):
     )
 
 @torch.no_grad()
-def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: Path | str,
-                                id_to_name: dict | None = None):
+@torch.no_grad()
+def _save_predictions_from_best(
+    trainer,
+    dataloader,
+    split_name: str,
+    out_path: Path | str,
+    id_to_name: dict | None = None,
+    vol_norm=None,                # 👈 pass training_dataset normalizer
+):
     """
-    GOOD1-STYLE EXPORT:
+    GOOD1-STYLE EXPORT (patched):
       • load best ckpt on CPU
       • iterate dataloader with num_workers=0
       • forward pass
       • take median RV quantile (+ optional direction)
-      • decode with dataset.target_normalizer
+      • decode with vol_norm from TRAIN dataset (passed in)
       • write ONE parquet at out_path
     """
     ckpt = _get_best_ckpt_path(trainer)
@@ -856,10 +863,16 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
             model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu")
     except TypeError:
         # Older Lightning/PyTorch
-        model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu", weights_only=False)
+        model = TemporalFusionTransformer.load_from_checkpoint(
+            ckpt, map_location="cpu", weights_only=False
+        )
 
     model.eval()
-    vol_norm = _extract_norm_from_dataset(model.dataset)  # some versions name it `model`
+
+    # 🔧 FIX: require caller to pass vol_norm (from training_dataset)
+    if vol_norm is None:
+        raise RuntimeError("vol_norm must be provided from training_dataset.")
+
     export_loader = make_export_loader(dataloader)
 
     # Collect predictions (classic/simple)
@@ -3794,6 +3807,7 @@ if __name__ == "__main__":
             val_dataloader,
             "val",
             val_pred_path,
+            vol_norm=vol_normalizer,
             id_to_name=metrics_cb.id_to_name,
         )
         print(f"✓ Wrote validation parquet → {val_pred_path}")
@@ -3809,6 +3823,7 @@ if __name__ == "__main__":
             test_dataloader,
             "test",
             test_pred_path,
+            vol_norm=vol_normalizer,
             id_to_name=metrics_cb.id_to_name,
         )
         print(f"✓ Wrote test parquet → {test_pred_path}")
@@ -3919,7 +3934,7 @@ try:
     val_export_loader = make_export_loader(val_dataloader)
 
     # Get the volatility normalizer from the validation dataset
-    vol_norm_val = _extract_norm_from_dataset(best_model.dataset)
+    vol_norm_val = vol_normalizer
 
     # 1) Collect a DataFrame of validation predictions (UNCALIBRATED)
     df_val_preds = _collect_predictions(
@@ -3949,6 +3964,7 @@ try:
         val_export_loader,
         "val",
         val_pred_path,
+        vol_norm=vol_normalizer,
         id_to_name=metrics_cb.id_to_name,
     )
     print(f"✓ Wrote validation parquet → {val_pred_path}")
@@ -4001,7 +4017,7 @@ try:
             best_model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu", weights_only=False)
 
     test_export_loader = make_export_loader(test_dataloader)
-    vol_norm_test = _extract_norm_from_dataset(best_model.dataset)
+    vol_norm_test = vol_normalizer
 
     df_test_preds = _collect_predictions(
         best_model,
@@ -4029,6 +4045,7 @@ try:
             test_export_loader,
             "test",
             test_pred_path,
+            vol_norm=vol_normalizer,
             id_to_name=metrics_cb.id_to_name,
         )
     except Exception as e:
@@ -4326,6 +4343,7 @@ try:
             test_dataloader,
             "test",
             test_pred_path,
+            vol_norm=vol_normalizer,
             id_to_name=metrics_cb.id_to_name,
             vol_norm=metrics_cb.vol_norm
         )
