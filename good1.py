@@ -373,6 +373,172 @@ def _extract_heads(pred):
 
     return None, None
 
+@torch.no_grad()
+def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
+    """
+    Minimal, self-contained export:
+    - Loads the best checkpoint
+    - Predicts on `dataloader`
+    - Decodes realised_vol to physical scale
+    - Harmonises columns and writes parquet to `out_path`
+    """
+    # 1) Find best checkpoint
+    best_ckpt = None
+    for cb in getattr(trainer, "callbacks", []):
+        if isinstance(cb, pl.callbacks.ModelCheckpoint):
+            if getattr(cb, "best_model_path", None):
+                if cb.best_model_path and os.path.exists(cb.best_model_path):
+                    best_ckpt = cb.best_model_path
+                    break
+    if best_ckpt is None:
+        # fallback: latest local ckpt
+        try:
+            cks = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if cks:
+                best_ckpt = str(cks[0])
+        except Exception:
+            pass
+    if best_ckpt is None:
+        raise RuntimeError("Best checkpoint not found for export.")
+
+    # 2) Recreate model from best ckpt on current device
+    LM = type(trainer.lightning_module)
+    best_model = LM.load_from_checkpoint(best_ckpt)
+    best_model.eval().to(trainer.lightning_module.device)
+
+    # 3) Grab id->name map from your PerAssetMetrics (so assets are readable)
+    metrics_cb = None
+    for cb in getattr(trainer, "callbacks", []):
+        if isinstance(cb, PerAssetMetrics):
+            metrics_cb = cb
+            break
+    if metrics_cb is None:
+        raise RuntimeError("PerAssetMetrics callback not found; id->name map unavailable.")
+
+    id_to_name = {int(k): str(v) for k, v in metrics_cb.id_to_name.items()}
+
+    # 4) Normalizer for decoding realised_vol
+    try:
+        vol_norm = _extract_norm_from_dataset(best_model.dataset)
+    except Exception:
+        vol_norm = None
+
+    # 5) Predict in raw mode so we can access group ids / time_idx
+    raw_preds, x = best_model.predict(dataloader, mode="raw", return_x=True)
+    # Flatten predictions if they come batched as a list
+    if isinstance(raw_preds, (list, tuple)):
+        preds = []
+        for rp in raw_preds:
+            rp = rp["prediction"] if isinstance(rp, dict) and "prediction" in rp else rp
+            preds.append(rp)
+        pred_all = torch.cat(preds, dim=0)
+    else:
+        pred_all = raw_preds["prediction"] if isinstance(raw_preds, dict) and "prediction" in raw_preds else raw_preds
+
+    # 6) Groups (asset ids)
+    groups = None
+    if isinstance(x, dict):
+        for k in ("groups", "group_ids", "group_id"):
+            if k in x and x[k] is not None:
+                groups = x[k]
+                break
+    if groups is None and isinstance(x, list) and x and isinstance(x[0], dict):
+        chunks = []
+        for xb in x:
+            g = xb.get("groups") or xb.get("group_ids") or xb.get("group_id")
+            if g is not None:
+                chunks.append(g[0] if isinstance(g, (list, tuple)) else g)
+        if chunks:
+            groups = torch.cat([c.reshape(-1) for c in chunks], dim=0)
+    if groups is None:
+        raise RuntimeError("Could not extract group ids during export.")
+
+    # 7) Extract median vol and probs for direction
+    p_vol_enc, p_dir = _extract_heads(pred_all)
+    if p_vol_enc is None:
+        raise RuntimeError("Export failed: could not parse vol head.")
+
+    # 8) Decode vol to physical scale
+    g = groups
+    while torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
+        g = g.squeeze(-1)
+    g = g.reshape(-1)
+    if vol_norm is not None:
+        y_vol_pred = safe_decode_vol(p_vol_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+    else:
+        y_vol_pred = p_vol_enc  # fallback
+
+    # 9) True targets if provided
+    y_vol_true = None
+    if isinstance(x, dict) and "decoder_target" in x and torch.is_tensor(x["decoder_target"]):
+        yt = x["decoder_target"]
+        if yt.ndim == 3 and yt.size(-1) >= 1:
+            yt = yt[:, 0, 0]
+        elif yt.ndim == 2:
+            yt = yt[:, 0]
+        if vol_norm is not None:
+            y_vol_true = safe_decode_vol(yt.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+        else:
+            y_vol_true = yt
+
+    # 10) Direction → probability in [0,1]
+    y_dir_prob = None
+    if p_dir is not None and torch.is_tensor(p_dir):
+        y_dir_prob = p_dir
+        try:
+            if torch.isfinite(y_dir_prob).any() and (y_dir_prob.min() < 0 or y_dir_prob.max() > 1):
+                y_dir_prob = torch.sigmoid(y_dir_prob)
+        except Exception:
+            y_dir_prob = torch.sigmoid(y_dir_prob)
+        y_dir_prob = torch.clamp(y_dir_prob, 0.0, 1.0)
+
+    # 11) Build dataframe
+    assets = [id_to_name.get(int(i), str(int(i))) for i in g.detach().cpu().tolist()]
+    time_idx = None
+    if isinstance(x, dict) and "decoder_time_idx" in x and torch.is_tensor(x["decoder_time_idx"]):
+        ti = x["decoder_time_idx"]
+        while ti.ndim > 1 and ti.size(-1) == 1:
+            ti = ti.squeeze(-1)
+        time_idx = ti.detach().cpu().numpy().tolist()
+    else:
+        time_idx = [None] * len(assets)
+
+    df = pd.DataFrame({
+        "asset": assets,
+        "time_idx": time_idx,
+        "y_vol_pred": y_vol_pred.detach().cpu().numpy(),
+    })
+    if y_vol_true is not None:
+        df["y_vol"] = y_vol_true.detach().cpu().numpy()
+    if y_dir_prob is not None:
+        df["y_dir_prob"] = y_dir_prob.detach().cpu().numpy()
+
+    # Try to attach actual 'Time' if a compatible source df is cached
+    try:
+        cand_names = ["val_df", "test_df", "raw_df", "full_df", "df"]
+        src = None
+        for nm in cand_names:
+            obj = globals().get(nm)
+            if isinstance(obj, pd.DataFrame) and {"asset","time_idx","Time"}.issubset(obj.columns):
+                src = obj[["asset","time_idx","Time"]].copy()
+                break
+        if src is not None:
+            src["asset"] = src["asset"].astype(str)
+            src["time_idx"] = pd.to_numeric(src["time_idx"], errors="coerce").astype("Int64").astype("int64")
+            df["asset"] = df["asset"].astype(str)
+            df["time_idx"] = pd.to_numeric(df["time_idx"], errors="coerce").astype("Int64").astype("int64")
+            df = df.merge(src, on=["asset","time_idx"], how="left", validate="m:1")
+            df["Time"] = pd.to_datetime(df["Time"], errors="coerce")
+            try:
+                df["Time"] = df["Time"].dt.tz_localize(None)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[WARN] Could not attach Time column: {e}")
+
+    # 12) Save parquet + optional GCS upload
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(out_path, index=False)
 
     
 
@@ -1172,13 +1338,15 @@ class PerAssetMetrics(pl.Callback):
                         )
                 except Exception as e:
                     print(f"[WARN] Failed to attach real timestamps: {e}")
-                pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
-                df_out.to_parquet(pred_path, index=False)
+                    pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+                    df_out.to_parquet(pred_path, index=False)
                 print(f"✓ Saved validation predictions (Parquet) → {pred_path}")
+
                 try:
                     upload_file_to_gcs(str(pred_path), f"{GCS_OUTPUT_PREFIX}/{pred_path.name}")
                 except Exception as e:
                     print(f"[WARN] Could not upload validation predictions: {e}")
+
         except Exception as e:
             print(f"[WARN] Could not save validation predictions: {e}")
 
@@ -1792,6 +1960,7 @@ EXTRA_CALLBACKS = [
           guard_tol=getattr(ARGS, "warmup_guard_tol", 0.0),
           alpha_step=0.03,
       ),
+
       TailWeightRamp(
           vol_loss=VOL_LOSS,
           start=1.0,
@@ -1813,7 +1982,7 @@ EXTRA_CALLBACKS = [
           save_top_k=3,
           save_last=True,
       ),
-      StochasticWeightAveraging(swa_lrs = 0.00091, swa_epoch_start=max(1, int(0.8 * MAX_EPOCHS))),
+      StochasticWeightAveraging(swa_lrs = 1e6 , annealing_epochs = 1, annealing_strategy="cos", swa_epoch_start=max(1, int(0.85 * MAX_EPOCHS))),
   ]
 
 class ValLossHistory(pl.Callback):
@@ -2285,7 +2454,7 @@ def _evaluate_decoded_metrics(
     # decode realised_vol
     y_dec = safe_decode_vol(y_all.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
     p_dec = safe_decode_vol(p_all.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
-    floor_val = globals().get("EVAL_VOL_FLOOR", 1e-6)
+    floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
     y_dec = torch.clamp(y_dec, min=floor_val)
     p_dec = torch.clamp(p_dec, min=floor_val)
 
@@ -2345,6 +2514,8 @@ def _resolve_best_model(trainer, fallback):
         except Exception as e:
             print(f"[WARN] load_from_checkpoint failed: {e}")
     return fallback
+
+
 
 @torch.no_grad()
 def run_permutation_importance(
@@ -2499,6 +2670,28 @@ def run_permutation_importance(
 
 
 
+
+    # ---------- EXPORT PREDICTIONS (VAL + TEST) ----------
+    try:
+        val_pred_path  = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+        test_pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+
+        _export_split_from_best(trainer, val_dataloader,  "val",  val_pred_path)
+        print(f"✓ Wrote validation parquet → {val_pred_path}")
+        try:
+            upload_file_to_gcs(str(val_pred_path), f"{GCS_OUTPUT_PREFIX}/{val_pred_path.name}")
+        except Exception as e:
+            print(f"[WARN] Could not upload validation parquet: {e}")
+
+        _export_split_from_best(trainer, test_dataloader, "test", test_pred_path)
+        print(f"✓ Wrote test parquet → {test_pred_path}")
+        try:
+            upload_file_to_gcs(str(test_pred_path), f"{GCS_OUTPUT_PREFIX}/{test_pred_path.name}")
+        except Exception as e:
+            print(f"[WARN] Could not upload test parquet: {e}")
+
+    except Exception as e:
+        print(f"[WARN] Final export failed: {e}")
 # Data preparation
 # -----------------------------------------------------------------------
 if __name__ == "__main__":
@@ -2534,7 +2727,7 @@ if __name__ == "__main__":
         df["rv_scale"].fillna(asset_scale_map.median(), inplace=True)
     # Global decoded-scale floor for vol (prevents QLIKE blow-ups on near-zero preds)
     try:
-        EVAL_VOL_FLOOR = max(1e-8, float(asset_scales["rv_scale"].median() * 0.02))
+        EVAL_VOL_FLOOR = max(1e-8, float(asset_scales["rv_scale"].median() * 0.002))
     except Exception:
         EVAL_VOL_FLOOR = 1e-8
     print(f"[EVAL] Global vol floor (decoded) set to {EVAL_VOL_FLOOR:.6g}")
@@ -2836,7 +3029,7 @@ if __name__ == "__main__":
     val_hist_cb  = ValLossHistory(val_hist_csv)
 
 
-    cosine_cb = CosineLR(start_epoch=8, min_lr=1e-4)
+    cosine_cb = CosineLR(start_epoch=9, min_lr=1e-4)
 
 
     # ----------------------------
