@@ -1953,12 +1953,26 @@ else:
     )
 
 def get_resume_ckpt_path(args=None):
-    # 1) explicit path wins
+    """
+    Resolve a checkpoint to resume from, with robust GCS fallback:
+      1) explicit --ckpt_path
+      2) local last.ckpt
+      3) newest local *.ckpt in LOCAL_CKPT_DIR
+      4) GCS: current CKPT_GCS_PREFIX (/checkpoints) -> last.ckpt or newest *.ckpt
+      5) GCS: parent of timestamped GCS_OUTPUT_PREFIX -> scan all sibling run folders' /checkpoints
+    Returns local filesystem path or None.
+    """
+    # ---- 1) explicit path wins ----
     if args is not None and getattr(args, "ckpt_path", None):
         return args.ckpt_path
 
-    # 2) local last.ckpt
-    base = globals().get("LOCAL_CKPT_DIR") or globals().get("LOCAL_OUTPUT_DIR") or Path("./checkpoints")
+    base = globals().get("LOCAL_CKPT_DIR", Path("./checkpoints"))
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    # ---- 2) local last.ckpt ----
     last = base / "last.ckpt"
     try:
         if last.exists():
@@ -1966,7 +1980,7 @@ def get_resume_ckpt_path(args=None):
     except Exception:
         pass
 
-    # 3) newest local *.ckpt
+    # ---- 3) newest local *.ckpt ----
     try:
         ckpts = sorted(base.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
         if ckpts:
@@ -1974,21 +1988,132 @@ def get_resume_ckpt_path(args=None):
     except Exception:
         pass
 
-    # 4) optional remote last.ckpt → copy to local for Lightning
+    # ---- helpers for GCS pulling ----
+    def _pull_gcs_to_local(gcs_uri: str, local_name: str = "last.ckpt") -> str | None:
+        """Copy a single ckpt from GCS to LOCAL_CKPT_DIR/local_name and return its path."""
+        try:
+            import fsspec, shutil
+            if fs is None:
+                return None
+            if not fs.exists(gcs_uri):
+                return None
+            dst = base / local_name
+            with fsspec.open(gcs_uri, "rb") as f_in, open(dst, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            return str(dst)
+        except Exception:
+            return None
+
+    def _list_gcs_ckpts(prefix: str) -> list[tuple[str, float]]:
+        """
+        List *.ckpt under a GCS prefix. Returns list of (uri, mtime) sorted by mtime desc.
+        """
+        out = []
+        try:
+            if fs is None:
+                return out
+            # Make sure we have a trailing slash for ls semantics
+            pref = prefix.rstrip("/") + "/"
+            # Some fs impls support glob; fall back to ls
+            try:
+                entries = fs.glob(pref + "*.ckpt")
+                # fs.glob returns full uris; need to stat each for mtime
+                for uri in entries:
+                    try:
+                        info = fs.info(uri)
+                        mtime = float(info.get("mtime", 0.0) or info.get("updated", 0.0) or 0.0)
+                    except Exception:
+                        mtime = 0.0
+                    out.append((uri, mtime))
+            except Exception:
+                # fallback: list then filter
+                for e in fs.ls(pref):
+                    if isinstance(e, str):
+                        uri = e
+                        name = uri.split("/")[-1]
+                        if not name.endswith(".ckpt"):
+                            continue
+                        try:
+                            info = fs.info(uri)
+                            mtime = float(info.get("mtime", 0.0) or info.get("updated", 0.0) or 0.0)
+                        except Exception:
+                            mtime = 0.0
+                        out.append((uri, mtime))
+            out.sort(key=lambda t: t[1], reverse=True)
+        except Exception:
+            return []
+        return out
+
+    # Build candidate GCS prefixes to search
+    prefixes = []
+
+    # Current run’s checkpoints prefix (your global)
+    cur_ckpt_prefix = globals().get("CKPT_GCS_PREFIX", None)
+    if cur_ckpt_prefix:
+        prefixes.append(cur_ckpt_prefix)
+
+    # If ARGS provides gcs_output_prefix, add its /checkpoints
+    gcs_out = None
+    if args is not None:
+        gcs_out = getattr(args, "gcs_output_prefix", None)
+    if gcs_out:
+        prefixes.append(gcs_out.rstrip("/") + "/checkpoints")
+
+    # Also try the parent of a timestamped prefix (e.g., .../Feature_Ablation/f_1234567890 → .../Feature_Ablation)
+    # and scan ALL sibling runs' /checkpoints for the newest ckpt.
+    parent_prefix = None
     try:
-        import fsspec
-        prefix = globals().get("CKPT_GCS_PREFIX") or (getattr(args, "gcs_output_prefix", None) or "")
-        if prefix:
-            uri = prefix.rstrip("/") + "/last.ckpt"
-            fs = fsspec.open(uri, "rb").fs
-            if fs.exists(uri):
-                base.mkdir(parents=True, exist_ok=True)
-                dst = base / "last.ckpt"
-                with fsspec.open(uri, "rb") as f_in, open(dst, "wb") as f_out:
-                    import shutil; shutil.copyfileobj(f_in, f_out)
-                return str(dst)
+        # e.g., gs://bucket/path/.../f_1693578230  →  gs://bucket/path/... (strip last segment)
+        parts = gcs_out.rstrip("/").split("/") if gcs_out else []
+        if parts and parts[-1].startswith("f_"):
+            parent_prefix = "/".join(parts[:-1])  # no trailing slash
+        elif gcs_out:
+            # even if not timestamped, consider its parent anyway
+            parent_prefix = "/".join(parts[:-1])
     except Exception:
-        pass
+        parent_prefix = None
+
+    # 4) Try current prefix first: last.ckpt or newest *.ckpt
+    for pref in prefixes:
+        # last.ckpt
+        uri = pref.rstrip("/") + "/last.ckpt"
+        pulled = _pull_gcs_to_local(uri, local_name="last.ckpt")
+        if pulled:
+            return pulled
+        # newest *.ckpt
+        cand = _list_gcs_ckpts(pref)
+        if cand:
+            pulled = _pull_gcs_to_local(cand[0][0], local_name="last.ckpt")
+            if pulled:
+                return pulled
+
+    # 5) Scan siblings under parent of timestamped folder (find newest across runs)
+    if parent_prefix and fs is not None:
+        try:
+            # list directories under parent (e.g., .../Feature_Ablation/)
+            # then, for each child, look for child/checkpoints/*.ckpt
+            base_dir = parent_prefix.rstrip("/") + "/"
+            children = fs.ls(base_dir)
+            best_uri, best_mtime = None, -1.0
+            for child in children:
+                # child may be str or dict depending on fs; normalize to uri string
+                if isinstance(child, dict):
+                    child_uri = child.get("name") or child.get("path")
+                else:
+                    child_uri = child
+                if not isinstance(child_uri, str):
+                    continue
+                # Expect subdirs like .../f_169xxxx
+                ckpt_pref = child_uri.rstrip("/") + "/checkpoints"
+                for uri, mtime in _list_gcs_ckpts(ckpt_pref):
+                    if mtime > best_mtime:
+                        best_uri, best_mtime = uri, mtime
+            if best_uri:
+                pulled = _pull_gcs_to_local(best_uri, local_name="last.ckpt")
+                if pulled:
+                    return pulled
+        except Exception:
+            pass
 
     return None
 
