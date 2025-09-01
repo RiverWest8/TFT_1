@@ -1417,13 +1417,17 @@ class PerAssetMetrics(pl.Callback):
         # Optionally save per-sample predictions for plotting
         try:
             import pandas as pd  # ensure pd is bound locally and not shadowed
+
             # Recompute decoded tensors from the stored device buffers
             g_cpu = torch.cat(self._g_dev).detach().cpu() if self._g_dev else None
             yv_cpu = torch.cat(self._yv_dev).detach().cpu() if self._yv_dev else None
             pv_cpu = torch.cat(self._pv_dev).detach().cpu() if self._pv_dev else None
             yd_cpu = torch.cat(self._yd_dev).detach().cpu() if self._yd_dev else None
             pdir_cpu = torch.cat(self._pd_dev).detach().cpu() if self._pd_dev else None
-            # decode vol back to physical scale
+
+            df_out = None
+
+            # decode vol back to physical scale and build dataframe
             if g_cpu is not None and yv_cpu is not None and pv_cpu is not None:
                 yv_dec = self.vol_norm.decode(yv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
                 pv_dec = self.vol_norm.decode(pv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
@@ -1464,6 +1468,7 @@ class PerAssetMetrics(pl.Callback):
                     df_out["y_vol_pred_q95"] = q95_dec.numpy().tolist()
                 else:
                     df_out["y_vol_pred_q95"] = [None] * len(df_out)
+
                 if yd_cpu is not None and pdir_cpu is not None and yd_cpu.numel() > 0 and pdir_cpu.numel() > 0:
                     # ensure pdir is probability
                     pdp = pdir_cpu
@@ -1477,12 +1482,15 @@ class PerAssetMetrics(pl.Callback):
                     df_out = df_out.iloc[:Lm].copy()
                     df_out["y_dir"] = yd_cpu[:Lm].numpy().tolist()
                     df_out["y_dir_prob"] = pdp[:Lm].numpy().tolist()
+            else:
+                print("[WARN] No validation tensors to save; skipping parquet.")
+
             # --- Write validation predictions parquet once (with optional Time merge) ---
-            pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
-            try:
+            if df_out is not None:
+                pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+
                 # Optional: merge real timestamps from val_df if available
                 try:
-                    import pandas as pd  # ensure pd is bound
                     if "val_df" in globals() and isinstance(val_df, pd.DataFrame) and {"asset","time_idx","Time"}.issubset(val_df.columns):
                         src = val_df[["asset","time_idx","Time"]].copy()
                         # harmonise dtypes before merge
@@ -1512,8 +1520,8 @@ class PerAssetMetrics(pl.Callback):
                 except Exception as e:
                     print(f"[WARN] Could not upload validation predictions: {e}")
 
-            except Exception as e:
-                print(f"[WARN] Could not save validation predictions: {e}")
+        except Exception as e:
+            print(f"[WARN] Could not save validation predictions: {e}")
 
 
 class BiasWarmupCallback(pl.Callback):
@@ -1523,7 +1531,7 @@ class BiasWarmupCallback(pl.Callback):
     • EMA of mean(y)/mean(p) steers underestimation bias (alpha).
     • Warm-ups are frozen if validation worsens for `guard_patience` epochs.
     • QLIKE ramps only when scale is near 1 to avoid fighting calibration.
-    scale_ema_alpha controls how quickly the EMA of mean(y)/mean(p) adapts.
+    scale_ema_alpha (default 0.6) controls how quickly the EMA of mean(y)/mean(p) adapts; higher values react faster.
     """
     def __init__(
         self,
@@ -1575,7 +1583,6 @@ class BiasWarmupCallback(pl.Callback):
         return None
 
     def on_validation_end(self, trainer, pl_module):
-        # Track whether validation got worse to optionally freeze warm-ups
         val = trainer.callback_metrics.get("val_loss") or trainer.callback_metrics.get("val_mae_overall")
         try:
             val = float(val.item() if hasattr(val, "item") else val)
@@ -1583,13 +1590,11 @@ class BiasWarmupCallback(pl.Callback):
             val = None
         if val is None:
             return
-
         if self._prev_val is not None and val > self._prev_val + self.guard_tol:
             self._worse_streak += 1
         else:
             self._worse_streak = 0
         self._prev_val = val
-
         if self._worse_streak >= self.guard_patience:
             self._frozen = True
         if self._worse_streak == 0:  # improved or equal
@@ -1606,20 +1611,19 @@ class BiasWarmupCallback(pl.Callback):
             pass
 
     def on_train_epoch_start(self, trainer, pl_module):
-        # Optional global switch to disable warm-ups
+        # Global CLI switch: if --disable_warmups is true, do nothing
         try:
             if globals().get("ARGS") is not None and getattr(ARGS, "disable_warmups", False):
                 print(f"[BIAS] epoch={int(getattr(trainer,'current_epoch',0))} DISABLED via --disable_warmups; skipping")
                 return
         except Exception:
             pass
-
         vol_loss = self._resolve_vol_loss(pl_module)
         if vol_loss is None:
             print("[BIAS] could not resolve vol loss; skipping warm-up tweaks")
             return
 
-        # Read last validation mean scale diagnostic
+        # read last validation mean scale diagnostic
         scale = None
         try:
             val = trainer.callback_metrics.get("val_mean_scale")
@@ -1628,14 +1632,11 @@ class BiasWarmupCallback(pl.Callback):
         except Exception:
             pass
 
-        # Smooth EMA of the mean scale (clamped step)
         if scale is not None:
             prev = self._scale_ema
-            # local import to avoid relying on global np
-            import numpy as _np
             beta = 0.9       # EMA smoothing
             rel_clip = 0.05  # clamp to ±5% per epoch
-            if (prev is None) or (not _np.isfinite(prev)):
+            if (prev is None) or (not np.isfinite(prev)):
                 self._scale_ema = float(scale)
             else:
                 ema = beta * float(prev) + (1.0 - beta) * float(scale)
@@ -1649,7 +1650,6 @@ class BiasWarmupCallback(pl.Callback):
         _decay_start = int((2.0/3.0) * MAX_EPOCHS)
         _epoch1 = e + 1
         _in_decay = (_epoch1 >= _decay_start)
-
         # ---- HOLD STEADY IN DECAY ----
         if _in_decay:
             # lock underestimation factor to a calm late value
@@ -1669,27 +1669,26 @@ class BiasWarmupCallback(pl.Callback):
             print(f"[BIAS] epoch={e} FROZEN: alpha=1.0 qlike_w={getattr(vol_loss, 'qlike_weight', 'n/a')} mean_bias={vol_loss.mean_bias_weight:.3f}")
             return
 
-        # Proportional (small) adjustment to alpha to avoid overshoot
+        # proportional (small) adjustment to alpha to avoid overshoot
         alpha = 1.0
         if self._scale_ema is not None:
-            import numpy as _np
-            err = _np.log(max(1e-6, self._scale_ema))   # log mean(y)/mean(p)
-            step = _np.clip(1.0 + self.alpha_step * err, 1.0 - self.alpha_step, 1.0 + self.alpha_step)
+            err = np.log(max(1e-6, self._scale_ema))   # log mean(y)/mean(p)
+            step = np.clip(1.0 + self.alpha_step * err, 1.0 - self.alpha_step, 1.0 + self.alpha_step)
             alpha = (1.0 + (self.target_under - 1.0) * prog) * step
             if self._scale_ema < 0.995:  # already over-predicting
                 alpha = min(alpha, 1.0)
         vol_loss.underestimation_factor = float(max(1.0, min(alpha, self.target_under)))
 
-        # Mean-bias gentle ramp
+        # mean-bias gentle ramp
         if e <= self.mean_bias_ramp_until:
             mb_prog = min(1.0, max(0.0, e / float(max(1, self.mean_bias_ramp_until))))
             vol_loss.mean_bias_weight = self.start_mean_bias + (self.target_mean_bias - self.start_mean_bias) * mb_prog
         else:
             vol_loss.mean_bias_weight = self.target_mean_bias
 
-        # QLIKE: only when calibration is roughly correct
+        # qlike: only when calibration is roughly correct
+        # qlike: only when calibration is roughly correct
         if hasattr(vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
-            import numpy as _np
             q_target = float(self.qlike_target_weight)
             q_prog   = min(1.0, float(e) / float(max(self.warm, 8)))
             near_ok  = (self._scale_ema is None) or (0.98 <= self._scale_ema <= 1.05)
@@ -1700,7 +1699,6 @@ class BiasWarmupCallback(pl.Callback):
             else:
                 vol_loss.qlike_weight = max(qlike_floor, 0.33 * q_target)  # gentle anchor when “closed”
 
-        # Pretty print current settings
         try:
             lr0 = trainer.optimizers[0].param_groups[0]["lr"]
         except Exception:
