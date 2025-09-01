@@ -4343,7 +4343,6 @@ try:
             test_dataloader,
             "test",
             test_pred_path,
-            vol_norm=vol_normalizer,
             id_to_name=metrics_cb.id_to_name,
             vol_norm=metrics_cb.vol_norm
         )
