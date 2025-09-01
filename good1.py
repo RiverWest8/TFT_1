@@ -3233,9 +3233,14 @@ if __name__ == "__main__":
         return fig
 
     tft.plot_prediction = MethodType(_blank_plot, tft)
-    resume_ckpt = get_resume_ckpt_path(args=ARGS) if getattr(ARGS, "resume", False) else None
-    if resume_ckpt:
-        print(f"↩️  Resuming from checkpoint: {resume_ckpt}")
+    # Resolve resume checkpoint if requested
+    resume_ckpt = None
+    if getattr(ARGS, "resume", False) or getattr(ARGS, "ckpt_path", None):
+        resume_ckpt = get_resume_ckpt_path(args=ARGS)
+        if resume_ckpt:
+            print(f"↩️  Resuming from checkpoint: {resume_ckpt}")
+        else:
+            print("[RESUME] --resume was set but no checkpoint found, starting fresh.")
     else:
         print("▶ Starting a fresh run (no resume)")
 
