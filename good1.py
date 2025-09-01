@@ -1514,7 +1514,7 @@ class PerAssetMetrics(pl.Callback):
 
             except Exception as e:
                 print(f"[WARN] Could not save validation predictions: {e}")
-import lightning.pytorch as pl
+
 
 class BiasWarmupCallback(pl.Callback):
     """
