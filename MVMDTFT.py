@@ -860,8 +860,15 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
 
     model.eval()
 
-    # Resolve normalizer from THIS dataset (good1 style: use dataset’s own)
-    vol_norm = _extract_norm_from_dataset(model.dataset)
+    try:
+        # prefer the normalizer bound to the loaded checkpoint model
+        vol_norm = _extract_norm_from_dataset(best_model.dataset)
+    except Exception:
+        try:
+            vol_norm = _extract_norm_from_dataset(model.dataset)  # some versions name it `model`
+        except Exception:
+            vol_norm = _extract_norm_from_dataset(dataloader.dataset)  # last-resort fallback`
+
 
     export_loader = make_export_loader(dataloader)
 
@@ -3912,7 +3919,7 @@ try:
     val_export_loader = make_export_loader(val_dataloader)
 
     # Get the volatility normalizer from the validation dataset
-    vol_norm_val = _extract_norm_from_dataset(val_export_loader.dataset)
+    vol_norm_val = _extract_norm_from_dataset(best_model.dataset)
 
     # 1) Collect a DataFrame of validation predictions (UNCALIBRATED)
     df_val_preds = _collect_predictions(
@@ -3994,7 +4001,7 @@ try:
             best_model = TemporalFusionTransformer.load_from_checkpoint(ckpt, map_location="cpu", weights_only=False)
 
     test_export_loader = make_export_loader(test_dataloader)
-    vol_norm_test = _extract_norm_from_dataset(test_export_loader.dataset)
+    vol_norm_test = _extract_norm_from_dataset(best_model.dataset)
 
     df_test_preds = _collect_predictions(
         best_model,
