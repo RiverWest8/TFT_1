@@ -2821,7 +2821,7 @@ EXTRA_CALLBACKS = [
           save_last=True,
       ),
       StochasticWeightAveraging(swa_lrs = 1e6 , annealing_epochs = 1, annealing_strategy="cos", swa_epoch_start=max(1, int(0.85 * MAX_EPOCHS))),
-      CosineLR(start_epoch=6, eta_min_ratio=1e-4, hold_last_epochs=2, warmup_steps=0),
+      CosineLR(start_epoch=8, eta_min_ratio=1e-4, hold_last_epochs=2, warmup_steps=0),
       ]
 
 class ValLossHistory(pl.Callback):
@@ -3699,7 +3699,7 @@ if __name__ == "__main__":
         attention_head_size=4,
         dropout=0.13, #0.0833704625250354,
         hidden_continuous_size=24, #0.0004
-        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.00087978), #0.0019 0017978
+        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.00037978), #0.0019 0017978
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
         output_size=[7, 1],  # 7 quantiles + 1 logit
@@ -3807,7 +3807,7 @@ if __name__ == "__main__":
             val_dataloader,
             "val",
             val_pred_path,
-            vol_norm=vol_normalizer,
+            vol_norm=metrics_cb.vol_norm,
             id_to_name=metrics_cb.id_to_name,
         )
         print(f"✓ Wrote validation parquet → {val_pred_path}")
@@ -3823,7 +3823,7 @@ if __name__ == "__main__":
             test_dataloader,
             "test",
             test_pred_path,
-            vol_norm=vol_normalizer,
+            vol_norm=metrics_cb.vol_norm,
             id_to_name=metrics_cb.id_to_name,
         )
         print(f"✓ Wrote test parquet → {test_pred_path}")
@@ -3964,7 +3964,7 @@ try:
         val_export_loader,
         "val",
         val_pred_path,
-        vol_norm=vol_normalizer,
+        vol_norm=metrics_cb.vol_norm,
         id_to_name=metrics_cb.id_to_name,
     )
     print(f"✓ Wrote validation parquet → {val_pred_path}")
@@ -4045,7 +4045,7 @@ try:
             test_export_loader,
             "test",
             test_pred_path,
-            vol_norm=vol_normalizer,
+            vol_norm=metrics_cb.vol_norm,
             id_to_name=metrics_cb.id_to_name,
         )
     except Exception as e:
