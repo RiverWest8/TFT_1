@@ -2326,13 +2326,10 @@ parser.add_argument("--prefetch_factor", type=int, default=8, help="DataLoader p
 parser.add_argument("--check_val_every_n_epoch", type=int, default=1, help="Validate every N epochs")
 parser.add_argument("--log_every_n_steps", type=int, default=200, help="How often to log train steps")
 parser.add_argument("--learning_rate", type=float, default=None, help="Override model learning rate")
-parser.add_argument(
-    "--resume",
-    type=lambda s: str(s).lower() in ("1","true","t","yes","y","on"),
-    default=False,                       # <— make default False
-    help="Resume from latest checkpoint if available"
-)
-parser.add_argument("--ckpt_path", type=str, default=None, help="Explicit checkpoint to resume from (overrides auto-detection)")
+parser.add_argument("--resume", action="store_true",
+                    help="Resume training from an automatically found checkpoint if available")
+parser.add_argument("--ckpt_path", type=str, default=None,
+                    help="Explicit checkpoint to resume from (overrides auto-detection)")
 # Quick-run subsetting for speed
 parser.add_argument("--train_max_rows", type=int, default=None, help="Limit number of rows in TRAIN for fast iterations")
 parser.add_argument("--val_max_rows", type=int, default=None, help="Limit number of rows in VAL (optional; default full)")
@@ -3760,6 +3757,7 @@ if __name__ == "__main__":
         print(f"↩️  Resuming from checkpoint: {resume_ckpt}")
     else:
         print("▶ Starting a fresh run (no resume)")
+    trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
 
     # Train the model
    
