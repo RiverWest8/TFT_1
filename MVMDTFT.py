@@ -861,7 +861,7 @@ def _save_predictions_from_best(trainer, dataloader, split_name: str, out_path: 
     model.eval()
 
     # Resolve normalizer from THIS dataset (good1 style: use dataset’s own)
-    vol_norm = _extract_norm_from_dataset(dataloader.dataset)
+    vol_norm = _extract_norm_from_dataset(model.dataset)
 
     export_loader = make_export_loader(dataloader)
 
@@ -2861,7 +2861,7 @@ EMBEDDING_CARDINALITY = {}
 
 BATCH_SIZE   = 128
 MAX_EPOCHS   = 35
-EARLY_STOP_PATIENCE = 9
+EARLY_STOP_PATIENCE = 15
 PERM_BLOCK_SIZE = 288
 
 # Artifacts are written locally then uploaded to GCS
