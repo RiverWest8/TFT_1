@@ -2671,28 +2671,14 @@ def run_permutation_importance(
 
 
 
-    # ---------- EXPORT PREDICTIONS (VAL + TEST) ----------
-    try:
-        val_pred_path  = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
-        test_pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
 
-        _export_split_from_best(trainer, val_dataloader,  "val",  val_pred_path)
-        print(f"✓ Wrote validation parquet → {val_pred_path}")
-        try:
-            upload_file_to_gcs(str(val_pred_path), f"{GCS_OUTPUT_PREFIX}/{val_pred_path.name}")
-        except Exception as e:
-            print(f"[WARN] Could not upload validation parquet: {e}")
-
-        _export_split_from_best(trainer, test_dataloader, "test", test_pred_path)
-        print(f"✓ Wrote test parquet → {test_pred_path}")
-        try:
-            upload_file_to_gcs(str(test_pred_path), f"{GCS_OUTPUT_PREFIX}/{test_pred_path.name}")
-        except Exception as e:
-            print(f"[WARN] Could not upload test parquet: {e}")
 
     except Exception as e:
         print(f"[WARN] Final export failed: {e}")
 # Data preparation
+
+ 
+
 # -----------------------------------------------------------------------
 if __name__ == "__main__":
     print(
@@ -3375,6 +3361,31 @@ def _collect_test_predictions(model, dl, id_to_name, vol_norm):
         "direction":         yd_list[:L],
         "pred_direction":    pd_list[:L],
     })
+
+
+# ---------- EXPORT PREDICTIONS (VAL + TEST) FROM BEST CHECKPOINT ----------
+try:
+    # Validation parquet (uncalibrated canonical export)
+    val_pred_path  = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+    _export_split_from_best(trainer, val_dataloader, "val", val_pred_path)
+    print(f"✓ Wrote validation parquet → {val_pred_path}")
+    try:
+        upload_file_to_gcs(str(val_pred_path), f"{GCS_OUTPUT_PREFIX}/{val_pred_path.name}")
+    except Exception as e:
+        print(f"[WARN] Could not upload validation parquet: {e}")
+
+    # Test parquet (uncalibrated canonical export)
+    test_pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+    _export_split_from_best(trainer, test_dataloader, "test", test_pred_path)
+    print(f"✓ Wrote test parquet → {test_pred_path}")
+    try:
+        upload_file_to_gcs(str(test_pred_path), f"{GCS_OUTPUT_PREFIX}/{test_pred_path.name}")
+    except Exception as e:
+        print(f"[WARN] Could not upload test parquet: {e}")
+
+except Exception as e:
+    print(f"[WARN] Final export failed: {e}")
+
 
 # Build dataframe of predictions and compute TEST metrics on decoded scale
 try:
