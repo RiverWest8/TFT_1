@@ -167,7 +167,7 @@ Q95_IDX = VOL_QUANTILES.index(0.95)
 EVAL_VOL_FLOOR = 1e-6
 
 # Composite metric weights (override via --metric_weights "w_mae,w_rmse,w_qlike")
-COMP_WEIGHTS = (1.0, 1.0, 0.333)  # default: slightly emphasise QLIKE for RV focus
+COMP_WEIGHTS = (1.0, 1.0, 0.004)  # default: slightly emphasise QLIKE for RV focus
 
 def composite_score(mae, rmse, qlike,
                     b_mae=None, b_rmse=None, b_qlike=None,
@@ -1439,6 +1439,7 @@ class PerAssetMetrics(pl.Callback):
                     df_out["y_dir_prob"] = pdp[:Lm].numpy().tolist()
                 # --- Attach real timestamps from a source DataFrame, if available ---
                 try:
+                    pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
                     # Look for a likely source dataframe that contains ['asset','time_idx','Time']
                     candidate_names = ["val_df"]
                     src_df = None
