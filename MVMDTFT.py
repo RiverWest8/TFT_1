@@ -831,7 +831,6 @@ def make_export_loader(dl):
     )
 
 @torch.no_grad()
-@torch.no_grad()
 def _save_predictions_from_best(
     trainer,
     dataloader,
@@ -869,9 +868,39 @@ def _save_predictions_from_best(
 
     model.eval()
 
-    # 🔧 FIX: require caller to pass vol_norm (from training_dataset)
+    # 🔧 Resolve TRAIN normalizer automatically if not provided
     if vol_norm is None:
-        raise RuntimeError("vol_norm must be provided from training_dataset.")
+        export_vol_norm = None
+        # 1) Prefer the dataset baked into the loaded checkpoint
+        try:
+            ds = getattr(model, "dataset", None)
+            if ds is not None:
+                export_vol_norm = _extract_norm_from_dataset(ds)
+        except Exception:
+            export_vol_norm = None
+        # 2) Fallback: a direct attribute on the model
+        if export_vol_norm is None:
+            try:
+                export_vol_norm = getattr(model, "vol_norm", None)
+            except Exception:
+                export_vol_norm = None
+        # 3) Last resort: infer from the dataloader's dataset
+        if export_vol_norm is None:
+            try:
+                export_vol_norm = _extract_norm_from_dataset(getattr(dataloader, "dataset", None))
+            except Exception:
+                export_vol_norm = None
+        vol_norm = export_vol_norm
+        if vol_norm is None:
+            raise RuntimeError("Could not resolve training normalizer for export (vol_norm).")
+
+    try:
+        print("[EXPORT] Using normalizer:", type(vol_norm).__name__,
+              "transformation=", getattr(vol_norm, "transformation", None),
+              "center=", getattr(vol_norm, "center", None),
+              "scale_by_group=", getattr(vol_norm, "scale_by_group", None))
+    except Exception:
+        pass
 
     export_loader = make_export_loader(dataloader)
 
