@@ -376,11 +376,12 @@ def _extract_heads(pred):
 @torch.no_grad()
 def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     """
-    Minimal, self-contained export:
-    - Loads the best checkpoint
-    - Predicts on `dataloader`
-    - Decodes realised_vol to physical scale
-    - Harmonises columns and writes parquet to `out_path`
+    Minimal, self-contained export that is robust to various PF/Lightning return layouts:
+      • Loads the best checkpoint
+      • Predicts in raw mode and iterates per-batch
+      • Extracts groups/time/targets from each batch dict
+      • Decodes realised_vol using the TRAIN normalizer
+      • Writes a harmonised parquet with columns: asset, time_idx, y_vol, y_vol_pred, y_dir_prob (optional)
     """
     # 1) Find best checkpoint
     best_ckpt = None
@@ -391,7 +392,6 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
                     best_ckpt = cb.best_model_path
                     break
     if best_ckpt is None:
-        # fallback: latest local ckpt
         try:
             cks = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
             if cks:
@@ -406,112 +406,160 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     best_model = LM.load_from_checkpoint(best_ckpt)
     best_model.eval().to(trainer.lightning_module.device)
 
-    # 3) Grab id->name map from your PerAssetMetrics (so assets are readable)
+    # 3) id->name map from PerAssetMetrics if available
     metrics_cb = None
     for cb in getattr(trainer, "callbacks", []):
         if isinstance(cb, PerAssetMetrics):
             metrics_cb = cb
             break
-    if metrics_cb is None:
-        raise RuntimeError("PerAssetMetrics callback not found; id->name map unavailable.")
+    id_to_name = None
+    if metrics_cb is not None:
+        id_to_name = {int(k): str(v) for k, v in metrics_cb.id_to_name.items()}
+    else:
+        # fallback: identity mapping added later if needed
+        id_to_name = {}
 
-    id_to_name = {int(k): str(v) for k, v in metrics_cb.id_to_name.items()}
-
-    # 4) Normalizer for decoding realised_vol
+    # 4) Resolve TRAIN normalizer for decoding realised_vol
+    vol_norm = None
     try:
-        vol_norm = _extract_norm_from_dataset(best_model.dataset)
+        vol_norm = _extract_norm_from_dataset(getattr(best_model, "dataset", None))
     except Exception:
         vol_norm = None
+    if vol_norm is None:
+        try:
+            vol_norm = _extract_norm_from_dataset(getattr(dataloader, "dataset", None))
+        except Exception:
+            vol_norm = None
 
-    # 5) Predict in raw mode so we can access group ids / time_idx
-    raw_preds, x = best_model.predict(dataloader, mode="raw", return_x=True)
-    # Flatten predictions if they come batched as a list
-    if isinstance(raw_preds, (list, tuple)):
-        preds = []
-        for rp in raw_preds:
-            rp = rp["prediction"] if isinstance(rp, dict) and "prediction" in rp else rp
-            preds.append(rp)
-        pred_all = torch.cat(preds, dim=0)
-    else:
-        pred_all = raw_preds["prediction"] if isinstance(raw_preds, dict) and "prediction" in raw_preds else raw_preds
+    # 5) Predict in raw mode; handle multiple return layouts
+    raw_preds, raw_x = best_model.predict(dataloader, mode="raw", return_x=True)
 
-    # 6) Groups (asset ids)
-    groups = None
-    if isinstance(x, dict):
+    # Normalise to per-batch lists for easier zipping
+    def _to_list(obj):
+        if isinstance(obj, (list, tuple)):
+            return list(obj)
+        return [obj]
+
+    preds_list = _to_list(raw_preds)
+    x_list = _to_list(raw_x)
+
+    # If a single big tensor dict was returned for preds but x is list, replicate once per batch length
+    if len(preds_list) == 1 and isinstance(preds_list[0], (dict, torch.Tensor)) and len(x_list) > 1:
+        preds_list = preds_list * len(x_list)
+
+    # Accumulators
+    assets_all, t_all = [], []
+    y_true_all, y_pred_all, y_dirprob_all = [], [], []
+
+    # Helper: extract x dict from a batch container
+    def _get_x(b):
+        if isinstance(b, dict):
+            return b
+        if isinstance(b, (list, tuple)) and len(b) >= 1 and isinstance(b[0], dict):
+            return b[0]
+        return None
+
+    # Iterate batches
+    for pred_b, xb in zip(preds_list, x_list):
+        x = _get_x(xb)
+        if x is None:
+            continue
+
+        # Resolve prediction tensor for this batch
+        if isinstance(pred_b, dict) and "prediction" in pred_b:
+            pred_t = pred_b["prediction"]
+        else:
+            pred_t = pred_b
+        if pred_t is None:
+            continue
+
+        # Groups (asset ids)
+        g = None
         for k in ("groups", "group_ids", "group_id"):
             if k in x and x[k] is not None:
-                groups = x[k]
+                g = x[k]
                 break
-    if groups is None and isinstance(x, list) and x and isinstance(x[0], dict):
-        chunks = []
-        for xb in x:
-            g = xb.get("groups") or xb.get("group_ids") or xb.get("group_id")
-            if g is not None:
-                chunks.append(g[0] if isinstance(g, (list, tuple)) else g)
-        if chunks:
-            groups = torch.cat([c.reshape(-1) for c in chunks], dim=0)
-    if groups is None:
-        raise RuntimeError("Could not extract group ids during export.")
+        if g is None:
+            continue
+        if isinstance(g, (list, tuple)) and len(g) > 0:
+            g = g[0]
+        while torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
+            g = g.squeeze(-1)
+        if not torch.is_tensor(g):
+            continue
+        L = g.shape[0]
 
-    # 7) Extract median vol and probs for direction
-    p_vol_enc, p_dir = _extract_heads(pred_all)
-    if p_vol_enc is None:
-        raise RuntimeError("Export failed: could not parse vol head.")
-
-    # 8) Decode vol to physical scale
-    g = groups
-    while torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
-        g = g.squeeze(-1)
-    g = g.reshape(-1)
-    if vol_norm is not None:
-        y_vol_pred = safe_decode_vol(p_vol_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
-    else:
-        y_vol_pred = p_vol_enc  # fallback
-
-    # 9) True targets if provided
-    y_vol_true = None
-    if isinstance(x, dict) and "decoder_target" in x and torch.is_tensor(x["decoder_target"]):
-        yt = x["decoder_target"]
-        if yt.ndim == 3 and yt.size(-1) >= 1:
-            yt = yt[:, 0, 0]
-        elif yt.ndim == 2:
-            yt = yt[:, 0]
-        if vol_norm is not None:
-            y_vol_true = safe_decode_vol(yt.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+        # Time index (optional)
+        t = x.get("decoder_time_idx") or x.get("decoder_relative_idx")
+        if torch.is_tensor(t):
+            while t.ndim > 1 and t.size(-1) == 1:
+                t = t.squeeze(-1)
+            t = t.reshape(-1)[:L]
         else:
-            y_vol_true = yt
+            t = None
 
-    # 10) Direction → probability in [0,1]
-    y_dir_prob = None
-    if p_dir is not None and torch.is_tensor(p_dir):
-        y_dir_prob = p_dir
-        try:
-            if torch.isfinite(y_dir_prob).any() and (y_dir_prob.min() < 0 or y_dir_prob.max() > 1):
+        # Extract heads
+        p_vol_enc, p_dir = _extract_heads(pred_t)
+        if p_vol_enc is None:
+            continue
+        p_vol_enc = p_vol_enc.reshape(-1)[:L]
+
+        # Decode vol
+        if vol_norm is not None:
+            y_vol_pred = safe_decode_vol(p_vol_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+        else:
+            y_vol_pred = p_vol_enc
+
+        # True targets (optional)
+        y_vol_true = None
+        dec_t = x.get("decoder_target")
+        if torch.is_tensor(dec_t):
+            yt = dec_t
+            if yt.ndim == 3 and yt.size(-1) >= 1:
+                yt = yt[:, 0, 0]
+            elif yt.ndim == 2:
+                yt = yt[:, 0]
+            if vol_norm is not None:
+                y_vol_true = safe_decode_vol(yt.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+            else:
+                y_vol_true = yt
+
+        # Direction → probability in [0,1]
+        y_dir_prob = None
+        if p_dir is not None and torch.is_tensor(p_dir):
+            y_dir_prob = p_dir.reshape(-1)[:L]
+            try:
+                if torch.isfinite(y_dir_prob).any() and (y_dir_prob.min() < 0 or y_dir_prob.max() > 1):
+                    y_dir_prob = torch.sigmoid(y_dir_prob)
+            except Exception:
                 y_dir_prob = torch.sigmoid(y_dir_prob)
-        except Exception:
-            y_dir_prob = torch.sigmoid(y_dir_prob)
-        y_dir_prob = torch.clamp(y_dir_prob, 0.0, 1.0)
+            y_dir_prob = torch.clamp(y_dir_prob, 0.0, 1.0)
 
-    # 11) Build dataframe
-    assets = [id_to_name.get(int(i), str(int(i))) for i in g.detach().cpu().tolist()]
-    time_idx = None
-    if isinstance(x, dict) and "decoder_time_idx" in x and torch.is_tensor(x["decoder_time_idx"]):
-        ti = x["decoder_time_idx"]
-        while ti.ndim > 1 and ti.size(-1) == 1:
-            ti = ti.squeeze(-1)
-        time_idx = ti.detach().cpu().numpy().tolist()
-    else:
-        time_idx = [None] * len(assets)
+        # Map asset ids → names
+        aset = [id_to_name.get(int(i), str(int(i))) for i in g.detach().cpu().tolist()]
 
+        # Append accumulators
+        assets_all.extend(aset)
+        t_all.extend(t.detach().cpu().tolist() if isinstance(t, torch.Tensor) else [None] * L)
+        y_pred_all.extend(y_vol_pred.detach().cpu().tolist())
+        if y_vol_true is not None:
+            y_true_all.extend(y_vol_true.detach().cpu().tolist())
+        else:
+            y_true_all.extend([None] * L)
+        if y_dir_prob is not None:
+            y_dirprob_all.extend(y_dir_prob.detach().cpu().tolist())
+        else:
+            y_dirprob_all.extend([None] * L)
+
+    # Build dataframe
+    import pandas as pd
     df = pd.DataFrame({
-        "asset": assets,
-        "time_idx": time_idx,
-        "y_vol_pred": y_vol_pred.detach().cpu().numpy(),
+        "asset": assets_all,
+        "time_idx": t_all,
+        "y_vol": y_true_all,
+        "y_vol_pred": y_pred_all,
+        "y_dir_prob": y_dirprob_all,
     })
-    if y_vol_true is not None:
-        df["y_vol"] = y_vol_true.detach().cpu().numpy()
-    if y_dir_prob is not None:
-        df["y_dir_prob"] = y_dir_prob.detach().cpu().numpy()
 
     # Try to attach actual 'Time' if a compatible source df is cached
     try:
@@ -536,10 +584,10 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     except Exception as e:
         print(f"[WARN] Could not attach Time column: {e}")
 
-    # 12) Save parquet + optional GCS upload
+    # Save parquet
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_path, index=False)
-
+    print(f"✓ Wrote {split.upper()} predictions → {out_path}")
     
 
 
@@ -1337,9 +1385,13 @@ class PerAssetMetrics(pl.Callback):
                             "raw_df, raw_data, full_df, df (also checked val_df/train_df/test_df)."
                         )
                 except Exception as e:
-                    print(f"[WARN] Failed to attach real timestamps: {e}")
                     pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
                     df_out.to_parquet(pred_path, index=False)
+                    print(f"✓ Saved validation predictions (Parquet) → {pred_path}")
+                    try:
+                        upload_file_to_gcs(str(pred_path), f"{GCS_OUTPUT_PREFIX}/{pred_path.name}")
+                    except Exception as e:
+                        print(f"[WARN] Could not upload validation predictions: {e}")
                 print(f"✓ Saved validation predictions (Parquet) → {pred_path}")
 
                 try:
@@ -2987,7 +3039,7 @@ if __name__ == "__main__":
         attention_head_size=4,
         dropout=0.13, #0.0833704625250354,
         hidden_continuous_size=24,
-        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.00035), #0.0019 0017978
+        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.00085), #0.0019 0017978
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
         output_size=[7, 1],  # 7 quantiles + 1 logit
@@ -3015,7 +3067,7 @@ if __name__ == "__main__":
     val_hist_cb  = ValLossHistory(val_hist_csv)
 
 
-    cosine_cb = CosineLR(start_epoch=9, min_lr=1e-4)
+    cosine_cb = CosineLR(start_epoch=9, min_lr=3.5e-5)
 
 
     # ----------------------------
@@ -3363,10 +3415,10 @@ def _collect_test_predictions(model, dl, id_to_name, vol_norm):
     })
 
 
-# ---------- EXPORT PREDICTIONS (VAL + TEST) FROM BEST CHECKPOINT ----------
+# ---------- EXPORT PREDICTIONS FROM BEST CHECKPOINT ----------
 try:
-    # Validation parquet (uncalibrated canonical export)
-    val_pred_path  = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+    # VAL parquet (uncalibrated canonical export)
+    val_pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
     _export_split_from_best(trainer, val_dataloader, "val", val_pred_path)
     print(f"✓ Wrote validation parquet → {val_pred_path}")
     try:
@@ -3374,7 +3426,7 @@ try:
     except Exception as e:
         print(f"[WARN] Could not upload validation parquet: {e}")
 
-    # Test parquet (uncalibrated canonical export)
+    # TEST parquet (uncalibrated canonical export)
     test_pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
     _export_split_from_best(trainer, test_dataloader, "test", test_pred_path)
     print(f"✓ Wrote test parquet → {test_pred_path}")
