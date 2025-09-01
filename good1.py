@@ -2112,36 +2112,126 @@ class TailWeightRamp(pl.Callback):
 
 
 class CosineLR(pl.Callback):
-    def __init__(self, start_epoch=8, min_lr=5.5e-5):
+    """
+    Cosine decay that ends at a near-zero floor, with an optional final hold
+    at the floor. This version updates **per training batch** so the last
+    training step lands at the cosine minimum.
+
+    Args:
+        start_epoch: Epoch index (0-based) to begin cosine decay. Before this,
+            LR stays at the base LR.
+        eta_min_ratio: Final LR is base_lr * eta_min_ratio per param group.
+        hold_last_epochs: Number of final epochs to hold LR at the floor
+            (converted to steps at runtime) to settle in the minima.
+        warmup_steps: Optional number of warmup steps (linear 0→1) before cosine.
+    """
+    def __init__(
+        self,
+        start_epoch: int = 8,
+        eta_min_ratio: float = 1e-5,
+        hold_last_epochs: int = 1,
+        warmup_steps: int | None = None,
+    ):
         super().__init__()
         self.start_epoch = int(start_epoch)
-        self.min_lr = float(min_lr)
-        self._schedulers = None
-        self._tmax = None
+        self.eta_min_ratio = float(eta_min_ratio)
+        self.hold_last_epochs = int(max(0, hold_last_epochs))
+        self.warmup_steps = None if warmup_steps is None else int(max(0, warmup_steps))
+
+        # resolved at fit start
+        self._base_lrs = None
+        self._eta_mins = None
+        self._total_steps = None
+        self._steps_per_epoch = None
+        self._start_steps = None
+        self._hold_last_steps = None
+        self._cosine_span = None
 
     def on_fit_start(self, trainer, pl_module):
-        # Create a CosineAnnealingLR for each optimizer, but only step it from start_epoch onwards
-        max_epochs = int(getattr(trainer, "max_epochs", 0))
-        self._tmax = max(1, max_epochs - self.start_epoch)
-        self._schedulers = []
+        # Snapshot base LRs and per-group eta_min
+        self._base_lrs = []
         for opt in trainer.optimizers:
-            sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self._tmax, eta_min=self.min_lr)
-            self._schedulers.append(sched)
+            for pg in opt.param_groups:
+                self._base_lrs.append(float(pg.get("lr", 1e-3)))
+        self._eta_mins = [lr * self.eta_min_ratio for lr in self._base_lrs]
 
-    def on_train_epoch_start(self, trainer, pl_module):
-        # Smooth cosine decay starting from start_epoch (inclusive)
-        e = int(getattr(trainer, "current_epoch", 0))
-        if (self._schedulers is None) or (e < self.start_epoch):
+        max_epochs = int(getattr(trainer, "max_epochs", 1) or 1)
+
+        # Prefer Lightning’s estimate of total steps
+        total_steps = getattr(trainer, "estimated_stepping_batches", None)
+        if total_steps is None:
+            # Fallback: steps/epoch * epochs
+            try:
+                steps_per_epoch = int(getattr(trainer, "num_training_batches", 0) or 0)
+            except Exception:
+                steps_per_epoch = 0
+            if steps_per_epoch <= 0:
+                steps_per_epoch = 1
+            total_steps = steps_per_epoch * max_epochs
+
+        self._total_steps = int(total_steps)
+        self._steps_per_epoch = max(1, self._total_steps // max_epochs)
+
+        # Convert epoch-based knobs to steps
+        self._start_steps = int(self.start_epoch * self._steps_per_epoch)
+        self._hold_last_steps = int(self.hold_last_epochs * self._steps_per_epoch)
+
+        # Warmup default
+        if self.warmup_steps is None:
+            self.warmup_steps = 0
+
+        # Cosine span (exclude pre-cosine + hold)
+        self._cosine_span = max(1, self._total_steps - self._start_steps - self._hold_last_steps)
+
+        print(
+            f"[LR Cosine(step)] total_steps={self._total_steps} steps/epoch={self._steps_per_epoch} "
+            f"start_epoch={self.start_epoch} (start_steps={self._start_steps}) hold_last_epochs={self.hold_last_epochs} "
+            f"(hold_last_steps={self._hold_last_steps}) eta_min_ratio={self.eta_min_ratio} warmup_steps={self.warmup_steps}"
+        )
+
+    def _set_lrs(self, trainer, factor: float):
+        # factor in [0,1]: 1→base_lr, 0→eta_min
+        i = 0
+        for opt in trainer.optimizers:
+            for pg in opt.param_groups:
+                base_lr = self._base_lrs[i]
+                eta_min = self._eta_mins[i]
+                lr = eta_min + (base_lr - eta_min) * float(max(0.0, min(1.0, factor)))
+                pg["lr"] = float(lr)
+                i += 1
+
+    def _compute_factor(self, step: int) -> float:
+        # Warmup (optional)
+        if self.warmup_steps and step < self.warmup_steps:
+            return float(step) / float(max(1, self.warmup_steps))
+
+        # Before cosine starts
+        if step < self._start_steps:
+            return 1.0
+
+        # Hold at floor for last K steps
+        if step >= self._total_steps - self._hold_last_steps:
+            return 0.0
+
+        # Cosine phase
+        t = float(step - self._start_steps + 1) / float(max(1, self._cosine_span))
+        t = min(max(t, 0.0), 1.0)
+        return 0.5 * (1.0 + math.cos(math.pi * t))
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        if self._total_steps is None:
             return
-        # Map epoch e -> scheduler step index (1-based so we actually decay at start_epoch)
-        step_idx = (e - self.start_epoch) + 1
-        for sched in self._schedulers:
-            sched.step(step_idx)
-        try:
-            print(f"[LR CosineBuiltin] epoch={e} lr={trainer.optimizers[0].param_groups[0]['lr']:.6g}")
-        except Exception:
-            pass
-
+        step = int(getattr(trainer, "global_step", 0))
+        step = min(max(step, 0), self._total_steps)  # clamp
+        factor = self._compute_factor(step)
+        self._set_lrs(trainer, factor)
+        # Optional sparse logs:
+        # if step % max(1, self._steps_per_epoch) == 0:
+        #     try:
+        #         print(f"[LR Cosine(step)] step={step}/{self._total_steps} factor={factor:.4f} "
+        #               f"lr={trainer.optimizers[0].param_groups[0]['lr']:.6g}")
+        #     except Exception:
+        #         pass
 class ReduceLROnPlateauCallback(pl.Callback):
     def __init__(self, monitor="val_comp_overall", factor=0.5, patience=5, min_lr=1e-5, cooldown=0, stop_after_epoch=9):
         self.monitor, self.factor, self.patience, self.min_lr, self.cooldown = monitor, factor, patience, min_lr, cooldown
