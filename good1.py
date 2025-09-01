@@ -992,12 +992,14 @@ class PerAssetMetrics(pl.Callback):
 
     def reset(self):
         # device-resident accumulators (concatenate at epoch end)
-        self._g_dev = []   # group ids per sample (device, flattened)
-        self._yv_dev = []  # realised vol target (NORMALISED, device)
-        self._pv_dev = []  # realised vol pred   (NORMALISED, device)
-        self._yd_dev = []  # direction target (device)
-        self._pd_dev = []  # direction pred logits/probs (device)
-        self._t_dev = []   # decoder time_idx (device) if provided
+        self._g_dev = []    # group ids per sample (device, flattened)
+        self._yv_dev = []   # realised vol target (NORMALISED, device)
+        self._pv_dev = []   # realised vol pred   (NORMALISED, device) - median (q50)
+        self._pq05_dev = [] # realised vol pred   (NORMALISED, device) - q05
+        self._pq95_dev = [] # realised vol pred   (NORMALISED, device) - q95
+        self._yd_dev = []   # direction target (device)
+        self._pd_dev = []   # direction pred logits/probs (device)
+        self._t_dev = []    # decoder time_idx (device) if provided
         # cached final rows/overall from last epoch
         self._last_rows = None
         self._last_overall = None
@@ -1092,11 +1094,24 @@ class PerAssetMetrics(pl.Callback):
         if p_vol is None:
             return  # nothing usable in this batch
 
+        # --- ALSO capture q05 and q95 for uncertainty bands ---
+        vol_q = _extract_vol_quantiles(pred)
+        q05_b, q95_b = None, None
+        if torch.is_tensor(vol_q) and vol_q.ndim == 2 and vol_q.size(1) >= (max(Q05_IDX, Q95_IDX) + 1):
+            # enforce monotone quantiles and select indices
+            vol_q = torch.cummax(vol_q, dim=-1).values
+            q05_b = vol_q[:, Q05_IDX]
+            q95_b = vol_q[:, Q95_IDX]
+
         # Store device tensors; no decode/CPU here
         L = g.shape[0]
         self._g_dev.append(g.reshape(L))
         self._yv_dev.append(y_vol_t.reshape(L))
         self._pv_dev.append(p_vol.reshape(L))
+        if q05_b is not None:
+            self._pq05_dev.append(q05_b.reshape(L))
+        if q95_b is not None:
+            self._pq95_dev.append(q95_b.reshape(L))
 
         # capture time index if available and shape-compatible
         if dec_time is not None and torch.is_tensor(dec_time):
@@ -1412,18 +1427,43 @@ class PerAssetMetrics(pl.Callback):
             if g_cpu is not None and yv_cpu is not None and pv_cpu is not None:
                 yv_dec = self.vol_norm.decode(yv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
                 pv_dec = self.vol_norm.decode(pv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
-                # Apply the same calibration used in metrics so saved preds match the plots
+
+                # Optional: decode q05/q95 if collected
+                q05_dec = q95_dec = None
+                if self._pq05_dev:
+                    pq05_cpu = torch.cat(self._pq05_dev).detach().cpu()
+                    q05_dec = self.vol_norm.decode(pq05_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
+                if self._pq95_dev:
+                    pq95_cpu = torch.cat(self._pq95_dev).detach().cpu()
+                    q95_dec = self.vol_norm.decode(pq95_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
+
+                # Apply the same calibration used in metrics to the median so parquet matches plots
                 pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
+
                 # map group id -> name
                 assets = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
                 # time index (may be missing)
                 t_cpu = torch.cat(self._t_dev).detach().cpu() if self._t_dev else None
+
+                # Build dataframe including 90% interval (q05, q95)
                 df_out = pd.DataFrame({
                     "asset": assets,
                     "time_idx": t_cpu.numpy().tolist() if t_cpu is not None else [None] * len(assets),
                     "y_vol": yv_dec.numpy().tolist(),
-                    "y_vol_pred": pv_dec.numpy().tolist(),
+                    "y_vol_pred": pv_dec.numpy().tolist(),          # point forecast ~ q50 (calibrated)
                 })
+
+                # Attach quantile columns if available (decoded)
+                if q05_dec is not None:
+                    df_out["y_vol_pred_q05"] = q05_dec.numpy().tolist()
+                else:
+                    df_out["y_vol_pred_q05"] = [None] * len(df_out)
+                # q50 column mirrors the (calibrated) point forecast for convenience
+                df_out["y_vol_pred_q50"] = df_out["y_vol_pred"]
+                if q95_dec is not None:
+                    df_out["y_vol_pred_q95"] = q95_dec.numpy().tolist()
+                else:
+                    df_out["y_vol_pred_q95"] = [None] * len(df_out)
                 if yd_cpu is not None and pdir_cpu is not None and yd_cpu.numel() > 0 and pdir_cpu.numel() > 0:
                     # ensure pdir is probability
                     pdp = pdir_cpu
@@ -1437,57 +1477,43 @@ class PerAssetMetrics(pl.Callback):
                     df_out = df_out.iloc[:Lm].copy()
                     df_out["y_dir"] = yd_cpu[:Lm].numpy().tolist()
                     df_out["y_dir_prob"] = pdp[:Lm].numpy().tolist()
-                # --- Attach real timestamps from a source DataFrame, if available ---
+            # --- Write validation predictions parquet once (with optional Time merge) ---
+            pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+            try:
+                # Optional: merge real timestamps from val_df if available
                 try:
-                    pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
-                    # Look for a likely source dataframe that contains ['asset','time_idx','Time']
-                    candidate_names = ["val_df"]
-                    src_df = None
-                    for _name in candidate_names:
-                        obj = globals().get(_name)
-                        if isinstance(obj, pd.DataFrame) and {"asset", "time_idx", "Time"}.issubset(obj.columns):
-                            src_df = obj[["asset", "time_idx", "Time"]].copy()
-                            break
-                    if src_df is not None:
-                        # Harmonise dtypes prior to merge
-                        src_df["asset"] = src_df["asset"].astype(str)
-                        src_df["time_idx"] = pd.to_numeric(src_df["time_idx"], errors="coerce").astype("Int64").astype("int64")
+                    import pandas as pd  # ensure pd is bound
+                    if "val_df" in globals() and isinstance(val_df, pd.DataFrame) and {"asset","time_idx","Time"}.issubset(val_df.columns):
+                        src = val_df[["asset","time_idx","Time"]].copy()
+                        # harmonise dtypes before merge
+                        src["asset"] = src["asset"].astype(str)
+                        src["time_idx"] = pd.to_numeric(src["time_idx"], errors="coerce").astype("Int64").astype("int64")
                         df_out["asset"] = df_out["asset"].astype(str)
                         df_out["time_idx"] = pd.to_numeric(df_out["time_idx"], errors="coerce").astype("Int64").astype("int64")
 
-                        # Merge on ['asset','time_idx'] to bring in the real Time column
-                        df_out = df_out.merge(src_df, on=["asset", "time_idx"], how="left", validate="m:1")
+                        df_out = df_out.merge(src, on=["asset","time_idx"], how="left", validate="m:1")
 
-                        # Coerce Time to timezone-naive pandas datetimes
+                        # normalise Time dtype (tz-naive)
                         df_out["Time"] = pd.to_datetime(df_out["Time"], errors="coerce")
                         try:
-                            # If tz-aware, drop timezone info; if already naive this may raise — ignore
                             df_out["Time"] = df_out["Time"].dt.tz_localize(None)
                         except Exception:
                             pass
                     else:
-                        print(
-                            "[WARN] Could not locate a source dataframe with ['asset','time_idx','Time'] among candidates: "
-                            "raw_df, raw_data, full_df, df (also checked val_df/train_df/test_df)."
-                        )
+                        print("[WARN] No usable val_df with ['asset','time_idx','Time']; saving without Time column.")
                 except Exception as e:
-                    pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
-                    df_out.to_parquet(pred_path, index=False)
-                    print(f"✓ Saved validation predictions (Parquet) → {pred_path}")
-                    try:
-                        upload_file_to_gcs(str(pred_path), f"{GCS_OUTPUT_PREFIX}/{pred_path.name}")
-                    except Exception as e:
-                        print(f"[WARN] Could not upload validation predictions: {e}")
-                print(f"✓ Saved validation predictions (Parquet) → {pred_path}")
+                    print(f"[WARN] Time merge skipped: {e}")
 
+                # Save once, then upload once
+                df_out.to_parquet(pred_path, index=False)
+                print(f"✓ Saved validation predictions (Parquet) → {pred_path}")
                 try:
                     upload_file_to_gcs(str(pred_path), f"{GCS_OUTPUT_PREFIX}/{pred_path.name}")
                 except Exception as e:
                     print(f"[WARN] Could not upload validation predictions: {e}")
 
-        except Exception as e:
-            print(f"[WARN] Could not save validation predictions: {e}")
-
+            except Exception as e:
+                print(f"[WARN] Could not save validation predictions: {e}")
 import lightning.pytorch as pl
 
 class BiasWarmupCallback(pl.Callback):
@@ -1497,6 +1523,7 @@ class BiasWarmupCallback(pl.Callback):
     • EMA of mean(y)/mean(p) steers underestimation bias (alpha).
     • Warm-ups are frozen if validation worsens for `guard_patience` epochs.
     • QLIKE ramps only when scale is near 1 to avoid fighting calibration.
+    scale_ema_alpha (default 0.6) controls how quickly the EMA of mean(y)/mean(p) adapts; higher values react faster.
     """
     def __init__(
         self,
@@ -1510,6 +1537,7 @@ class BiasWarmupCallback(pl.Callback):
         guard_patience: int = 2,
         guard_tol: float = 0.0,
         alpha_step: float = 0.05,
+        scale_ema_alpha: float = 0.99,
     ):
         super().__init__()
         self._vol_loss_hint = vol_loss
@@ -1522,6 +1550,7 @@ class BiasWarmupCallback(pl.Callback):
         self.guard_patience = int(max(1, guard_patience))
         self.guard_tol = float(guard_tol)
         self.alpha_step = float(alpha_step)
+        self.scale_ema_alpha = float(max(1e-6, min(1.0, scale_ema_alpha)))
 
         self._scale_ema = None
         self._prev_val = None
@@ -1546,7 +1575,7 @@ class BiasWarmupCallback(pl.Callback):
         return None
 
     def on_validation_end(self, trainer, pl_module):
-        val = trainer.callback_metrics.get("val_loss") or trainer.callback_metrics.get("val_qlike_overall")
+        val = trainer.callback_metrics.get("val_loss") or trainer.callback_metrics.get("val_mae_overall")
         try:
             val = float(val.item() if hasattr(val, "item") else val)
         except Exception:
@@ -1562,6 +1591,16 @@ class BiasWarmupCallback(pl.Callback):
             self._frozen = True
         if self._worse_streak == 0:  # improved or equal
             self._frozen = False
+
+        # Fast EMA update using the latest validation mean scale (speeds convergence)
+        try:
+            vms = trainer.callback_metrics.get("val_mean_scale", None)
+            if vms is not None:
+                s = float(vms.item() if hasattr(vms, "item") else vms)
+                a = getattr(self, "scale_ema_alpha", 0.005)
+                self._scale_ema = s if (self._scale_ema is None) else (1.0 - a) * self._scale_ema + a * s
+        except Exception:
+            pass
 
     def on_train_epoch_start(self, trainer, pl_module):
         # Global CLI switch: if --disable_warmups is true, do nothing
@@ -1586,18 +1625,40 @@ class BiasWarmupCallback(pl.Callback):
             pass
 
         if scale is not None:
-            self._scale_ema = scale if self._scale_ema is None else 0.8 * self._scale_ema + 0.2 * scale
+            prev = self._scale_ema
+            beta = 0.9       # EMA smoothing
+            rel_clip = 0.05  # clamp to ±5% per epoch
+            if (prev is None) or (not np.isfinite(prev)):
+                self._scale_ema = float(scale)
+            else:
+                ema = beta * float(prev) + (1.0 - beta) * float(scale)
+                lo = float(prev) * (1.0 - rel_clip)
+                hi = float(prev) * (1.0 + rel_clip)
+                self._scale_ema = float(min(max(ema, lo), hi))
 
         e = int(getattr(trainer, "current_epoch", 0))
         prog = min(1.0, float(e) / float(max(self.warm, 1)))
+        # Decay phase starts at ~2/3 of training; hold bias terms steady thereafter
+        _decay_start = int((2.0/3.0) * MAX_EPOCHS)
+        _epoch1 = e + 1
+        _in_decay = (_epoch1 >= _decay_start)
+        # ---- HOLD STEADY IN DECAY ----
+        if _in_decay:
+            # lock underestimation factor to a calm late value
+            vol_loss.underestimation_factor = float(max(1.0, min(getattr(self, "target_under", 1.09), 1.09)))
+            # keep QLIKE pressure constant and mild in decay
+            if hasattr(vol_loss, "qlike_weight"):
+                vol_loss.qlike_weight = 0.08
 
         # Freeze if getting worse
         if self._frozen:
             vol_loss.underestimation_factor = 1.0
             if hasattr(vol_loss, "qlike_weight"):
-                vol_loss.qlike_weight = 0.0
+                # keep a small, non-zero qlike weight to maintain well-posedness
+                current_qw = float(getattr(vol_loss, "qlike_weight", 0.0) or 0.0)
+                vol_loss.qlike_weight = max(0.05, current_qw)
             vol_loss.mean_bias_weight = min(getattr(vol_loss, "mean_bias_weight", 0.0), self.target_mean_bias)
-            print(f"[BIAS] epoch={e} FROZEN: alpha=1.0 qlike_w=0.0 mean_bias={vol_loss.mean_bias_weight:.3f}")
+            print(f"[BIAS] epoch={e} FROZEN: alpha=1.0 qlike_w={getattr(vol_loss, 'qlike_weight', 'n/a')} mean_bias={vol_loss.mean_bias_weight:.3f}")
             return
 
         # proportional (small) adjustment to alpha to avoid overshoot
@@ -1618,11 +1679,17 @@ class BiasWarmupCallback(pl.Callback):
             vol_loss.mean_bias_weight = self.target_mean_bias
 
         # qlike: only when calibration is roughly correct
+        # qlike: only when calibration is roughly correct
         if hasattr(vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
             q_target = float(self.qlike_target_weight)
-            q_prog = min(1.0, float(e) / float(max(self.warm, 8)))
-            near_ok = (self._scale_ema is None) or (0.9 <= self._scale_ema <= 1.1)
-            vol_loss.qlike_weight = (q_target * q_prog) if near_ok else 0.0
+            q_prog   = min(1.0, float(e) / float(max(self.warm, 8)))
+            near_ok  = (self._scale_ema is None) or (0.98 <= self._scale_ema <= 1.05)
+
+            qlike_floor = 0.05  # keep some scale pressure even when gated
+            if near_ok:
+                vol_loss.qlike_weight = max(qlike_floor, q_target * q_prog)
+            else:
+                vol_loss.qlike_weight = max(qlike_floor, 0.33 * q_target)  # gentle anchor when “closed”
 
         try:
             lr0 = trainer.optimizers[0].param_groups[0]["lr"]
@@ -1729,6 +1796,10 @@ else:
 parser = argparse.ArgumentParser(description="TFT training with optional permutation importance", add_help=True)
 parser.add_argument("--disable_warmups", type=lambda s: str(s).lower() in ("1","true","t","yes","y","on"),
                     default=False, help="Disable bias/QLIKE warm-ups and tail ramp")
+parser.add_argument("--resume", action="store_true",
+                    help="Resume training from an automatically found checkpoint if available")
+parser.add_argument("--ckpt_path", type=str, default=None,
+                    help="Explicit checkpoint to resume from (overrides auto-detection)")
 parser.add_argument("--warmup_guard_patience", type=int, default=2,
                     help="Consecutive worsening epochs before freezing warm-ups")
 parser.add_argument("--warmup_guard_tol", type=float, default=0.0,
@@ -1878,35 +1949,44 @@ else:
         "or ensure GCS is configured (install gcsfs & correct URIs)."
     )
 
-def get_resume_ckpt_path():
-    if not RESUME_ENABLED:
-        return None
+def get_resume_ckpt_path(args=None):
+    # 1) explicit path wins
+    if args is not None and getattr(args, "ckpt_path", None):
+        return args.ckpt_path
 
+    # 2) local last.ckpt
+    base = globals().get("LOCAL_CKPT_DIR") or globals().get("LOCAL_OUTPUT_DIR") or Path("./checkpoints")
+    last = base / "last.ckpt"
     try:
-        local_ckpts = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if local_ckpts:
-            return str(local_ckpts[0])
+        if last.exists():
+            return str(last)
     except Exception:
         pass
-    # Fallback: try GCS "last.ckpt" then the lexicographically latest .ckpt
+
+    # 3) newest local *.ckpt
     try:
-        if fs is not None:
-            last_uri = f"{CKPT_GCS_PREFIX}/last.ckpt"
-            if fs.exists(last_uri):
-                dst = LOCAL_CKPT_DIR / "last.ckpt"
-                with fsspec.open(last_uri, "rb") as f_in, open(dst, "wb") as f_out:
-                    shutil.copyfileobj(f_in, f_out)
+        ckpts = sorted(base.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if ckpts:
+            return str(ckpts[0])
+    except Exception:
+        pass
+
+    # 4) optional remote last.ckpt → copy to local for Lightning
+    try:
+        import fsspec
+        prefix = globals().get("CKPT_GCS_PREFIX") or (getattr(args, "gcs_output_prefix", None) or "")
+        if prefix:
+            uri = prefix.rstrip("/") + "/last.ckpt"
+            fs = fsspec.open(uri, "rb").fs
+            if fs.exists(uri):
+                base.mkdir(parents=True, exist_ok=True)
+                dst = base / "last.ckpt"
+                with fsspec.open(uri, "rb") as f_in, open(dst, "wb") as f_out:
+                    import shutil; shutil.copyfileobj(f_in, f_out)
                 return str(dst)
-            # else get the latest by name (filenames contain ISO timestamps)
-            entries = fs.glob(f"{CKPT_GCS_PREFIX}/*.ckpt") or []
-            if entries:
-                latest = sorted(entries)[-1]
-                dst = LOCAL_CKPT_DIR / Path(latest).name
-                with fsspec.open(latest, "rb") as f_in, open(dst, "wb") as f_out:
-                    shutil.copyfileobj(f_in, f_out)
-                return str(dst)
-    except Exception as e:
-        print(f"[WARN] Could not fetch resume checkpoint from GCS: {e}")
+    except Exception:
+        pass
+
     return None
 
 def mirror_local_ckpts_to_gcs():
@@ -1939,7 +2019,7 @@ class TailWeightRamp(pl.Callback):
         end: float = 1.25,
         ramp_epochs: int = 12,
         gate_by_calibration: bool = True,
-        gate_low: float = 0.95,
+        gate_low: float = 0.97,
         gate_high: float = 1.05,
         gate_patience: int = 2,
     ):
@@ -1954,6 +2034,9 @@ class TailWeightRamp(pl.Callback):
         self.gate_patience = int(gate_patience)
         self._ok_streak = 0
         self._trigger_epoch = None
+
+
+
 
     def _get_scale_ema(self, trainer):
         for cb in getattr(trainer, "callbacks", []):
@@ -1987,21 +2070,36 @@ class TailWeightRamp(pl.Callback):
             if (scale_ema is None) or not (self.gate_low <= float(scale_ema) <= self.gate_high):
                 self._ok_streak = 0
                 self._trigger_epoch = None
-                self.vol_loss.tail_weight = self.start
-                print(f"[TAIL] epoch={e} gated (scale_ema={scale_ema}); tail_weight={self.vol_loss.tail_weight}")
+                tw_prev = float(getattr(self.vol_loss, "tail_weight", self.start))
+                # GENTLE DECAY toward start (prevents big jumps)
+                self.vol_loss.tail_weight = max(self.start, 0.9 * tw_prev + 0.1 * self.start)
+                print(f"[TAIL] epoch={e} gated (scale_ema={scale_ema}); tail_weight={self.vol_loss.tail_weight} (decay→start)")
                 return
             else:
                 self._ok_streak = min(self.gate_patience, self._ok_streak + 1)
                 if self._ok_streak < self.gate_patience:
-                    self.vol_loss.tail_weight = self.start
-                    print(f"[TAIL] epoch={e} gating warm-up {self._ok_streak}/{self.gate_patience}; tail_weight={self.vol_loss.tail_weight}")
+                    tw_prev = float(getattr(self.vol_loss, "tail_weight", self.start))
+                    self.vol_loss.tail_weight = max(self.start, 0.9 * tw_prev + 0.1 * self.start)
+                    print(f"[TAIL] epoch={e} gating warm-up {self._ok_streak}/{self.gate_patience}; tail_weight={self.vol_loss.tail_weight} (decay→start)")
                     return
                 if self._trigger_epoch is None:
                     self._trigger_epoch = e
                     print(f"[TAIL] epoch={e} gate OPEN (scale_ema={scale_ema}); starting ramp")
+        # --- Gate passed (no return above): apply late, short ramp ---
+        _epoch1 = int(getattr(trainer, "current_epoch", 0)) + 1
+        _tail_start = int(0.90 * MAX_EPOCHS)
+        if _epoch1 <= _tail_start:
+            # hold near your start value until very late
+            self.vol_loss.tail_weight = float(self.start)
+        else:
+            _ramp_den = 2  # 2-epoch ramp
+            _k = min(1.0, (_epoch1 - _tail_start) / _ramp_den)
+            # ramp from start → 1.0
+            self.vol_loss.tail_weight = float(self.start + (1.0 - self.start) * _k)
 
+        print(f"[TAIL] epoch={e} ungated; tail_weight={self.vol_loss.tail_weight}")
         # Ramping once gate is open (or immediately if gate disabled)
-        eff_end = min(self.end, 1.5)
+        eff_end = min(self.end, 1.1)
         eff_ramp = max(self.ramp, 8)
         base = self._trigger_epoch if (self.gate and self._trigger_epoch is not None) else 0
         prog = min(1.0, max(0.0, (e - base + 1) / float(eff_ramp)))
@@ -2042,7 +2140,7 @@ class CosineLR(pl.Callback):
             pass
 
 class ReduceLROnPlateauCallback(pl.Callback):
-    def __init__(self, monitor="val_comp_overall", factor=0.5, patience=5, min_lr=1e-5, cooldown=0, stop_after_epoch=None):
+    def __init__(self, monitor="val_comp_overall", factor=0.5, patience=5, min_lr=1e-5, cooldown=0, stop_after_epoch=9):
         self.monitor, self.factor, self.patience, self.min_lr, self.cooldown = monitor, factor, patience, min_lr, cooldown
         self.stop_after_epoch = stop_after_epoch
         self.best, self.bad, self.cool = float("inf"), 0, 0
@@ -2091,37 +2189,37 @@ EXTRA_CALLBACKS = [
           target_under=1.09,
           target_mean_bias=0.04,
           warmup_epochs=6,
-          qlike_target_weight=0.0,   # keep out of the loss; diagnostics only
-          start_mean_bias=0.0,
+          qlike_target_weight=0.08,   # keep out of the loss; diagnostics only
+          start_mean_bias=0.02,
           mean_bias_ramp_until=12,
           guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
-          guard_tol=getattr(ARGS, "warmup_guard_tol", 0.0),
-          alpha_step=0.03,
+          guard_tol=getattr(ARGS, "warmup_guard_tol", 0.005),
+          alpha_step=0.05,
       ),
-
       TailWeightRamp(
           vol_loss=VOL_LOSS,
           start=1.0,
-          end=1.15,
-          ramp_epochs=16,
+          end=1.1,
+          ramp_epochs=24,
           gate_by_calibration=True,
-          gate_low=0.95,
-          gate_high=1.05,
+          gate_low=0.9,
+          gate_high=1.1,
           gate_patience=2,
       ),
       ReduceLROnPlateauCallback(
-          monitor="val_qlike_overall", factor=0.5, patience=4, min_lr=3e-5, cooldown=1, stop_after_epoch=None
+          monitor="val_composite_overall", factor=0.5, patience=4, min_lr=3e-5, cooldown=1, stop_after_epoch=5
       ),
       ModelCheckpoint(
           dirpath=str(LOCAL_CKPT_DIR),
-          filename="tft-{epoch:02d}-{val_qlike_overall:.4f}",
-          monitor="val_qlike_overall",
+          filename="tft-{epoch:02d}-{val_mae_overall:.4f}",
+          monitor="val_comp_overall",
           mode="min",
-          save_top_k=3,
+          save_top_k=2,
           save_last=True,
       ),
       StochasticWeightAveraging(swa_lrs = 1e6 , annealing_epochs = 1, annealing_strategy="cos", swa_epoch_start=max(1, int(0.85 * MAX_EPOCHS))),
-  ]
+      CosineLR(start_epoch=8, eta_min_ratio=1e-4, hold_last_epochs=2, warmup_steps=0),
+      ]
 
 class ValLossHistory(pl.Callback):
     """
@@ -2657,170 +2755,6 @@ def _resolve_best_model(trainer, fallback):
             print(f"[WARN] load_from_checkpoint failed: {e}")
     return fallback
 
-
-
-@torch.no_grad()
-def run_permutation_importance(
-    model,
-    template_ds,
-    base_df: pd.DataFrame,
-    features: List[str],
-    block_size: int,
-    batch_size: int,
-    max_batches: int,
-    num_workers: int,
-    prefetch: int,
-    pin_memory: bool,
-    vol_norm,                       # 👈 pass GroupNormalizer from TRAIN
-    out_csv_path: str,
-    uploader,
-    build_ds_fn=lambda: None,       # compatibility; unused
-) -> None:
-    """
-    Permutation Feature Importance on **decoded** metrics with a **baseline-normalised composite**:
-
-        Comp = w_mae*(MAE/MAE0) + w_rmse*(RMSE/RMSE0) + w_qlike*(QLIKE/QLIKE0)
-
-    We log per-feature deltas:
-        Δ_COMP = Comp_perm - Comp_base  (positive = harmful; negative = helpful)
-    """
-
-    import os
-
-    # ---------- optional RESUME ----------
-    already = set()
-    existing_rows = []
-    if out_csv_path and os.path.exists(out_csv_path):
-        try:
-            prev = pd.read_csv(out_csv_path)
-            if "feature" in prev.columns:
-                already = set(prev["feature"].astype(str).tolist())
-                existing_rows = prev.to_dict("records")
-                print(f"[FI] Resuming — {len(already)} features already in {out_csv_path}")
-        except Exception as e:
-            print(f"[FI WARN] Could not read existing FI CSV for resume: {e}")
-
-    # ---------- BASELINE (predict=True, last step) ----------
-    ds_base = TimeSeriesDataSet.from_dataset(
-        template_ds,
-        base_df,
-        predict=False,
-        stop_randomization=True,
-    )
-
-    b_mae, b_rmse, b_brier, b_qlike, n_base = _evaluate_decoded_metrics(
-        model=model,
-        ds=ds_base,
-        batch_size=batch_size,
-        max_batches=max_batches,
-        num_workers=num_workers,
-        prefetch=prefetch,
-        pin_memory=pin_memory,
-        vol_norm=vol_norm,
-    )
-
-    base_comp = composite_score(b_mae, b_rmse, b_qlike, b_mae, b_rmse, b_qlike, COMP_WEIGHTS)
-
-
-
-    print(
-        f"[FI] Dataset size (samples): {len(base_df)} | batch_size={batch_size}\n"
-        f"[FI] Baseline: QLIKE={b_qlike:.6f} | MAE={b_mae:.6f} | RMSE={b_rmse:.6f} | "
-        f"COMPOSITE(base)={base_comp:.4f} | N={n_base}"
-    )
-    if b_mae > 0.01:
-        print("[FI DEBUG] WARNING: baseline decoded MAE unusually large (expected ~0.001–0.003). "
-              "Check vol_norm and decode pipeline.")
-
-    new_rows = []
-    work_df = base_df.copy()
-
-    # ---------- PERMUTE LOOP ----------
-    for feat in features:
-        if str(feat) in already:
-            print(f"[FI] {feat:>20s} | SKIP (already present)")
-            continue
-
-        df_perm = work_df.copy()
-        _permute_series_inplace(df_perm, feat, block=block_size, group_col="asset")
-
-        ds_perm = TimeSeriesDataSet.from_dataset(
-            template_ds,
-            df_perm,
-            predict=False,
-            stop_randomization=True,
-        )
-
-        p_mae, p_rmse, p_brier, p_qlike, n_p = _evaluate_decoded_metrics(
-            model=model,
-            ds=ds_perm,
-            batch_size=batch_size,
-            max_batches=max_batches,
-            num_workers=num_workers,
-            prefetch=prefetch,
-            pin_memory=pin_memory,
-            vol_norm=vol_norm,
-        )
-
-        # individual deltas (lower is better)
-        d_mae   = float(p_mae   - b_mae)
-        d_rmse  = float(p_rmse  - b_rmse)
-        d_qlike = float(p_qlike - b_qlike)
-
-        # baseline-normalised composite
-        p_comp = composite_score(p_mae, p_rmse, p_qlike, b_mae, b_rmse, b_qlike, COMP_WEIGHTS)
-        d_comp = float(p_comp - base_comp)  # + = harmful (we minimise)
-
-        print(
-            f"[FI] {feat:>20s} | QLIKE={p_qlike:.6f} Δ_QLIKE={d_qlike:+.6f} | "
-            f"Δ_MAE={d_mae:+.6f} Δ_RMSE={d_rmse:+.6f} | "
-            f"COMPOSITE={p_comp:.4f} Δ_COMP={d_comp:+.4f} "
-            f"{'(↑ worse ⇒ useful)' if d_comp > 0 else '(↓ better ⇒ harmful/redundant)'}"
-        )
-
-        new_rows.append({
-            "feature": str(feat),
-            "baseline_mae": float(b_mae),
-            "baseline_rmse": float(b_rmse),
-            "baseline_qlike": float(b_qlike),
-            "permuted_mae": float(p_mae),
-            "permuted_rmse": float(p_rmse),
-            "permuted_qlike": float(p_qlike),
-            "delta_mae": float(d_mae),
-            "delta_rmse": float(d_rmse),
-            "delta_qlike": float(d_qlike),
-            "composite_base": float(base_comp),
-            "composite_perm": float(p_comp),
-            "delta_composite": float(d_comp),
-            "brier": (float(p_brier) if p_brier == p_brier else None),
-            "weights": f"mae={COMP_WEIGHTS[0]},rmse={COMP_WEIGHTS[1]},qlike={COMP_WEIGHTS[2]}",
-            "n": int(n_p),
-        })
-
-    # ---------- SAVE / UPLOAD ----------
-    try:
-        out_df = pd.DataFrame((existing_rows or []) + new_rows)
-        out_df.to_csv(out_csv_path, index=False)
-        print(f"[FI] wrote {out_csv_path}")
-        if uploader is not None:
-            try:
-                uploader(out_csv_path, f"{GCS_OUTPUT_PREFIX}/{Path(out_csv_path).name}")
-            except Exception as e:
-                print(f"[FI WARN] upload failed: {e}")
-    except Exception as e:
-        print(f"[FI WARN] could not save FI CSV: {e}")
-
-
-
-
-
-
-    except Exception as e:
-        print(f"[WARN] Final export failed: {e}")
-# Data preparation
-
- 
-
 # -----------------------------------------------------------------------
 if __name__ == "__main__":
     print(
@@ -3206,7 +3140,7 @@ if __name__ == "__main__":
         return fig
 
     tft.plot_prediction = MethodType(_blank_plot, tft)
-    resume_ckpt = get_resume_ckpt_path() if RESUME_ENABLED else None
+    resume_ckpt = get_resume_ckpt_path(args=ARGS) if getattr(ARGS, "resume", False) else None
     if resume_ckpt:
         print(f"↩️  Resuming from checkpoint: {resume_ckpt}")
     else:
