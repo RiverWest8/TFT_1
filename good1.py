@@ -492,7 +492,11 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             continue
 
         # group ids
-        g = x.get("groups") or x.get("group_ids") or x.get("group_id")
+        g = None
+        for _k in ("groups", "group_ids", "group_id"):
+            if _k in x and x[_k] is not None:
+                g = x[_k]
+                break
         if g is None:
             continue
         g = g[0] if isinstance(g, (list, tuple)) else g
@@ -503,7 +507,9 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
         L = g.shape[0]
 
         # time_idx
-        t = x.get("decoder_time_idx") or x.get("decoder_relative_idx")
+        t = x.get("decoder_time_idx", None)
+        if t is None:
+            t = x.get("decoder_relative_idx", None)
         if torch.is_tensor(t):
             while t.ndim > 1 and t.size(-1) == 1:
                 t = t.squeeze(-1)
