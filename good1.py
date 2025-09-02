@@ -543,8 +543,16 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
         # direction prob
         y_dir_prob = None
         if torch.is_tensor(p_dir):
-            y_dir_prob = torch.sigmoid(p_dir.reshape(-1)[:L]) if (p_dir.min() < 0 or p_dir.max() > 1) else p_dir.reshape(-1)[:L]
-            y_dir_prob = torch.clamp(y_dir_prob, 0, 1)
+            y_dir_prob = p_dir.reshape(-1)[:L]
+            try:
+                # Use scalar min/max to avoid ambiguous Tensor boolean
+                minv = float(y_dir_prob.min().item())
+                maxv = float(y_dir_prob.max().item())
+                if (minv < 0.0) or (maxv > 1.0):
+                    y_dir_prob = torch.sigmoid(y_dir_prob)
+            except Exception:
+                y_dir_prob = torch.sigmoid(y_dir_prob)
+            y_dir_prob = torch.clamp(y_dir_prob, 0.0, 1.0)
 
         # apply calibration if available
         if calib_dict is not None:
@@ -1500,7 +1508,10 @@ class PerAssetMetrics(pl.Callback):
             # Convert logits→probs if needed
             probs = pdir_cpu
             try:
-                if torch.isfinite(probs).any() and (probs.min() < 0 or probs.max() > 1):
+                # Convert to scalar min/max before boolean checks
+                minv = float(torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0).min().item())
+                maxv = float(torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0).max().item())
+                if (minv < 0.0) or (maxv > 1.0):
                     probs = torch.sigmoid(probs)
             except Exception:
                 probs = torch.sigmoid(probs)
@@ -1661,7 +1672,9 @@ class PerAssetMetrics(pl.Callback):
                 yd1 = yd[:L].float()
                 pd1 = pd_all[:L]
                 try:
-                    if torch.isfinite(pd1).any() and (pd1.min() < 0 or pd1.max() > 1):
+                    minv = float(pd1.min().item())
+                    maxv = float(pd1.max().item())
+                    if (minv < 0.0) or (maxv > 1.0):
                         pd1 = torch.sigmoid(pd1)
                 except Exception:
                     pd1 = torch.sigmoid(pd1)
@@ -1767,7 +1780,9 @@ class PerAssetMetrics(pl.Callback):
                     # ensure pdir is probability
                     pdp = pdir_cpu
                     try:
-                        if torch.isfinite(pdp).any() and (pdp.min() < 0 or pdp.max() > 1):
+                        minv = float(pdp.min().item())
+                        maxv = float(pdp.max().item())
+                        if (minv < 0.0) or (maxv > 1.0):
                             pdp = torch.sigmoid(pdp)
                     except Exception:
                         pdp = torch.sigmoid(pdp)
