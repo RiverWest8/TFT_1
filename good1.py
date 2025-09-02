@@ -573,7 +573,87 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     df.to_parquet(out_path, index=False)
     print(f"✓ Wrote {split.upper()} predictions → {out_path}")
 
-    
+@torch.no_grad()
+def run_test_export_and_metrics(trainer, test_loader, out_dir: Path):
+    """
+    1) Export TEST predictions using the robust raw-predict path (same as VAL).
+    2) Load the parquet and compute decoded metrics safely.
+    3) Upload to GCS if configured.
+
+    Parquet schema (matches VAL):
+      asset, time_idx, Time, y_vol, y_dir, y_vol_pred,
+      y_vol_pred_q05, y_vol_pred_q50, y_vol_pred_q95, y_dir_prob
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    test_path = out_dir / f"tft_test_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+
+    # --- robust export (handles all PF return layouts) ---
+    try:
+        _export_split_from_best(trainer, test_loader, split="test", out_path=test_path)
+    except Exception as e:
+        print(f"[WARN] Robust TEST export failed: {e}")
+        return
+
+    print(f"✓ Saved TEST predictions → {test_path}")
+    try:
+        upload_file_to_gcs(str(test_path), f"{GCS_OUTPUT_PREFIX}/{test_path.name}")
+        print(f"✓ Uploaded {test_path} → {GCS_OUTPUT_PREFIX}/{test_path.name}")
+    except Exception as e:
+        print(f"[WARN] Could not upload TEST parquet: {e}")
+
+    # --- compute metrics from parquet (no unpacking pitfalls) ---
+    try:
+        import pandas as pd, numpy as np
+        from sklearn.metrics import roc_auc_score
+
+        df = pd.read_parquet(test_path)
+
+        # If y_dir missing, try to merge from in-memory test_df
+        if "y_dir" not in df.columns and "test_df" in globals():
+            src = globals().get("test_df")
+            if isinstance(src, pd.DataFrame) and {"asset","time_idx","direction"}.issubset(src.columns):
+                m = src[["asset","time_idx","direction"]].copy().rename(columns={"direction":"y_dir"})
+                m["asset"] = m["asset"].astype(str)
+                m["time_idx"] = pd.to_numeric(m["time_idx"], errors="coerce").astype("Int64").astype("int64")
+                df["asset"] = df["asset"].astype(str)
+                df["time_idx"] = pd.to_numeric(df["time_idx"], errors="coerce").astype("Int64").astype("int64")
+                df = df.merge(m, on=["asset","time_idx"], how="left", validate="m:1")
+
+        if {"y_vol","y_vol_pred"}.issubset(df.columns):
+            mask = np.isfinite(df["y_vol"]) & np.isfinite(df["y_vol_pred"])
+            if mask.any():
+                y = df.loc[mask, "y_vol"].to_numpy(float)
+                p = df.loc[mask, "y_vol_pred"].to_numpy(float)
+                eps = 1e-6
+                mae  = float(np.mean(np.abs(p - y)))
+                mse  = float(np.mean((p - y)**2))
+                rmse = float(np.sqrt(mse))
+                s2y  = np.clip(np.abs(y), eps, None)**2
+                s2p  = np.clip(np.abs(p), eps, None)**2
+                r    = s2y / s2p
+                qlik = float(np.mean(r - np.log(r) - 1.0))
+
+                acc = brier = auroc = None
+                if {"y_dir_prob","y_dir"}.issubset(df.columns):
+                    probs = np.clip(df.loc[mask,"y_dir_prob"].to_numpy(float), 1e-6, 1-1e-6)
+                    ydir  = df.loc[mask,"y_dir"].to_numpy(int)
+                    acc   = float(np.mean((probs >= 0.5).astype(int) == ydir))
+                    brier = float(np.mean((probs - ydir)**2))
+                    try:
+                        auroc = float(roc_auc_score(ydir, probs))
+                    except Exception:
+                        auroc = None
+
+                print(f"[TEST] (decoded) MAE={mae:.6f} RMSE={rmse:.6f} MSE={mse:.6f} QLIKE={qlik:.6f}"
+                      + (f" | ACC={acc:.3f}" if acc is not None else "")
+                      + (f" | Brier={brier:.4f}" if brier is not None else "")
+                      + (f" | AUROC={auroc:.3f}" if auroc is not None else ""))
+            else:
+                print("[TEST] No valid rows with finite y_vol & y_vol_pred; metrics skipped.")
+        else:
+            print("[TEST] y_vol/y_vol_pred not found in parquet; metrics skipped.")
+    except Exception as e:
+        print(f"[WARN] Could not compute TEST metrics from parquet: {e}")
 
 
 # -----------------------------------------------------------------------
@@ -3177,6 +3257,8 @@ def _resolve_best_model(trainer, fallback):
 
 # -----------------------------------------------------------------------
 if __name__ == "__main__":
+    # After trainer.test(...)
+    run_test_export_and_metrics(trainer, test_dataloader, LOCAL_OUTPUT_DIR)
     print(
         f"[CONFIG] batch_size={BATCH_SIZE} | encoder={MAX_ENCODER_LENGTH} | epochs={MAX_EPOCHS} | "
         f"perm_importance={'on' if ENABLE_FEATURE_IMPORTANCE else 'off'} | fi_max_batches={FI_MAX_BATCHES} | "
