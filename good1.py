@@ -3257,8 +3257,7 @@ def _resolve_best_model(trainer, fallback):
 
 # -----------------------------------------------------------------------
 if __name__ == "__main__":
-    # After trainer.test(...)
-    run_test_export_and_metrics(trainer, test_dataloader, LOCAL_OUTPUT_DIR)
+
     print(
         f"[CONFIG] batch_size={BATCH_SIZE} | encoder={MAX_ENCODER_LENGTH} | epochs={MAX_EPOCHS} | "
         f"perm_importance={'on' if ENABLE_FEATURE_IMPORTANCE else 'off'} | fi_max_batches={FI_MAX_BATCHES} | "
