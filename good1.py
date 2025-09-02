@@ -463,7 +463,22 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             continue
 
     # 5) Run raw predictions
-    raw_preds, raw_x = best_model.predict(dataloader, mode="raw", return_x=True)
+    # Predict can return (raw,), (raw, x), or (raw, x, index) depending on PF/Lightning version
+    pred_out = best_model.predict(dataloader, mode="raw", return_x=True)
+    raw_preds, raw_x = None, None
+    if isinstance(pred_out, (list, tuple)):
+        if len(pred_out) == 1:
+            raw_preds = pred_out[0]
+            raw_x = None
+        elif len(pred_out) == 2:
+            raw_preds, raw_x = pred_out
+        elif len(pred_out) >= 3:
+            raw_preds, raw_x = pred_out[0], pred_out[1]
+        else:
+            raw_preds = pred_out
+    else:
+        raw_preds = pred_out
+        raw_x = None
     preds_list = raw_preds if isinstance(raw_preds, (list, tuple)) else [raw_preds]
     x_list = raw_x if isinstance(raw_x, (list, tuple)) else [raw_x]
     if len(preds_list) == 1 and len(x_list) > 1:
