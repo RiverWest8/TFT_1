@@ -596,23 +596,69 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
 
     df = pd.DataFrame(recs)
 
-    # --- attach real timestamps ---
+    # ---- Attach true realised_vol/direction and Time from the original split ----
     try:
-        for nm in ["val_df", "test_df", "raw_df", "full_df", "df"]:
-            src = globals().get(nm)
-            if isinstance(src, pd.DataFrame) and {"asset","time_idx","Time"}.issubset(src.columns):
-                src2 = src[["asset","time_idx","Time"]].copy()
-                src2["asset"] = src2["asset"].astype(str)
-                src2["time_idx"] = pd.to_numeric(src2["time_idx"], errors="coerce").astype("Int64").astype("int64")
-                df["asset"] = df["asset"].astype(str)
-                df["time_idx"] = pd.to_numeric(df["time_idx"], errors="coerce").astype("Int64").astype("int64")
-                df = df.merge(src2, on=["asset","time_idx"], how="left", validate="m:1")
-                df["Time"] = pd.to_datetime(df["Time"], errors="coerce").dt.tz_localize(None)
+        # Prefer the current split's dataframe if present (e.g., val_df/test_df)
+        src = None
+        src_name = f"{split.lower()}_df" if isinstance(split, str) else None
+        cand_names = [src_name, "val_df", "test_df", "train_df", "raw_df", "full_df", "df"]
+        cand_names = [n for n in cand_names if n]
+        for nm in cand_names:
+            obj = globals().get(nm)
+            if isinstance(obj, pd.DataFrame) and {"asset", "time_idx"}.issubset(obj.columns):
+                src = obj
                 break
-    except Exception as e:
-        print(f"[WARN] Could not attach Time column: {e}")
 
-    # save parquet
+        if src is not None:
+            # pick available columns to merge from source
+            cols_to_merge = ["asset", "time_idx"]
+            if "Time" in src.columns:
+                cols_to_merge.append("Time")
+            if "realised_vol" in src.columns:
+                cols_to_merge.append("realised_vol")
+            if "direction" in src.columns:
+                cols_to_merge.append("direction")
+
+            src_m = src[cols_to_merge].copy()
+
+            # harmonise dtypes before merge
+            src_m["asset"] = src_m["asset"].astype(str)
+            src_m["time_idx"] = pd.to_numeric(src_m["time_idx"], errors="coerce").astype("Int64").astype("int64")
+            df["asset"] = df["asset"].astype(str)
+            df["time_idx"] = pd.to_numeric(df["time_idx"], errors="coerce").astype("Int64").astype("int64")
+
+            df = df.merge(src_m, on=["asset", "time_idx"], how="left", validate="m:1")
+
+            # Normalise/rename into the expected schema
+            if "Time" in df.columns:
+                df["Time"] = pd.to_datetime(df["Time"], errors="coerce")
+                try:
+                    df["Time"] = df["Time"].dt.tz_localize(None)
+                except Exception:
+                    pass
+
+            if "realised_vol" in df.columns:
+                df["y_vol"] = pd.to_numeric(df["realised_vol"], errors="coerce")
+                df.drop(columns=["realised_vol"], inplace=True)
+
+            if "direction" in df.columns:
+                # keep as integer labels (0/1) where possible
+                df["y_dir"] = pd.to_numeric(df["direction"], errors="coerce").astype("Int64")
+                df.drop(columns=["direction"], inplace=True)
+        else:
+            print(f"[WARN] Could not locate source df to attach ground-truth for split='{split}'.")
+    except Exception as e:
+        print(f"[WARN] Could not attach ground-truth/Time: {e}")
+
+    # Reorder columns to a standard schema for downstream scripts
+    wanted = [
+        "asset", "time_idx", "Time", "y_vol", "y_dir",
+        "y_vol_pred", "y_vol_pred_q05", "y_vol_pred_q50", "y_vol_pred_q95", "y_dir_prob",
+    ]
+    cols = [c for c in wanted if c in df.columns] + [c for c in df.columns if c not in wanted]
+    df = df[cols]
+
+    # Save parquet
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_path, index=False)
     print(f"✓ Wrote {split.upper()} predictions → {out_path}")
