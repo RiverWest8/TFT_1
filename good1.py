@@ -423,9 +423,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     All vol preds are decoded and calibrated using the saved validation calibrator if available.
     """
 
-    # --- Load saved validation calibrator (applied to all splits) ---
-    calib_dict = _load_val_calibrator(LOCAL_RUN_DIR) if 'LOCAL_RUN_DIR' in globals() else None
-
+    
     # 1) Locate best checkpoint
     best_ckpt = None
     for cb in getattr(trainer, "callbacks", []):
@@ -575,10 +573,10 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             y_dir_prob = torch.clamp(y_dir_prob, 0.0, 1.0)
 
         # apply calibration if available
-        if calib_dict is not None:
-            y_q50 = apply_pred_regime_calibrator(y_q50, calib_dict)
-            if y_q05 is not None: y_q05 = apply_pred_regime_calibrator(y_q05, calib_dict)
-            if y_q95 is not None: y_q95 = apply_pred_regime_calibrator(y_q95, calib_dict)
+        # legacy calibration (requires ground truth; previously used/better for us)
+        if y_vol_true is not None and y_q50 is not None:
+            y_q50 = calibrate_vol_predictions(y_vol_true, y_q50)
+        # note: q05/q95 left unchanged under legacy calibration
 
         # assemble records
         assets = [id_to_name.get(int(i), str(int(i))) for i in g.detach().cpu().tolist()]
@@ -1552,6 +1550,7 @@ class PerAssetMetrics(pl.Callback):
         ratio    = sigma2_y / sigma2_p
         overall_qlike = float((ratio - torch.log(ratio) - 1.0).mean().item())
 
+       
         # Calibrated QLIKE (diagnostic only; not used for scheduling)
         # Fit a predicted-tercile calibrator on VAL and compute calibrated QLIKE
         self._val_calibrator = fit_pred_regime_calibrator(y_cpu, p_cpu)
@@ -1809,14 +1808,9 @@ class PerAssetMetrics(pl.Callback):
                     pq95_cpu = torch.cat(self._pq95_dev).detach().cpu()
                     q95_dec = self.vol_norm.decode(pq95_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
 
-                # Apply the same calibration used in metrics to the median so parquet matches plots
-                # Apply predicted-tercile calibrator (fitted on VAL) to q50 and propagate to q05/q95
-                calib = getattr(self, "_val_calibrator", None)
-                if calib is not None:
-                    pv_dec, q05_dec, q95_dec = apply_calibrator_to_quantiles(pv_dec, q05_dec, q95_dec, calib)
-                else:
-                    # legacy single-pass calibration fallback
-                    pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
+                # Apply legacy calibration to the median only (our previous/better approach)
+                pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
+                # note: q05/q95 left unchanged under legacy calibration
 
                 # map group id -> name
                 assets = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
