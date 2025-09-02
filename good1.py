@@ -573,10 +573,18 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             y_dir_prob = torch.clamp(y_dir_prob, 0.0, 1.0)
 
         # apply calibration if available
-        # legacy calibration (requires ground truth; previously used/better for us)
+        # legacy calibration (requires ground truth). Calibrate q50 and
+        # propagate the *same multiplicative factor* to q05/q95 (method unchanged).
         if y_vol_true is not None and y_q50 is not None:
-            y_q50 = calibrate_vol_predictions(y_vol_true, y_q50)
-        # note: q05/q95 left unchanged under legacy calibration
+            _eps      = 1e-12
+            _q50_orig = y_q50
+            _q50_cal  = calibrate_vol_predictions(y_vol_true, _q50_orig)
+            _scale    = _q50_cal / torch.clamp(_q50_orig, min=_eps)
+            y_q50     = _q50_cal
+            if y_q05 is not None:
+                y_q05 = y_q05 * _scale
+            if y_q95 is not None:
+                y_q95 = y_q95 * _scale
 
         # assemble records
         assets = [id_to_name.get(int(i), str(int(i))) for i in g.detach().cpu().tolist()]
@@ -1550,18 +1558,13 @@ class PerAssetMetrics(pl.Callback):
         ratio    = sigma2_y / sigma2_p
         overall_qlike = float((ratio - torch.log(ratio) - 1.0).mean().item())
 
-       
-        # Calibrated QLIKE (diagnostic only; not used for scheduling)
-        # Fit a predicted-tercile calibrator on VAL and compute calibrated QLIKE
-        self._val_calibrator = fit_pred_regime_calibrator(y_cpu, p_cpu)
+        # Calibrated QLIKE (diagnostic only; legacy method)
         try:
-            p_cal = apply_pred_regime_calibrator(p_cpu, self._val_calibrator)
+            p_cal = calibrate_vol_predictions(y_cpu, p_cpu)
             sigma2_pc = torch.clamp(p_cal.abs(), min=eps) ** 2
             ratio_cal = sigma2_y / sigma2_pc
             overall_qlike_cal = float((ratio_cal - torch.log(ratio_cal) - 1.0).mean().item())
             trainer.callback_metrics["val_qlike_cal"] = torch.tensor(overall_qlike_cal)
-            # persist calibrator to disk so TEST export can reuse it
-            _save_val_calibrator(self._val_calibrator, LOCAL_RUN_DIR / f"tft_val_calibrator_e{MAX_EPOCHS}_{RUN_SUFFIX}.json")
         except Exception as _e:
             overall_qlike_cal = None
             print(f"[WARN] Calibrated QLIKE failed: {_e}")
@@ -1808,9 +1811,16 @@ class PerAssetMetrics(pl.Callback):
                     pq95_cpu = torch.cat(self._pq95_dev).detach().cpu()
                     q95_dec = self.vol_norm.decode(pq95_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
 
-                # Apply legacy calibration to the median only (our previous/better approach)
-                pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
-                # note: q05/q95 left unchanged under legacy calibration
+                # Apply legacy calibration to q50 and propagate the *same multiplicative factor* to q05/q95
+                _eps = 1e-12
+                _pv_orig = pv_dec
+                _pv_cal  = calibrate_vol_predictions(yv_dec, _pv_orig)
+                _scale   = _pv_cal / torch.clamp(_pv_orig, min=_eps)
+                pv_dec   = _pv_cal
+                if q05_dec is not None:
+                    q05_dec = q05_dec * _scale
+                if q95_dec is not None:
+                    q95_dec = q95_dec * _scale
 
                 # map group id -> name
                 assets = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
