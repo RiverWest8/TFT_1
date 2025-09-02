@@ -418,7 +418,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     """
     Export predictions for a split (val/test) using the best checkpoint.
     Harmonised parquet schema:
-        asset, time_idx, Time, y_vol, y_vol_pred, 
+        asset, time_idx, Time, y_vol, y_dir, y_vol_pred,
         y_vol_pred_q05, y_vol_pred_q50, y_vol_pred_q95, y_dir_prob
     All vol preds are decoded and calibrated using the saved validation calibrator if available.
     """
@@ -539,12 +539,26 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
 
         y_q05, y_q50, y_q95 = map(_decode, (q05_enc, q50_enc, q95_enc))
 
-        # true vols
+        # True targets (optional) – realised vol (decoded) and direction (0/1)
         y_vol_true = None
+        y_dir_true = None
         dec_t = x.get("decoder_target")
         if torch.is_tensor(dec_t):
-            yt = dec_t[:, 0, 0] if dec_t.ndim == 3 else dec_t[:, 0]
-            y_vol_true = _decode(yt)
+            yt = dec_t
+            # Normalise to shape [B, n_targets]
+            if yt.ndim == 3 and yt.size(1) == 1:
+                yt = yt[:, 0, :]
+            if yt.ndim == 3 and yt.size(-1) == 1:
+                yt = yt[..., 0]
+            if yt.ndim == 2:
+                # column 0: realised_vol (encoded); column 1: direction (0/1) if present
+                yv_enc = yt[:, 0]
+                if vol_norm is not None:
+                    y_vol_true = safe_decode_vol(yv_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+                else:
+                    y_vol_true = yv_enc
+                if yt.size(1) > 1:
+                    y_dir_true = yt[:, 1]
 
         # direction prob
         y_dir_prob = None
@@ -572,6 +586,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             "asset": assets[i],
             "time_idx": int(t[i].item()) if isinstance(t, torch.Tensor) else None,
             "y_vol": float(y_vol_true[i].item()) if y_vol_true is not None else None,
+            "y_dir": int(y_dir_true[i].item()) if y_dir_true is not None else None,
             "y_vol_pred": float(y_q50[i].item()) if y_q50 is not None else None,
             "y_vol_pred_q05": float(y_q05[i].item()) if y_q05 is not None else None,
             "y_vol_pred_q50": float(y_q50[i].item()) if y_q50 is not None else None,
