@@ -3655,6 +3655,8 @@ if __name__ == "__main__":
     # Train the model
     trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
 
+    run_test_export_and_metrics(trainer, test_dataloader, LOCAL_OUTPUT_DIR)
+
     # Resolve the best checkpoint
     model_for_fi = _resolve_best_model(trainer, fallback=tft)
 
