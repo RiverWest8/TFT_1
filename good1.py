@@ -2575,9 +2575,9 @@ EXTRA_CALLBACKS = [
       ),
       TailWeightRamp(
           vol_loss=VOL_LOSS,
-          start=0.5,
+          start=1.0,
           end=1.12,
-          ramp_epochs=24,
+          ramp_epochs=18,
           gate_by_calibration=True,
           gate_low=0.95,
           gate_high=1.08,
