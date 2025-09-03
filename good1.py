@@ -1599,7 +1599,7 @@ class BiasWarmupCallback(pl.Callback):
         guard_patience: int = 2,
         guard_tol: float = 0.0,
         alpha_step: float = 0.05,
-        scale_ema_alpha: float = 0.99,
+        scale_ema_alpha: float = 0.35,
     ):
         super().__init__()
         self._vol_loss_hint = vol_loss
@@ -1659,7 +1659,7 @@ class BiasWarmupCallback(pl.Callback):
             vms = trainer.callback_metrics.get("val_mean_scale", None)
             if vms is not None:
                 s = float(vms.item() if hasattr(vms, "item") else vms)
-                a = getattr(self, "scale_ema_alpha", 0.005)
+                a = getattr(self, "scale_ema_alpha", 0.35)
                 self._scale_ema = s if (self._scale_ema is None) else (1.0 - a) * self._scale_ema + a * s
         except Exception:
             pass
@@ -1706,8 +1706,8 @@ class BiasWarmupCallback(pl.Callback):
         _in_decay = (_epoch1 >= _decay_start)
         # ---- HOLD STEADY IN DECAY ----
         if _in_decay:
-            # lock underestimation factor to a calm late value
-            vol_loss.underestimation_factor = float(max(1.0, min(getattr(self, "target_under", 1.09), 1.09)))
+            # lock underestimation factor to the configured target_under (≥1.0)
+            vol_loss.underestimation_factor = float(max(1.0, getattr(self, "target_under", 1.0)))
             # keep QLIKE pressure constant and mild in decay
             if hasattr(vol_loss, "qlike_weight"):
                 vol_loss.qlike_weight = 0.08
@@ -1747,11 +1747,11 @@ class BiasWarmupCallback(pl.Callback):
             q_prog   = min(1.0, float(e) / float(max(self.warm, 8)))
             near_ok  = (self._scale_ema is None) or (0.98 <= self._scale_ema <= 1.05)
 
-            qlike_floor = 0.02  # keep some scale pressure even when gated
+            qlike_floor = 0.08  # keep some scale pressure even when gated
             if near_ok:
                 vol_loss.qlike_weight = max(qlike_floor, q_target * q_prog)
             else:
-                vol_loss.qlike_weight = max(qlike_floor, 0.33 * q_target)  # gentle anchor when “closed”
+                vol_loss.qlike_weight = max(qlike_floor, 0.6 * q_target)  # gentle anchor when “closed”
 
         try:
             lr0 = trainer.optimizers[0].param_groups[0]["lr"]
@@ -2459,7 +2459,7 @@ VOL_LOSS = AsymmetricQuantileLoss(
 EXTRA_CALLBACKS = [
       BiasWarmupCallback(
           vol_loss=VOL_LOSS,
-          target_under=1.09,
+          target_under=1.1115,
           target_mean_bias=0.04,
           warmup_epochs=6,
           qlike_target_weight=0.08,   # keep out of the loss; diagnostics only
