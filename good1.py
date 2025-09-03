@@ -1825,7 +1825,7 @@ class BiasWarmupCallback(pl.Callback):
         # Freeze if getting worse
         if self._frozen:
             # hold near neutral when frozen
-            vol_loss.underestimation_factor = float(min(max(vol_loss.underestimation_factor, 0.98), 1.02))
+            vol_loss.underestimation_factor = float(min(max(vol_loss.underestimation_factor, 0.99), 1.01))
             if hasattr(vol_loss, "qlike_weight"):
                 vol_loss.qlike_weight = max(0.05, getattr(vol_loss, "qlike_weight", 0.0))
             vol_loss.mean_bias_weight = min(getattr(vol_loss, "mean_bias_weight", 0.0), self.target_mean_bias)
@@ -1842,7 +1842,7 @@ class BiasWarmupCallback(pl.Callback):
             if self._scale_ema < 0.995:  # already over-predicting
                 alpha = min(alpha, 1.0)
         # tighter equilibrium clamp around 1.0
-        lo, hi = 0.95, 1.1115
+        lo, hi = 1.0, 1.05
         vol_loss.underestimation_factor = float(min(max(alpha, lo), hi))
 
         # mean-bias gentle ramp
@@ -1857,7 +1857,7 @@ class BiasWarmupCallback(pl.Callback):
         if hasattr(vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
             q_target = float(self.qlike_target_weight)
             q_prog   = min(1.0, float(e) / float(max(self.warm, 8)))
-            near_ok  = (self._scale_ema is None) or (0.95 <= self._scale_ema <= 1.15)
+            near_ok  = (self._scale_ema is None) or (0.98 <= self._scale_ema <= 1.02)
 
             qlike_floor = 0.08  # keep some scale pressure even when gated
             if near_ok:
@@ -2563,7 +2563,7 @@ class ReduceLROnPlateauCallback(pl.Callback):
 
 VOL_LOSS = AsymmetricQuantileLoss(
     quantiles=VOL_QUANTILES,
-    underestimation_factor=1.05,  # managed by BiasWarmupCallback
+    underestimation_factor=1.0,  # managed by BiasWarmupCallback
     mean_bias_weight=0.002,        # small centering on the median for MAE
     tail_q=0.9,
     tail_weight=1.0,              # will be ramped by TailWeightRamp
@@ -2574,7 +2574,7 @@ VOL_LOSS = AsymmetricQuantileLoss(
 EXTRA_CALLBACKS = [
       BiasWarmupCallback(
           vol_loss=VOL_LOSS,
-          target_under=1.1115,
+          target_under=1.02,
           target_mean_bias=0.04,
           warmup_epochs=8,
           qlike_target_weight=0.07,   # keep out of the loss; diagnostics only
