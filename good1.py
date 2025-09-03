@@ -852,14 +852,13 @@ def calibrate_vol_predictions(
     return_params: bool = False,
 ):
     """
-    Three‑regime (tercile) multiplicative calibration (low / mid / high),
-    kept close to your original API:
+    Two‑regime multiplicative calibration (median split: low / high).
 
-      • If `calib_params` is None  → FIT on validation truths (decoded) using terciles.
+      • If `calib_params` is None  → FIT on validation truths (decoded) using the median of y.
       • If `calib_params` provided → APPLY to any split (e.g., test).
-      • Regime is chosen using the **predicted median** (safe for test).
-      • Same scale factor is applied to q05 and q95 if provided.
-      • Per‑asset if `asset_ids` given; otherwise GLOBAL.
+      • Regime is chosen using the **predicted median** p50 relative to the fitted y‑median.
+      • The same per‑regime scale factor is applied to q05 and q95 if provided.
+      • Per‑asset if `asset_ids` is given; otherwise GLOBAL.
 
     Returns
     -------
@@ -902,13 +901,12 @@ def calibrate_vol_predictions(
             if yy.numel() == 0 or pp.numel() == 0:
                 continue
 
-            # Tercile thresholds from TRUE y (decoded)
-            t33, t66 = torch.quantile(yy, torch.tensor([0.33, 0.66], device=yy.device))
+            # Median threshold from TRUE y (decoded)
+            t50 = torch.quantile(yy, torch.tensor(0.50, device=yy.device))
 
             # Define regimes by TRUE y for FITTING
-            low_mask  = (yy <= t33)
-            mid_mask  = (yy >  t33) & (yy <  t66)
-            high_mask = (yy >= t66)
+            low_mask  = (yy <= t50)
+            high_mask = (yy >  t50)
 
             def _safe_scale(mask: torch.Tensor) -> float:
                 if torch.count_nonzero(mask).item() == 0:
@@ -921,15 +919,12 @@ def calibrate_vol_predictions(
                 return float((yt / yp).clamp(0.5, 2.0).item())
 
             s_low  = _safe_scale(low_mask)
-            s_mid  = _safe_scale(mid_mask)
             s_high = _safe_scale(high_mask)
 
             key = "GLOBAL" if grp is None else str(grp)
             params[key] = {
-                "t33":  float(t33.item()),
-                "t66":  float(t66.item()),
+                "t50":   float(t50.item()),
                 "s_low":  float(s_low),
-                "s_mid":  float(s_mid),
                 "s_high": float(s_high),
             }
 
@@ -948,23 +943,19 @@ def calibrate_vol_predictions(
         if par is None:
             continue
 
-        t33   = par["t33"]
-        t66   = par["t66"]
+        t50   = par["t50"]
         s_low = par["s_low"]
-        s_mid = par["s_mid"]
         s_high= par["s_high"]
 
         p_local = p50_cal[m]
 
         # Decide regime by **predicted** median
-        reg_low  = (p_local <= t33)
-        reg_high = (p_local >= t66)
-        reg_mid  = (~reg_low) & (~reg_high)
+        reg_low  = (p_local <= t50)
+        reg_high = ~reg_low
 
         # Select scale per element
         s = torch.empty_like(p_local)
         s[reg_low]  = s_low
-        s[reg_mid]  = s_mid
         s[reg_high] = s_high
 
         p50_cal[m] = p_local * s
@@ -1602,6 +1593,9 @@ class PerAssetMetrics(pl.Callback):
                         pq95_cpu = torch.cat(self._pq95_dev).detach().cpu()
                         q95_dec = self.vol_norm.decode(pq95_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
 
+
+
+                                
                     # Apply per-asset validation calibration and SAVE params for TEST
                     pv_dec, q05_dec, q95_dec, calib_params = calibrate_vol_predictions(
                         yv_dec, pv_dec,
@@ -1781,7 +1775,7 @@ class BiasWarmupCallback(pl.Callback):
             vms = trainer.callback_metrics.get("val_mean_scale", None)
             if vms is not None:
                 s = float(vms.item() if hasattr(vms, "item") else vms)
-                a = getattr(self, "scale_ema_alpha", 0.35)
+                a = getattr(self, "scale_ema_alpha", 0.50)
                 self._scale_ema = s if (self._scale_ema is None) else (1.0 - a) * self._scale_ema + a * s
         except Exception:
             pass
@@ -1811,7 +1805,7 @@ class BiasWarmupCallback(pl.Callback):
         if scale is not None:
             prev = self._scale_ema
             beta = 0.9       # EMA smoothing
-            rel_clip = 0.05  # clamp to ±5% per epoch
+            rel_clip = 0.09  # clamp to ±5% per epoch
             if (prev is None) or (not np.isfinite(prev)):
                 self._scale_ema = float(scale)
             else:
@@ -1826,23 +1820,17 @@ class BiasWarmupCallback(pl.Callback):
         _decay_start = int((2.0/3.0) * MAX_EPOCHS)
         _epoch1 = e + 1
         _in_decay = (_epoch1 >= _decay_start)
-        # ---- HOLD STEADY IN DECAY ----
-        if _in_decay:
-            # lock underestimation factor to the configured target_under (≥1.0)
-            vol_loss.underestimation_factor = float(max(1.0, getattr(self, "target_under", 1.0)))
-            # keep QLIKE pressure constant and mild in decay
-            if hasattr(vol_loss, "qlike_weight"):
-                vol_loss.qlike_weight = 0.08
+ 
 
         # Freeze if getting worse
         if self._frozen:
-            vol_loss.underestimation_factor = 1.0
+            # hold near neutral when frozen
+            vol_loss.underestimation_factor = float(min(max(vol_loss.underestimation_factor, 0.98), 1.02))
             if hasattr(vol_loss, "qlike_weight"):
-                # keep a small, non-zero qlike weight to maintain well-posedness
-                current_qw = float(getattr(vol_loss, "qlike_weight", 0.0) or 0.0)
-                vol_loss.qlike_weight = max(0.05, current_qw)
+                vol_loss.qlike_weight = max(0.05, getattr(vol_loss, "qlike_weight", 0.0))
             vol_loss.mean_bias_weight = min(getattr(vol_loss, "mean_bias_weight", 0.0), self.target_mean_bias)
-            print(f"[BIAS] epoch={e} FROZEN: alpha=1.0 qlike_w={getattr(vol_loss, 'qlike_weight', 'n/a')} mean_bias={vol_loss.mean_bias_weight:.3f}")
+            print(f"[BIAS] epoch={e} SOFT-FROZEN: alpha={vol_loss.underestimation_factor:.3f} "
+                f"qlike_w={getattr(vol_loss, 'qlike_weight', 'n/a')} mean_bias={vol_loss.mean_bias_weight:.3f}")
             return
 
         # proportional (small) adjustment to alpha to avoid overshoot
@@ -1853,7 +1841,9 @@ class BiasWarmupCallback(pl.Callback):
             alpha = (1.0 + (self.target_under - 1.0) * prog) * step
             if self._scale_ema < 0.995:  # already over-predicting
                 alpha = min(alpha, 1.0)
-        vol_loss.underestimation_factor = float(max(1.0, min(alpha, self.target_under)))
+        # tighter equilibrium clamp around 1.0
+        lo, hi = 0.95, 1.1115
+        vol_loss.underestimation_factor = float(min(max(alpha, lo), hi))
 
         # mean-bias gentle ramp
         if e <= self.mean_bias_ramp_until:
@@ -1867,7 +1857,7 @@ class BiasWarmupCallback(pl.Callback):
         if hasattr(vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
             q_target = float(self.qlike_target_weight)
             q_prog   = min(1.0, float(e) / float(max(self.warm, 8)))
-            near_ok  = (self._scale_ema is None) or (0.98 <= self._scale_ema <= 1.05)
+            near_ok  = (self._scale_ema is None) or (0.95 <= self._scale_ema <= 1.15)
 
             qlike_floor = 0.08  # keep some scale pressure even when gated
             if near_ok:
@@ -2586,13 +2576,14 @@ EXTRA_CALLBACKS = [
           vol_loss=VOL_LOSS,
           target_under=1.1115,
           target_mean_bias=0.04,
-          warmup_epochs=6,
-          qlike_target_weight=0.08,   # keep out of the loss; diagnostics only
-          start_mean_bias=0.02,
+          warmup_epochs=8,
+          qlike_target_weight=0.07,   # keep out of the loss; diagnostics only
+          start_mean_bias=0.01,
           mean_bias_ramp_until=12,
           guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
           guard_tol=getattr(ARGS, "warmup_guard_tol", 0.005),
-          alpha_step=0.05,
+          alpha_step=0.08,
+          scale_ema_alpha = 0.5,
       ),
       TailWeightRamp(
           vol_loss=VOL_LOSS,
@@ -2600,12 +2591,12 @@ EXTRA_CALLBACKS = [
           end=1.1,
           ramp_epochs=24,
           gate_by_calibration=True,
-          gate_low=0.9,
-          gate_high=1.1,
+          gate_low=0.95,
+          gate_high=1.08,
           gate_patience=2,
       ),
       ReduceLROnPlateauCallback(
-          monitor="val_composite_overall", factor=0.5, patience=4, min_lr=3e-5, cooldown=1, stop_after_epoch=5
+          monitor="val_composite_overall", factor=0.5, patience=6, min_lr=3e-5, cooldown=1, stop_after_epoch=8
       ),
       ModelCheckpoint(
           dirpath=str(LOCAL_CKPT_DIR),
