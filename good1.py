@@ -1842,7 +1842,7 @@ class BiasWarmupCallback(pl.Callback):
             if self._scale_ema < 0.995:  # already over-predicting
                 alpha = min(alpha, 1.0)
         # tighter equilibrium clamp around 1.0
-        lo, hi = 1.0, 1.05
+        lo, hi = 0.95, 1.05
         vol_loss.underestimation_factor = float(min(max(alpha, lo), hi))
 
         # mean-bias gentle ramp
@@ -2587,8 +2587,8 @@ EXTRA_CALLBACKS = [
       ),
       TailWeightRamp(
           vol_loss=VOL_LOSS,
-          start=1.0,
-          end=1.1,
+          start=0.5,
+          end=1.12,
           ramp_epochs=24,
           gate_by_calibration=True,
           gate_low=0.95,
@@ -2606,7 +2606,7 @@ EXTRA_CALLBACKS = [
           save_top_k=2,
           save_last=True,
       ),
-      StochasticWeightAveraging(swa_lrs = 8.5e-4, annealing_epochs = 1, annealing_strategy="cos", swa_epoch_start=max(1, int(0.85 * MAX_EPOCHS))),
+      StochasticWeightAveraging(swa_lrs = 3e-4, annealing_epochs = 1, annealing_strategy="cos", swa_epoch_start=max(1, int(0.85 * MAX_EPOCHS))),
       CosineLR(start_epoch=8, eta_min_ratio=1e-3, hold_last_epochs=3, warmup_steps=0, min_lr = 3e-5),
       ]
 
