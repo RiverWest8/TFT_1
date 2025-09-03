@@ -645,28 +645,65 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
         "y_dir_prob": y_dirprob_all,
     })
 
-    # Try to attach actual 'Time' if a compatible source df is cached
+    # --- Attach Time column robustly (handles dtype mismatches, dups, missing) ---
     try:
-        cand_names = ["val_df", "test_df", "raw_df", "full_df", "df"]
-        src = None
-        for nm in cand_names:
+        # 1) choose the best source DF for this split, then fall back to others
+        candidates = []
+        if split and isinstance(split, str):
+            s = split.lower()
+            if s == "val" and "val_df" in globals() and isinstance(val_df, pd.DataFrame):
+                candidates.append(val_df)
+            if s == "test" and "test_df" in globals() and isinstance(test_df, pd.DataFrame):
+                candidates.append(test_df)
+        # generic fallbacks
+        for nm in ("raw_df", "full_df", "df"):
             obj = globals().get(nm)
-            if isinstance(obj, pd.DataFrame) and {"asset","time_idx","Time"}.issubset(obj.columns):
-                src = obj[["asset","time_idx","Time"]].copy()
+            if isinstance(obj, pd.DataFrame):
+                candidates.append(obj)
+
+        src = None
+        for cand in candidates:
+            if {"asset", "time_idx", "Time"}.issubset(cand.columns):
+                src = cand.loc[:, ["asset", "time_idx", "Time"]].copy()
                 break
-        if src is not None:
-            src["asset"] = src["asset"].astype(str)
-            src["time_idx"] = pd.to_numeric(src["time_idx"], errors="coerce").astype("Int64").astype("int64")
+
+        if src is None:
+            print(f"[EXPORT][Time] No suitable source dataframe found; leaving Time empty for split={split}")
+        else:
+            # 2) harmonise dtypes for a clean merge
             df["asset"] = df["asset"].astype(str)
-            df["time_idx"] = pd.to_numeric(df["time_idx"], errors="coerce").astype("Int64").astype("int64")
-            df = df.merge(src, on=["asset","time_idx"], how="left", validate="m:1")
-            df["Time"] = pd.to_datetime(df["Time"], errors="coerce")
+            src["asset"] = src["asset"].astype(str)
+
+            def _to_int64_safe(s):
+                s2 = pd.to_numeric(s, errors="coerce")
+                # if float-like, floor to nearest lower int (time_idx should be integral)
+                if pd.api.types.is_float_dtype(s2):
+                    s2 = np.floor(s2)
+                # Int64 (nullable) ➜ int64
+                s2 = s2.astype("Int64").astype("int64")
+                return s2
+
+            df["time_idx"] = _to_int64_safe(df["time_idx"])
+            src["time_idx"] = _to_int64_safe(src["time_idx"])
+
+            # 3) normalise Time and drop duplicates in the source (keep the latest)
+            src["Time"] = pd.to_datetime(src["Time"], errors="coerce")
             try:
-                df["Time"] = df["Time"].dt.tz_localize(None)
+                src["Time"] = src["Time"].dt.tz_localize(None)
             except Exception:
                 pass
+            src = src.drop_duplicates(subset=["asset", "time_idx"], keep="last")
+
+            # 4) merge and report coverage
+            n_before = len(df)
+            df = df.merge(src, on=["asset", "time_idx"], how="left", validate="m:1")
+            n_missing = int(df["Time"].isna().sum())
+            if n_missing:
+                print(f"[EXPORT][Time] Attached Time for {n_before - n_missing}/{n_before} rows; "
+                      f"{n_missing} rows had no match in source.")
+
     except Exception as e:
-        print(f"[WARN] Could not attach Time column: {e}")
+        print(f"[WARN][Time] attach failed: {e}")
 
     # Save parquet
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2394,11 +2431,11 @@ class ReduceLROnPlateauCallback(pl.Callback):
 
 VOL_LOSS = AsymmetricQuantileLoss(
     quantiles=VOL_QUANTILES,
-    underestimation_factor=1.00,  # managed by BiasWarmupCallback
-    mean_bias_weight=0.01,        # small centering on the median for MAE
-    tail_q=0.85,
+    underestimation_factor=1.05,  # managed by BiasWarmupCallback
+    mean_bias_weight=0.002,        # small centering on the median for MAE
+    tail_q=0.9,
     tail_weight=1.0,              # will be ramped by TailWeightRamp
-    qlike_weight=0.0,             # QLIKE weight is ramped safely in BiasWarmupCallback
+    qlike_weight=0.02,             # QLIKE weight is ramped safely in BiasWarmupCallback
     reduction="mean",
 )
 # ---------------- Callback bundle (bias warm-up, tail ramp, LR control) ----------------
@@ -2437,7 +2474,7 @@ EXTRA_CALLBACKS = [
           save_last=True,
       ),
       StochasticWeightAveraging(swa_lrs = 1e6 , annealing_epochs = 1, annealing_strategy="cos", swa_epoch_start=max(1, int(0.85 * MAX_EPOCHS))),
-      CosineLR(start_epoch=8, eta_min_ratio=1e-4, hold_last_epochs=2, warmup_steps=0),
+      CosineLR(start_epoch=8, eta_min_ratio=1e-4, hold_last_epochs=3, warmup_steps=0),
       ]
 
 class ValLossHistory(pl.Callback):
@@ -3335,7 +3372,7 @@ if __name__ == "__main__":
         callbacks=[TQDMProgressBar(refresh_rate=50), es_cb, metrics_cb, mirror_cb, lr_cb, val_hist_cb] + EXTRA_CALLBACKS,
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
-        enable_progress_bar=True,
+        enable_progress_bar=False,
     )
 
 
