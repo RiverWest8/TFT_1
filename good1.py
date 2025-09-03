@@ -420,7 +420,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
       • Predicts in raw mode and iterates per-batch
       • Extracts groups/time/targets from each batch dict
       • Decodes realised_vol using the TRAIN normalizer
-      • Writes a harmonised parquet with columns: asset, time_idx, y_vol, y_vol_pred, y_dir_prob (optional)
+      • Writes a harmonised parquet with columns: asset, time_idx, Time, y_vol, y_vol_pred, y_dir, y_dir_prob (optional)
     """
     # 1) Find best checkpoint
     best_ckpt = None
@@ -490,6 +490,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     assets_all, t_all = [], []
     y_true_all, y_dirprob_all = [], []
     y_pred_q05_all, y_pred_q50_all, y_pred_q95_all = [], [], []
+    y_dir_all = []
     # Helper: extract x dict from a batch container
     def _get_x(b):
         if isinstance(b, dict):
@@ -598,6 +599,17 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             else:
                 y_vol_true = yt
 
+        # True direction target (optional)
+        y_dir_true = None
+        dec_t = x.get("decoder_target")
+        if torch.is_tensor(dec_t):
+            if dec_t.ndim == 3 and dec_t.size(-1) > 1:
+                y_dir_true = dec_t[:, 0, 1]
+            elif dec_t.ndim == 2 and dec_t.size(1) > 1:
+                y_dir_true = dec_t[:, 1]
+        if y_dir_true is not None:
+            y_dir_true = y_dir_true.reshape(-1)[:L]
+
         # Direction → probability in [0,1]
         y_dir_prob = None
         if p_dir is not None and torch.is_tensor(p_dir):
@@ -629,6 +641,10 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             y_true_all.extend(y_vol_true.detach().cpu().tolist())
         else:
             y_true_all.extend([None] * L)
+        if y_dir_true is not None:
+            y_dir_all.extend(y_dir_true.detach().cpu().tolist())
+        else:
+            y_dir_all.extend([None] * L)
         if y_dir_prob is not None:
             y_dirprob_all.extend(y_dir_prob.detach().cpu().tolist())
         else:
@@ -642,6 +658,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
         "y_vol_pred_q05": y_pred_q05_all,
         "y_vol_pred_q50": y_pred_q50_all,
         "y_vol_pred_q95": y_pred_q95_all,
+        "y_dir": y_dir_all,
         "y_dir_prob": y_dirprob_all,
     })
 
@@ -1730,7 +1747,7 @@ class BiasWarmupCallback(pl.Callback):
             q_prog   = min(1.0, float(e) / float(max(self.warm, 8)))
             near_ok  = (self._scale_ema is None) or (0.98 <= self._scale_ema <= 1.05)
 
-            qlike_floor = 0.05  # keep some scale pressure even when gated
+            qlike_floor = 0.02  # keep some scale pressure even when gated
             if near_ok:
                 vol_loss.qlike_weight = max(qlike_floor, q_target * q_prog)
             else:
@@ -2531,7 +2548,7 @@ EMBEDDING_CARDINALITY = {}
 
 BATCH_SIZE   = 128
 MAX_EPOCHS   = 35
-EARLY_STOP_PATIENCE = 7
+EARLY_STOP_PATIENCE = 15
 PERM_BLOCK_SIZE = 288
 
 # Artifacts are written locally then uploaded to GCS
@@ -3279,7 +3296,7 @@ if __name__ == "__main__":
     print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.00091}")
     
     es_cb = EarlyStopping(
-    monitor="val_qlike_overall",
+    monitor="val_composite_overall",
     patience=EARLY_STOP_PATIENCE,
     mode="min",
     min_delta = 1e-4
