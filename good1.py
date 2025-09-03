@@ -570,17 +570,19 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
                 y_dir_prob = torch.sigmoid(y_dir_prob)
             y_dir_prob = torch.clamp(y_dir_prob, 0.0, 1.0)
 
-            # Legacy calibration everywhere: calibrate q50 and propagate multiplicative factor to q05/q95
-            if y_vol_true is not None and y_q50 is not None:
-                _eps      = 1e-12
-                _q50_orig = y_q50
-                _q50_cal  = calibrate_vol_predictions(y_vol_true, _q50_orig)
-                _scale    = _q50_cal / torch.clamp(_q50_orig, min=_eps)
-                y_q50     = _q50_cal
-                if y_q05 is not None:
-                    y_q05 = y_q05 * _scale
-                if y_q95 is not None:
-                    y_q95 = y_q95 * _scale
+        # Legacy calibration everywhere (TEST/VAL export):
+        # Calibrate q50 with true decoded vols and propagate the multiplicative
+        # factor to q05/q95 so bands keep their relative width.
+        if y_vol_true is not None and y_q50 is not None:
+            _eps      = 1e-12
+            _q50_orig = y_q50
+            _q50_cal  = calibrate_vol_predictions(y_vol_true, _q50_orig)
+            _scale    = _q50_cal / torch.clamp(_q50_orig, min=_eps)
+            y_q50     = _q50_cal
+            if y_q05 is not None:
+                y_q05 = y_q05 * _scale
+            if y_q95 is not None:
+                y_q95 = y_q95 * _scale
 
         # assemble records
         assets = [id_to_name.get(int(i), str(int(i))) for i in g.detach().cpu().tolist()]
@@ -1531,49 +1533,49 @@ class PerAssetMetrics(pl.Callback):
         yd_cpu = yd.detach().cpu() if yd is not None else None
         pdir_cpu = pdir.detach().cpu() if pdir is not None else None
 
-        # Calibration diagnostic (not used in loss)
-        try:
-            mean_scale = float((y_cpu.mean() / (p_cpu.mean() + 1e-12)).item())
-        except Exception:
-            mean_scale = float("nan")
-        print(f"[CAL DEBUG] mean(y)/mean(p)={mean_scale:.4f} (1==perfect)")
-        try:
-            trainer.callback_metrics["val_mean_scale"] = torch.tensor(mean_scale)
-        except Exception:
-            pass
+        # Use legacy calibration as the MAIN path for validation metrics
+        # (keep uncalibrated metrics as diagnostics with *_uncal suffix)
+        p_cal_cpu = calibrate_vol_predictions(y_cpu, p_cpu)
 
         # --- Decoded regression metrics (overall) ---
         eps = 1e-8
-        diff = (p_cpu - y_cpu)
+
+        # Uncalibrated (diagnostic only)
+        diff_uncal = (p_cpu - y_cpu)
+        mae_uncal  = float(diff_uncal.abs().mean().item())
+        mse_uncal  = float((diff_uncal ** 2).mean().item())
+        rmse_uncal = float(mse_uncal ** 0.5)
+        sigma2_pu  = torch.clamp(p_cpu.abs(), min=eps) ** 2
+        sigma2_y   = torch.clamp(y_cpu.abs(), min=eps) ** 2
+        ratio_u    = sigma2_y / sigma2_pu
+        qlike_uncal = float((ratio_u - torch.log(ratio_u) - 1.0).mean().item())
+
+        # Calibrated (MAIN)
+        diff = (p_cal_cpu - y_cpu)
         overall_mae  = float(diff.abs().mean().item())
         overall_mse  = float((diff ** 2).mean().item())
         overall_rmse = float(overall_mse ** 0.5)
 
-        sigma2_p = torch.clamp(p_cpu.abs(), min=eps) ** 2
-        sigma2_y = torch.clamp(y_cpu.abs(), min=eps) ** 2
-        ratio    = sigma2_y / sigma2_p
+        sigma2_pc = torch.clamp(p_cal_cpu.abs(), min=eps) ** 2
+        ratio     = sigma2_y / sigma2_pc
         overall_qlike = float((ratio - torch.log(ratio) - 1.0).mean().item())
 
-        # Calibrated QLIKE (diagnostic only; legacy method everywhere)
+        # store calibrated-vs-uncalibrated for the logger
         try:
-            p_cal = calibrate_vol_predictions(y_cpu, p_cpu)
-            sigma2_pc = torch.clamp(p_cal.abs(), min=eps) ** 2
-            ratio_cal = sigma2_y / sigma2_pc
-            overall_qlike_cal = float((ratio_cal - torch.log(ratio_cal) - 1.0).mean().item())
-            trainer.callback_metrics["val_qlike_cal"] = torch.tensor(overall_qlike_cal)
-        except Exception as _e:
-            overall_qlike_cal = None
-            print(f"[WARN] Calibrated QLIKE failed: {_e}")
+            trainer.callback_metrics["val_mae_uncal"]   = torch.tensor(mae_uncal)
+            trainer.callback_metrics["val_rmse_uncal"]  = torch.tensor(rmse_uncal)
+            trainer.callback_metrics["val_mse_uncal"]   = torch.tensor(mse_uncal)
+            trainer.callback_metrics["val_qlike_uncal"] = torch.tensor(qlike_uncal)
+        except Exception:
+            pass
 
-        # --- Optional direction metrics (overall) ---
+        # --- Optional direction metrics (overall) --- (unchanged)
         acc = None
         brier = None
         auroc = None
         if yd_cpu is not None and pdir_cpu is not None and yd_cpu.numel() > 0 and pdir_cpu.numel() > 0:
-            # Convert logits→probs if needed
             probs = pdir_cpu
             try:
-                # Convert to scalar min/max before boolean checks
                 minv = float(torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0).min().item())
                 maxv = float(torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0).max().item())
                 if (minv < 0.0) or (maxv > 1.0):
@@ -1590,7 +1592,6 @@ class PerAssetMetrics(pl.Callback):
             except Exception as e:
                 print(f"[WARN] AUROC failed: {e}")
 
-            # stash for later printing/saving
             try:
                 trainer.callback_metrics["val_brier_overall"] = torch.tensor(brier)
                 trainer.callback_metrics["val_auroc_overall"] = torch.tensor(auroc) if auroc is not None else None
@@ -1598,38 +1599,32 @@ class PerAssetMetrics(pl.Callback):
             except Exception:
                 pass
 
-        # --- Epoch summary / val loss ---
+        # --- Epoch summary / val loss (now based on CALIBRATED metrics) ---
         N = int(y_cpu.numel())
         try:
             epoch_num = int(getattr(trainer, "current_epoch", -1)) + 1
         except Exception:
             epoch_num = None
 
-        # Composite loss (absolute form for validation)
         val_comp = float(composite_score(overall_mae, overall_rmse, overall_qlike))
-        # Preferred monitor key
         trainer.callback_metrics["val_comp_overall"]      = torch.tensor(val_comp)
-        # Backward-compat alias (some monitors used this)
         trainer.callback_metrics["val_composite_overall"] = torch.tensor(val_comp)
-        trainer.callback_metrics["val_loss_source"]       = "composite(MAE,RMSE,QLIKE)"
-        # Lightning's default early-stopping key
+        trainer.callback_metrics["val_loss_source"]       = "composite(MAE,RMSE,QLIKE) — calibrated"
         trainer.callback_metrics["val_loss"]              = torch.tensor(val_comp)
         trainer.callback_metrics["val_loss_decoded"]      = torch.tensor(val_comp)
         trainer.callback_metrics["val_mae_overall"]       = torch.tensor(overall_mae)
         trainer.callback_metrics["val_rmse_overall"]      = torch.tensor(overall_rmse)
         trainer.callback_metrics["val_mse_overall"]       = torch.tensor(overall_mse)
         trainer.callback_metrics["val_qlike_overall"]     = torch.tensor(overall_qlike)
-        trainer.callback_metrics["val_qlike_cal"]     = torch.tensor(overall_qlike_cal)
         trainer.callback_metrics["val_N_overall"]         = torch.tensor(float(N))
 
         msg = (
             f"[VAL EPOCH {epoch_num}] "
-            f"(decoded) MAE={overall_mae:.6f} "
+            f"(decoded, CALIBRATED) MAE={overall_mae:.6f} "
             f"RMSE={overall_rmse:.6f} "
             f"MSE={overall_mse:.6f} "
             f"QLIKE={overall_qlike:.6f} "
-            f"CompLoss = {val_comp:.6f}"
-            + (f"QLIKE_CAL={overall_qlike_cal:.6f} " if overall_qlike_cal is not None else "")
+            f"CompLoss = {val_comp:.6f} "
             + (f" | ACC={acc:.3f}"   if acc   is not None else "")
             + (f" | Brier={brier:.4f}" if brier is not None else "")
             + (f" | AUROC={auroc:.3f}" if auroc is not None else "")
@@ -1719,7 +1714,7 @@ class PerAssetMetrics(pl.Callback):
             return
         rows = self._last_rows
         overall = self._last_overall
-        print("\nOverall decoded metrics (final):")
+        print("\nOverall decoded metrics (final, CALIBRATED):")
         print(f"MAE: {overall['mae']:.6f} | RMSE: {overall['rmse']:.6f} | MSE: {overall['mse']:.6f} | QLIKE: {overall['qlike']:.6f}")
 
         print("\nPer-asset validation metrics (top by samples):")
