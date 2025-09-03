@@ -852,13 +852,14 @@ def calibrate_vol_predictions(
     return_params: bool = False,
 ):
     """
-    Two-regime multiplicative calibration (low / high), kept close to your original API:
+    Three‑regime (tercile) multiplicative calibration (low / mid / high),
+    kept close to your original API:
 
-      • If `calib_params` is None  → FIT on validation truths (decoded): median split.
+      • If `calib_params` is None  → FIT on validation truths (decoded) using terciles.
       • If `calib_params` provided → APPLY to any split (e.g., test).
       • Regime is chosen using the **predicted median** (safe for test).
       • Same scale factor is applied to q05 and q95 if provided.
-      • Per-asset if `asset_ids` given; otherwise GLOBAL.
+      • Per‑asset if `asset_ids` given; otherwise GLOBAL.
 
     Returns
     -------
@@ -901,11 +902,13 @@ def calibrate_vol_predictions(
             if yy.numel() == 0 or pp.numel() == 0:
                 continue
 
-            # Split by the TRUE median of y (decoded)
-            t50 = torch.quantile(yy, torch.tensor(0.50, device=yy.device))
+            # Tercile thresholds from TRUE y (decoded)
+            t33, t66 = torch.quantile(yy, torch.tensor([0.33, 0.66], device=yy.device))
 
-            low_mask  = (yy <= t50)
-            high_mask = (yy >  t50)
+            # Define regimes by TRUE y for FITTING
+            low_mask  = (yy <= t33)
+            mid_mask  = (yy >  t33) & (yy <  t66)
+            high_mask = (yy >= t66)
 
             def _safe_scale(mask: torch.Tensor) -> float:
                 if torch.count_nonzero(mask).item() == 0:
@@ -918,12 +921,15 @@ def calibrate_vol_predictions(
                 return float((yt / yp).clamp(0.5, 2.0).item())
 
             s_low  = _safe_scale(low_mask)
+            s_mid  = _safe_scale(mid_mask)
             s_high = _safe_scale(high_mask)
 
             key = "GLOBAL" if grp is None else str(grp)
             params[key] = {
-                "t50":  float(t50.item()),
+                "t33":  float(t33.item()),
+                "t66":  float(t66.item()),
                 "s_low":  float(s_low),
+                "s_mid":  float(s_mid),
                 "s_high": float(s_high),
             }
 
@@ -942,14 +948,25 @@ def calibrate_vol_predictions(
         if par is None:
             continue
 
-        t50   = par["t50"]
+        t33   = par["t33"]
+        t66   = par["t66"]
         s_low = par["s_low"]
+        s_mid = par["s_mid"]
         s_high= par["s_high"]
 
         p_local = p50_cal[m]
+
         # Decide regime by **predicted** median
-        s = torch.where(p_local <= t50, torch.tensor(s_low,  device=p_local.device, dtype=p_local.dtype),
-                                     torch.tensor(s_high, device=p_local.device, dtype=p_local.dtype))
+        reg_low  = (p_local <= t33)
+        reg_high = (p_local >= t66)
+        reg_mid  = (~reg_low) & (~reg_high)
+
+        # Select scale per element
+        s = torch.empty_like(p_local)
+        s[reg_low]  = s_low
+        s[reg_mid]  = s_mid
+        s[reg_high] = s_high
+
         p50_cal[m] = p_local * s
         if q05_cal is not None: q05_cal[m] = q05_cal[m] * s
         if q95_cal is not None: q95_cal[m] = q95_cal[m] * s
