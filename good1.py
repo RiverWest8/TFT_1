@@ -433,23 +433,11 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
                 return v
         return None
 
-    # 1) Best ckpt
-    best_ckpt = None
-    for cb in getattr(trainer, "callbacks", []):
-        if isinstance(cb, pl.callbacks.ModelCheckpoint):
-            if getattr(cb, "best_model_path", None):
-                if cb.best_model_path and os.path.exists(cb.best_model_path):
-                    best_ckpt = cb.best_model_path
-                    break
-    if best_ckpt is None:
-        try:
-            cks = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
-            if cks:
-                best_ckpt = str(cks[0])
-        except Exception:
-            pass
-    if best_ckpt is None:
-        raise RuntimeError("Best checkpoint not found for export.")
+    # 1) Last ckpt only
+    last_ckpt = LOCAL_CKPT_DIR / "last.ckpt"
+    if not last_ckpt.exists():
+        raise RuntimeError("Last checkpoint not found for export.")
+    best_ckpt = str(last_ckpt)
 
     # 2) Model
     LM = type(trainer.lightning_module)
