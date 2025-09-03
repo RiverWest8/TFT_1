@@ -415,19 +415,17 @@ def _extract_vol_quantiles(pred):
 @torch.no_grad()
 def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     """
-    Minimal, robust export:
+    Robust export:
       • Load best checkpoint
       • Predict in raw mode (return_x=True)
       • Decode realised_vol with TRAIN normalizer
-      • Optionally apply VAL calibrator (on TEST)
-      • Save parquet with: asset, asset_id, time_idx, Time, y_vol, y_vol_pred,
-                           y_vol_pred_q05/q50/q95, y_dir, y_dir_prob
+      • On VAL: fit per-asset calibration (q05/q50/q95) and save JSON
+      • On TEST: load per-asset calibration (with glob fallback) and apply
+      • Save parquet with canonical columns.
     """
-    import json
-    import numpy as np
-    import pandas as pd
+    import json, os, numpy as np, pandas as pd
 
-    # Local helper to safely pick the first present key without boolean-evaluating tensors
+    # --- helpers ---
     def _first_not_none(d, keys):
         for k in keys:
             v = d.get(k, None) if isinstance(d, dict) else None
@@ -435,7 +433,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
                 return v
         return None
 
-    # 1) Find best checkpoint
+    # 1) Best ckpt
     best_ckpt = None
     for cb in getattr(trainer, "callbacks", []):
         if isinstance(cb, pl.callbacks.ModelCheckpoint):
@@ -453,12 +451,12 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     if best_ckpt is None:
         raise RuntimeError("Best checkpoint not found for export.")
 
-    # 2) Recreate model on current device
+    # 2) Model
     LM = type(trainer.lightning_module)
     best_model = LM.load_from_checkpoint(best_ckpt)
     best_model.eval().to(trainer.lightning_module.device)
 
-    # 3) id->name mapping (if PerAssetMetrics is present)
+    # 3) id->name
     metrics_cb = None
     for cb in getattr(trainer, "callbacks", []):
         if isinstance(cb, PerAssetMetrics):
@@ -466,7 +464,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             break
     id_to_name = {int(k): str(v) for k, v in (metrics_cb.id_to_name.items() if metrics_cb is not None else {})}
 
-    # 4) TRAIN normalizer for decoding
+    # 4) TRAIN normalizer
     vol_norm = None
     try:
         vol_norm = _extract_norm_from_dataset(getattr(best_model, "dataset", None))
@@ -478,34 +476,34 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
         except Exception:
             pass
 
-    # 5) If exporting TEST, try to load VAL calibrator (per-asset)
+    # 5) Maybe load calibration (TEST)
     calib_params = None
-    try:
-        if isinstance(split, str) and split.lower() == "test":
-            calib_path = LOCAL_RUN_DIR / f"tft_val_calib_params_e{MAX_EPOCHS}_{RUN_SUFFIX}.json"
-            if calib_path.exists():
-                with open(calib_path, "r") as f:
+    calib_path_exact = LOCAL_RUN_DIR / f"tft_val_calib_params_e{MAX_EPOCHS}_{RUN_SUFFIX}.json"
+    if isinstance(split, str) and split.lower() == "test":
+        if calib_path_exact.exists():
+            with open(calib_path_exact, "r") as f:
+                calib_params = json.load(f)
+            print(f"[EXPORT] Loaded VAL calibrator from {calib_path_exact}")
+        else:
+            # fallback: most recent calibration file for these epochs
+            cands = sorted(LOCAL_RUN_DIR.glob(f"tft_val_calib_params_e{MAX_EPOCHS}_*.json"),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
+            if cands:
+                with open(cands[0], "r") as f:
                     calib_params = json.load(f)
-                print(f"[EXPORT] Loaded VAL calibrator ({len(calib_params)} groups) from {calib_path}")
+                print(f"[EXPORT] Loaded latest VAL calibrator (fallback): {cands[0]}")
             else:
-                print(f"[WARN] No calibration file found at {calib_path}; leaving TEST uncalibrated.")
-    except Exception as e:
-        print(f"[WARN] Could not load calibrator: {e}")
-        calib_params = None
+                print(f"[WARN] No calibration file found; leaving TEST uncalibrated.")
 
-    # 6) Predict (raw) and normalise outputs to lists
+    # 6) Predict (raw)
     ret = best_model.predict(dataloader, mode="raw", return_x=True)
-    raw_preds, raw_x = None, None
     if isinstance(ret, (list, tuple)):
-        if len(ret) >= 2:
-            raw_preds, raw_x = ret[0], ret[1]
-        elif len(ret) == 1:
-            raw_preds = ret[0]
+        raw_preds, raw_x = (ret[0], ret[1]) if len(ret) >= 2 else (ret[0], None)
     elif isinstance(ret, dict):
         raw_preds = ret.get("prediction") or ret.get("predictions") or ret.get("y_hat") or ret.get("output")
         raw_x     = ret.get("x") or ret.get("inputs") or ret.get("batch") or ret.get("decoder_input")
     else:
-        raw_preds = ret
+        raw_preds, raw_x = ret, None
     if raw_preds is None:
         raise RuntimeError("predict() returned no predictions")
 
@@ -519,22 +517,21 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     if len(preds_list) == 1 and isinstance(preds_list[0], (dict, torch.Tensor)) and len(x_list) > 1:
         preds_list = preds_list * len(x_list)
 
-    # Accumulators
+    # 7) Accumulators
     assets_all, asset_id_all, t_all = [], [], []
     y_true_all, y_dir_all, y_dirprob_all = [], [], []
     y_pred_q05_all, y_pred_q50_all, y_pred_q95_all = [], [], []
 
-    # 7) Iterate batches
+    # 8) Loop
     for pred_b, xb in zip(preds_list, x_list):
         x = xb if isinstance(xb, dict) else (xb[0] if isinstance(xb, (list, tuple)) and xb and isinstance(xb[0], dict) else None)
         if x is None:
             continue
-
         pred_t = pred_b["prediction"] if (isinstance(pred_b, dict) and "prediction" in pred_b) else pred_b
         if pred_t is None:
             continue
 
-        # Groups (asset ids)
+        # groups
         g = None
         for k in ("groups", "group_ids", "group_id"):
             if k in x and x[k] is not None:
@@ -549,7 +546,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             continue
         L = g.shape[0]
 
-        # Time index (no tensor boolean 'or')
+        # time
         t = _first_not_none(x, ("decoder_time_idx", "decoder_relative_idx", "decoder_time", "time_idx"))
         if torch.is_tensor(t):
             while t.ndim > 1 and t.size(-1) == 1:
@@ -558,13 +555,12 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
         else:
             t = None
 
-        # Heads
+        # heads
         p_vol_enc, p_dir = _extract_heads(pred_t)
         if p_vol_enc is None:
             continue
         p_vol_enc = p_vol_enc.reshape(-1)[:L]
-
-        # Vol quantiles (encoded)
+        # quantiles (encoded)
         vol_q = _extract_vol_quantiles(pred_t)
         q05_enc = q50_enc = q95_enc = None
         if torch.is_tensor(vol_q) and vol_q.ndim == 2 and vol_q.size(1) >= (max(Q05_IDX, Q50_IDX, Q95_IDX) + 1):
@@ -575,7 +571,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
         else:
             q50_enc = p_vol_enc
 
-        # Decode to physical scale
+        # decode
         floor_val = float(globals().get("EVAL_VOL_FLOOR", 1e-8))
         if vol_norm is not None:
             y_q50 = torch.clamp(safe_decode_vol(p_vol_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1), min=floor_val)
@@ -584,20 +580,8 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
         else:
             y_q50, y_q05, y_q95 = p_vol_enc, q05_enc, q95_enc
 
-        # Apply VAL calibrator on TEST (scales q05/q50/q95 consistently, per-asset)
-        if calib_params is not None:
-            y_q50, y_q05, y_q95 = calibrate_vol_predictions(
-                y_true_dec=None,
-                y_pred_dec=y_q50,
-                asset_ids=g,
-                q05=y_q05, q95=y_q95,
-                calib_params=calib_params,
-                return_params=False
-            )
-
-        # True targets (may be absent in predict())
-        y_vol_true = None
-        y_dir_true = None
+        # true targets if present
+        y_vol_true, y_dir_true = None, None
         dec_t = x.get("decoder_target")
         if torch.is_tensor(dec_t):
             yt = dec_t
@@ -606,7 +590,6 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             elif yt.ndim == 2:
                 yt = yt[:, 0]
             y_vol_true = (safe_decode_vol(yt.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1) if vol_norm is not None else yt)
-            # direction (2nd channel if present)
             if dec_t.ndim == 3 and dec_t.size(-1) > 1:
                 y_dir_true = dec_t[:, 0, 1]
             elif dec_t.ndim == 2 and dec_t.size(1) > 1:
@@ -614,7 +597,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
         if y_dir_true is not None:
             y_dir_true = y_dir_true.reshape(-1)[:L]
 
-        # Direction → probability
+        # direction prob
         y_dir_prob = None
         if p_dir is not None and torch.is_tensor(p_dir):
             y_dir_prob = p_dir.reshape(-1)[:L]
@@ -625,13 +608,13 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
                 y_dir_prob = torch.sigmoid(y_dir_prob)
             y_dir_prob = torch.clamp(y_dir_prob, 0.0, 1.0)
 
-        # Names & ids
+        # names & ids
         aset = [id_to_name.get(int(i), str(int(i))) for i in g.detach().cpu().tolist()]
         assets_all.extend(aset)
         asset_id_all.extend(g.detach().cpu().long().tolist())
         t_all.extend(t.detach().cpu().tolist() if isinstance(t, torch.Tensor) else [None] * L)
 
-        # Push preds/targets (lists)
+        # push
         y_pred_q05_all.extend(y_q05.detach().cpu().tolist() if y_q05 is not None else [None] * L)
         y_pred_q50_all.extend(y_q50.detach().cpu().tolist())
         y_pred_q95_all.extend(y_q95.detach().cpu().tolist() if y_q95 is not None else [None] * L)
@@ -639,26 +622,27 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
         y_dir_all.extend(y_dir_true.detach().cpu().tolist() if y_dir_true is not None else [None] * L)
         y_dirprob_all.extend(y_dir_prob.detach().cpu().tolist() if y_dir_prob is not None else [None] * L)
 
-    # Assemble DF
+    # 9) Assemble DF with canonical names
     df = pd.DataFrame({
         "asset": assets_all,
         "asset_id": asset_id_all,
         "time_idx": t_all,
-        "y_vol": y_true_all,
-        "y_vol_pred": y_pred_q50_all,
-        "y_vol_pred_q05": y_pred_q05_all,
-        "y_vol_pred_q50": y_pred_q50_all,
-        "y_vol_pred_q95": y_pred_q95_all,
-        "y_dir": y_dir_all,
-        "y_dir_prob": y_dirprob_all,
+        "realised_vol": y_true_all,
+        "pred_realised_vol": y_pred_q50_all,
+        "pred_q05": y_pred_q05_all,
+        "pred_q50": y_pred_q50_all,
+        "pred_q95": y_pred_q95_all,
+        "direction": y_dir_all,
+        "pred_direction_prob": y_dirprob_all,
     })
 
-    # 8) Attach Time and backfill true targets from source split DF
+    # 10) Attach Time + backfill truths from split DF (if missing)
     try:
         candidates = []
-        if isinstance(split, str) and split.lower() == "val" and "val_df" in globals() and isinstance(val_df, pd.DataFrame):
+        s = (split or "").lower()
+        if s == "val" and "val_df" in globals() and isinstance(val_df, pd.DataFrame):
             candidates.append(val_df)
-        if isinstance(split, str) and split.lower() == "test" and "test_df" in globals() and isinstance(test_df, pd.DataFrame):
+        if s == "test" and "test_df" in globals() and isinstance(test_df, pd.DataFrame):
             candidates.append(test_df)
         for nm in ("raw_df", "full_df", "df"):
             obj = globals().get(nm)
@@ -671,64 +655,97 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
                 src = cand.copy()
                 break
 
-        if src is None:
-            print(f"[EXPORT] No suitable source dataframe found to attach Time/targets for split={split}")
-        else:
-            # Harmonise dtypes
-            df["asset"] = df["asset"].astype(str)
-            src["asset"] = src["asset"].astype(str)
+        if src is not None:
+            df["asset"] = df["asset"].astype(str); src["asset"] = src["asset"].astype(str)
 
             def _to_int64_safe(s):
                 s2 = pd.to_numeric(s, errors="coerce")
-                if pd.api.types.is_float_dtype(s2):
-                    s2 = np.floor(s2)
+                if pd.api.types.is_float_dtype(s2): s2 = np.floor(s2)
                 return s2.astype("Int64").astype("int64")
 
             df["time_idx"]  = _to_int64_safe(df["time_idx"])
             src["time_idx"] = _to_int64_safe(src["time_idx"])
 
-            # Build rename map to extract Time + true labels with aliases
-            rename_map = {}
-            if "Time" in src.columns:
-                rename_map["Time"] = "Time"
-            for c in ("realised_vol", "realized_vol", "y_vol", "vol_true", "target_vol"):
-                if c in src.columns:
-                    rename_map[c] = "y_vol_src"; break
-            for c in ("direction", "y_dir", "dir_true"):
-                if c in src.columns:
-                    rename_map[c] = "y_dir_src"; break
+            # rename possible aliases for truth columns
+            ren = {}
+            if "Time" in src.columns: ren["Time"] = "Time"
+            for c in ("realised_vol","realized_vol","y_vol","vol_true","target_vol"):
+                if c in src.columns: ren[c] = "rv_src"; break
+            for c in ("direction","y_dir","dir_true"):
+                if c in src.columns: ren[c] = "dir_src"; break
 
-            keep_cols = ["asset", "time_idx"] + [k for k in ("Time", "y_vol_src", "y_dir_src") if k in rename_map.values()]
-            src_lean = src.rename(columns={k: v for k, v in rename_map.items()})[keep_cols]
+            keep = ["asset","time_idx"] + [k for k in ("Time","rv_src","dir_src") if k in ren.values()]
+            src_lean = src.rename(columns={k: v for k, v in ren.items()})[keep]
+            src_lean = src_lean.drop_duplicates(subset=["asset","time_idx"], keep="last")
+            df = df.merge(src_lean, on=["asset","time_idx"], how="left", validate="m:1")
 
-            # Deduplicate and merge
-            src_lean = src_lean.drop_duplicates(subset=["asset", "time_idx"], keep="last")
-            df = df.merge(src_lean, on=["asset", "time_idx"], how="left", validate="m:1")
-
-            # Normalise Time dtype
             if "Time" in df.columns:
                 df["Time"] = pd.to_datetime(df["Time"], errors="coerce")
-                try:
-                    df["Time"] = df["Time"].dt.tz_localize(None)
-                except Exception:
-                    pass
+                try: df["Time"] = df["Time"].dt.tz_localize(None)
+                except Exception: pass
 
-            # Backfill true labels if missing in predict() batches
-            if "y_vol_src" in df.columns:
-                df["y_vol"] = df["y_vol"].where(df["y_vol"].notna(), df["y_vol_src"])
-                df.drop(columns=["y_vol_src"], inplace=True)
-            if "y_dir_src" in df.columns:
-                df["y_dir"] = df["y_dir"].where(df["y_dir"].notna(), df["y_dir_src"])
-                df.drop(columns=["y_dir_src"], inplace=True)
+            if "rv_src" in df.columns:
+                df["realised_vol"] = df["realised_vol"].where(df["realised_vol"].notna(), df["rv_src"])
+                df.drop(columns=["rv_src"], inplace=True)
+            if "dir_src" in df.columns:
+                df["direction"] = df["direction"].where(df["direction"].notna(), df["dir_src"])
+                df.drop(columns=["dir_src"], inplace=True)
+        else:
+            print(f"[EXPORT] No suitable source DF to attach Time/labels for split={split}")
 
     except Exception as e:
         print(f"[WARN][EXPORT] attach/backfill failed: {e}")
 
-    # 9) Save parquet
+    # 11) Calibrate & save/load params as needed
+    try:
+        # tensors for calibration
+        g_t   = torch.tensor(df["asset_id"].values, dtype=torch.long)
+        p50_t = torch.tensor(df["pred_realised_vol"].values, dtype=torch.float32)
+        q05_t = torch.tensor(df["pred_q05"].fillna(np.nan).values, dtype=torch.float32) if "pred_q05" in df else None
+        q95_t = torch.tensor(df["pred_q95"].fillna(np.nan).values, dtype=torch.float32) if "pred_q95" in df else None
+
+        # mask NaNs out of quantiles
+        if q05_t is not None and torch.isnan(q05_t).any(): q05_t = None
+        if q95_t is not None and torch.isnan(q95_t).any(): q95_t = None
+
+        if s == "val":
+            # need true realised_vol to fit
+            if df["realised_vol"].notna().any():
+                y_t = torch.tensor(df["realised_vol"].values, dtype=torch.float32)
+                p50_c, q05_c, q95_c, params = calibrate_vol_predictions(
+                    y_true_dec=y_t, y_pred_dec=p50_t,
+                    asset_ids=g_t, q05=q05_t, q95=q95_t,
+                    calib_params=None, return_params=True,
+                )
+                # write back calibrated columns
+                df["pred_realised_vol"] = p50_c.cpu().numpy()
+                if q05_c is not None: df["pred_q05"] = q05_c.cpu().numpy()
+                if q95_c is not None: df["pred_q95"] = q95_c.cpu().numpy()
+
+                # save calib JSON
+                with open(calib_path_exact, "w") as f:
+                    json.dump(params, f, indent=2)
+                print(f"✓ Saved calibration params → {calib_path_exact}")
+            else:
+                print("[WARN] VAL export has no realised_vol labels; skipped fitting calibration.")
+
+        elif s == "test" and calib_params is not None:
+            p50_c, q05_c, q95_c = calibrate_vol_predictions(
+                y_true_dec=None, y_pred_dec=p50_t,
+                asset_ids=g_t, q05=q05_t, q95=q95_t,
+                calib_params=calib_params, return_params=False,
+            )
+            df["pred_realised_vol"] = p50_c.cpu().numpy()
+            if q05_c is not None: df["pred_q05"] = q05_c.cpu().numpy()
+            if q95_c is not None: df["pred_q95"] = q95_c.cpu().numpy()
+
+    except Exception as e:
+        print(f"[WARN] Export/calibration failed: {e}")
+
+    # 12) Save parquet
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_path, index=False)
     print(f"✓ Wrote {split.upper()} predictions → {out_path}")
-    
 
 
 # -----------------------------------------------------------------------
