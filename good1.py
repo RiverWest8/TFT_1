@@ -1366,15 +1366,6 @@ class PerAssetMetrics(pl.Callback):
         ratio    = sigma2_y / sigma2_p
         overall_qlike = float((ratio - torch.log(ratio) - 1.0).mean().item())
 
-        # Calibrated QLIKE (diagnostic only; not used for scheduling)
-        try:
-            p_cal = calibrate_vol_predictions(y_cpu, p_cpu)
-            sigma2_pc = torch.clamp(p_cal.abs(), min=eps) ** 2
-            ratio_cal = sigma2_y / sigma2_pc
-            overall_qlike_cal = float((ratio_cal - torch.log(ratio_cal) - 1.0).mean().item())
-            trainer.callback_metrics["val_qlike_cal"] = torch.tensor(overall_qlike_cal)
-        except Exception as _e:
-            pass
 
         # --- Optional direction metrics (overall) ---
         acc = None
@@ -1427,7 +1418,6 @@ class PerAssetMetrics(pl.Callback):
         trainer.callback_metrics["val_rmse_overall"]      = torch.tensor(overall_rmse)
         trainer.callback_metrics["val_mse_overall"]       = torch.tensor(overall_mse)
         trainer.callback_metrics["val_qlike_overall"]     = torch.tensor(overall_qlike)
-        trainer.callback_metrics["val_qlike_cal"]     = torch.tensor(overall_qlike_cal)
         trainer.callback_metrics["val_N_overall"]         = torch.tensor(float(N))
 
         msg = (
@@ -1437,7 +1427,6 @@ class PerAssetMetrics(pl.Callback):
             f"MSE={overall_mse:.6f} "
             f"QLIKE={overall_qlike:.6f} "
             f"CompLoss = {val_comp:.6f}"
-            + (f"QLIKE_CAL={overall_qlike_cal:.6f} " if overall_qlike_cal is not None else "")
             + (f" | ACC={acc:.3f}"   if acc   is not None else "")
             + (f" | Brier={brier:.4f}" if brier is not None else "")
             + (f" | AUROC={auroc:.3f}" if auroc is not None else "")
@@ -2657,7 +2646,6 @@ class ValLossHistory(pl.Callback):
             "epoch": int(getattr(trainer, "current_epoch", -1)) + 1,
             "val_loss":            self._as_float(m.get("val_loss", float("nan"))),
             "val_qlike_overall":   self._as_float(m.get("val_qlike_overall", float("nan"))),
-            "val_qlike_cal":      self._as_float(m.get("val_qlike_cal", float("nan"))),
             "val_mae_overall":     self._as_float(m.get("val_mae_overall", float("nan"))),
             "val_rmse_overall":    self._as_float(m.get("val_rmse_overall", float("nan"))),
             "val_acc_overall":     self._as_float(m.get("val_acc_overall", float("nan"))),
@@ -2684,7 +2672,7 @@ EMBEDDING_CARDINALITY = {}
 
 BATCH_SIZE   = 128
 MAX_EPOCHS   = 35
-EARLY_STOP_PATIENCE = 15
+EARLY_STOP_PATIENCE = 12
 PERM_BLOCK_SIZE = 288
 
 # Artifacts are written locally then uploaded to GCS
