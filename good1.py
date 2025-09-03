@@ -550,8 +550,8 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             continue
         L = g.shape[0]
 
-        # Time index (optional)
-        t = x.get("decoder_time_idx") or x.get("decoder_relative_idx")
+        # Time index (optional) — avoid boolean evaluation of tensors
+        t = _first_not_none(x, ("decoder_time_idx", "decoder_relative_idx", "decoder_time", "time_idx"))
         if torch.is_tensor(t):
             while t.ndim > 1 and t.size(-1) == 1:
                 t = t.squeeze(-1)
@@ -645,6 +645,8 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
 
         # Map asset ids → names
         aset = [id_to_name.get(int(i), str(int(i))) for i in g.detach().cpu().tolist()]
+        # Store raw asset ids as well
+        asset_id_all.extend(g.detach().cpu().long().tolist())
         
 
         # Append accumulators
