@@ -636,6 +636,23 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
         "pred_direction_prob": y_dirprob_all,
     })
 
+    # --- Ensure numeric columns are real numeric; avoid numpy.object_ from None ---
+    _num_cols = [
+        "realised_vol",
+        "pred_realised_vol",
+        "pred_q05",
+        "pred_q50",
+        "pred_q95",
+        "pred_direction_prob",
+    ]
+    for _c in _num_cols:
+        if _c in df.columns:
+            df[_c] = pd.to_numeric(df[_c], errors="coerce")  # None/"None" -> NaN, dtype float
+
+    # asset_id as nullable Int64 here (we cast to torch.long later)
+    if "asset_id" in df.columns:
+        df["asset_id"] = pd.to_numeric(df["asset_id"], errors="coerce").astype("Int64")
+
     # 10) Attach Time + backfill truths from split DF (if missing)
     try:
         candidates = []
@@ -698,20 +715,30 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
 
     # 11) Calibrate & save/load params as needed
     try:
-        # tensors for calibration
-        g_t   = torch.tensor(df["asset_id"].values, dtype=torch.long)
-        p50_t = torch.tensor(df["pred_realised_vol"].values, dtype=torch.float32)
-        q05_t = torch.tensor(df["pred_q05"].fillna(np.nan).values, dtype=torch.float32) if "pred_q05" in df else None
-        q95_t = torch.tensor(df["pred_q95"].fillna(np.nan).values, dtype=torch.float32) if "pred_q95" in df else None
+        # Build tensors with proper dtypes (coerce from pandas to avoid object arrays)
+        g_arr = pd.to_numeric(df["asset_id"], errors="coerce").fillna(-1).astype("int64").to_numpy()
+        g_t   = torch.tensor(g_arr, dtype=torch.long)
 
-        # mask NaNs out of quantiles
-        if q05_t is not None and torch.isnan(q05_t).any(): q05_t = None
-        if q95_t is not None and torch.isnan(q95_t).any(): q95_t = None
+        p50_arr = pd.to_numeric(df["pred_realised_vol"], errors="coerce").to_numpy(dtype=np.float32)
+        p50_t   = torch.tensor(p50_arr, dtype=torch.float32)
+
+        q05_t = None
+        if "pred_q05" in df.columns:
+            q05_arr = pd.to_numeric(df["pred_q05"], errors="coerce").to_numpy(dtype=np.float32)
+            if np.isfinite(q05_arr).sum() > 0:
+                q05_t = torch.tensor(q05_arr, dtype=torch.float32)
+
+        q95_t = None
+        if "pred_q95" in df.columns:
+            q95_arr = pd.to_numeric(df["pred_q95"], errors="coerce").to_numpy(dtype=np.float32)
+            if np.isfinite(q95_arr).sum() > 0:
+                q95_t = torch.tensor(q95_arr, dtype=torch.float32)
 
         if s == "val":
             # need true realised_vol to fit
             if df["realised_vol"].notna().any():
-                y_t = torch.tensor(df["realised_vol"].values, dtype=torch.float32)
+                y_arr = pd.to_numeric(df["realised_vol"], errors="coerce").to_numpy(dtype=np.float32)
+                y_t   = torch.tensor(y_arr, dtype=torch.float32)
                 p50_c, q05_c, q95_c, params = calibrate_vol_predictions(
                     y_true_dec=y_t, y_pred_dec=p50_t,
                     asset_ids=g_t, q05=q05_t, q95=q95_t,
