@@ -157,12 +157,8 @@ import argparse
 import pytorch_forecasting as pf
 import inspect
 
-VOL_QUANTILES = [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95] #The quantiles which yielded our best so far
-#Q50_IDX = VOL_QUANTILES.index(0.50)  
-#VOL_QUANTILES = [0.05, 0.15, 0.35, 0.50, 0.65, 0.85, 0.95]
+VOL_QUANTILES = [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95]  # The quantiles which yielded our best so far
 Q50_IDX = VOL_QUANTILES.index(0.50)
-Q05_IDX = VOL_QUANTILES.index(0.05)
-Q95_IDX = VOL_QUANTILES.index(0.95)
 # Floor used when computing decoded QLIKE to avoid blow-ups when y or ŷ ~ 0
 EVAL_VOL_FLOOR = 1e-6
 
@@ -418,14 +414,11 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     """
     Export predictions for a split (val/test) using the best checkpoint.
     Harmonised parquet schema:
-        asset, time_idx, Time, y_vol, y_vol_pred, 
-        y_vol_pred_q05, y_vol_pred_q50, y_vol_pred_q95, y_dir_prob
-    All vol preds are decoded and calibrated using the saved validation calibrator if available.
+        asset, time_idx, Time, y_vol, y_dir, y_vol_pred, y_vol_pred_q50, y_dir_prob
+    All vol preds are decoded and legacy‑calibrated (q50 only).
     """
 
-    # --- Load saved validation calibrator (applied to all splits) ---
-    calib_dict = _load_val_calibrator(LOCAL_RUN_DIR) if 'LOCAL_RUN_DIR' in globals() else None
-
+   
     # 1) Locate best checkpoint
     best_ckpt = None
     for cb in getattr(trainer, "callbacks", []):
@@ -501,29 +494,37 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
         if p_vol_enc is None:
             continue
 
-        # quantiles
+        # quantiles → keep only q50 (median)
         vol_q = _extract_vol_quantiles(pred_b["prediction"] if isinstance(pred_b, dict) else pred_b)
-        q05_enc, q50_enc, q95_enc = None, None, None
-        if torch.is_tensor(vol_q) and vol_q.ndim == 2 and vol_q.size(1) >= 3:
-            q05_enc, q50_enc, q95_enc = vol_q[:, Q05_IDX], vol_q[:, Q50_IDX], vol_q[:, Q95_IDX]
+        if torch.is_tensor(vol_q) and vol_q.ndim == 2 and vol_q.size(1) > Q50_IDX:
+            q50_enc = vol_q[:, Q50_IDX]
         else:
             q50_enc = p_vol_enc
 
         # decode vols
         def _decode(v):
-            if v is None: return None
+            if v is None: 
+                return None
             if vol_norm is not None:
                 return safe_decode_vol(v.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
             return v
 
-        y_q05, y_q50, y_q95 = map(_decode, (q05_enc, q50_enc, q95_enc))
+        y_q50 = _decode(q50_enc)
+        y_q50 = calibrate_vol_predictions(y_vol_true, y_q50)
 
-        # true vols
+        # true targets (vol + optional direction)
         y_vol_true = None
+        y_dir_true = None
         dec_t = x.get("decoder_target")
         if torch.is_tensor(dec_t):
+            # realised_vol (encoded) → decode to physical
             yt = dec_t[:, 0, 0] if dec_t.ndim == 3 else dec_t[:, 0]
             y_vol_true = _decode(yt)
+            # direction label if present (no decode needed)
+            if (dec_t.ndim == 3 and dec_t.size(-1) >= 2):
+                y_dir_true = dec_t[:, 0, 1]
+            elif (dec_t.ndim == 2 and dec_t.size(1) >= 2):
+                y_dir_true = dec_t[:, 1]
 
         # direction prob
         y_dir_prob = None
@@ -531,11 +532,9 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             y_dir_prob = torch.sigmoid(p_dir.reshape(-1)[:L]) if (p_dir.min() < 0 or p_dir.max() > 1) else p_dir.reshape(-1)[:L]
             y_dir_prob = torch.clamp(y_dir_prob, 0, 1)
 
-        # apply calibration if available
-        if calib_dict is not None:
-            y_q50 = apply_pred_regime_calibrator(y_q50, calib_dict)
-            if y_q05 is not None: y_q05 = apply_pred_regime_calibrator(y_q05, calib_dict)
-            if y_q95 is not None: y_q95 = apply_pred_regime_calibrator(y_q95, calib_dict)
+        # legacy calibration on q50 only (requires y_vol_true)
+        if y_vol_true is not None and y_q50 is not None:
+            y_q50 = calibrate_vol_predictions(y_vol_true, y_q50)
 
         # assemble records
         assets = [id_to_name.get(int(i), str(int(i))) for i in g.detach().cpu().tolist()]
@@ -543,10 +542,9 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             "asset": assets[i],
             "time_idx": int(t[i].item()) if isinstance(t, torch.Tensor) else None,
             "y_vol": float(y_vol_true[i].item()) if y_vol_true is not None else None,
+            "y_dir": int(y_dir_true[i].item()) if y_dir_true is not None else None,
             "y_vol_pred": float(y_q50[i].item()) if y_q50 is not None else None,
-            "y_vol_pred_q05": float(y_q05[i].item()) if y_q05 is not None else None,
             "y_vol_pred_q50": float(y_q50[i].item()) if y_q50 is not None else None,
-            "y_vol_pred_q95": float(y_q95[i].item()) if y_q95 is not None else None,
             "y_dir_prob": float(y_dir_prob[i].item()) if y_dir_prob is not None else None,
         } for i in range(L)])
 
@@ -783,74 +781,6 @@ def apply_pred_regime_calibrator(p: torch.Tensor, calib: dict) -> torch.Tensor:
     out[m_hi] = out[m_hi] * s_hi
     return out.view_as(p)
 
-@torch.no_grad()
-def apply_calibrator_to_quantiles(q50: torch.Tensor,
-                                  q05: torch.Tensor | None,
-                                  q95: torch.Tensor | None,
-                                  calib: dict) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    """
-    Calibrate q50 and (optionally) q05/q95 *multiplicatively*. We decide the
-    scaling regime from q50, and apply the same factor to q05/q95 so that
-    the interval width is preserved proportionally.
-    """
-    if not isinstance(calib, dict) or calib.get("mode") != "pred_tercile":
-        return q50, q05, q95
-
-    q_lo = float(calib.get("q_lo", 0.33))
-    q_hi = float(calib.get("q_hi", 0.66))
-    s_lo = float(calib.get("s_lo", 1.0))
-    s_hi = float(calib.get("s_hi", 1.0))
-
-    base = q50.reshape(-1)
-    if base.numel() == 0:
-        return q50, q05, q95
-
-    t_lo = torch.quantile(base, q_lo)
-    t_hi = torch.quantile(base, q_hi)
-    m_lo = base <= t_lo
-    m_hi = base >= t_hi
-
-    q50c = base.clone()
-    q50c[m_lo] = q50c[m_lo] * s_lo
-    q50c[m_hi] = q50c[m_hi] * s_hi
-    q50c = q50c.view_as(q50)
-
-    def _scale_like(x: torch.Tensor | None):
-        if x is None:
-            return None
-        flat = x.reshape(-1).clone()
-        flat[m_lo] = flat[m_lo] * s_lo
-        flat[m_hi] = flat[m_hi] * s_hi
-        return flat.view_as(x)
-
-    return q50c, _scale_like(q05), _scale_like(q95)
-
-def _save_val_calibrator(calib: dict, path: Path) -> None:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(calib, f, indent=2)
-        print(f"✓ Saved validation calibrator → {path}")
-    except Exception as e:
-        print(f"[WARN] Could not save calibrator: {e}")
-
-def _load_val_calibrator(run_dir: Path) -> dict | None:
-    """
-    Try to load a calibrator JSON for this run. Prefer the file matching the
-    current RUN_SUFFIX; otherwise take the most recent one.
-    """
-    try:
-        exact = run_dir / f"tft_val_calibrator_e{MAX_EPOCHS}_{RUN_SUFFIX}.json"
-        if exact.exists():
-            with open(exact, "r") as f:
-                return json.load(f)
-        cands = sorted(run_dir.glob("tft_val_calibrator_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if cands:
-            with open(cands[0], "r") as f:
-                return json.load(f)
-    except Exception as e:
-        print(f"[WARN] Could not load calibrator: {e}")
-    return None
 
 # --- Predicted-tercile calibrator: fit on VAL, apply anywhere (VAL/TEST) ---
 @torch.no_grad()
@@ -1183,8 +1113,6 @@ class PerAssetMetrics(pl.Callback):
         self._g_dev = []    # group ids per sample (device, flattened)
         self._yv_dev = []   # realised vol target (NORMALISED, device)
         self._pv_dev = []   # realised vol pred   (NORMALISED, device) - median (q50)
-        self._pq05_dev = [] # realised vol pred   (NORMALISED, device) - q05
-        self._pq95_dev = [] # realised vol pred   (NORMALISED, device) - q95
         self._yd_dev = []   # direction target (device)
         self._pd_dev = []   # direction pred logits/probs (device)
         self._t_dev = []    # decoder time_idx (device) if provided
@@ -1282,24 +1210,11 @@ class PerAssetMetrics(pl.Callback):
         if p_vol is None:
             return  # nothing usable in this batch
 
-        # --- ALSO capture q05 and q95 for uncertainty bands ---
-        vol_q = _extract_vol_quantiles(pred)
-        q05_b, q95_b = None, None
-        if torch.is_tensor(vol_q) and vol_q.ndim == 2 and vol_q.size(1) >= (max(Q05_IDX, Q95_IDX) + 1):
-            # enforce monotone quantiles and select indices
-            vol_q = torch.cummax(vol_q, dim=-1).values
-            q05_b = vol_q[:, Q05_IDX]
-            q95_b = vol_q[:, Q95_IDX]
-
         # Store device tensors; no decode/CPU here
         L = g.shape[0]
         self._g_dev.append(g.reshape(L))
         self._yv_dev.append(y_vol_t.reshape(L))
         self._pv_dev.append(p_vol.reshape(L))
-        if q05_b is not None:
-            self._pq05_dev.append(q05_b.reshape(L))
-        if q95_b is not None:
-            self._pq95_dev.append(q95_b.reshape(L))
 
         # capture time index if available and shape-compatible
         if dec_time is not None and torch.is_tensor(dec_time):
@@ -1382,17 +1297,13 @@ class PerAssetMetrics(pl.Callback):
         ratio    = sigma2_y / sigma2_p
         overall_qlike = float((ratio - torch.log(ratio) - 1.0).mean().item())
 
-        # Calibrated QLIKE (diagnostic only; not used for scheduling)
-        # Fit a predicted-tercile calibrator on VAL and compute calibrated QLIKE
-        self._val_calibrator = fit_pred_regime_calibrator(y_cpu, p_cpu)
+        # Calibrated QLIKE (diagnostic only; legacy method)
         try:
-            p_cal = apply_pred_regime_calibrator(p_cpu, self._val_calibrator)
+            p_cal = calibrate_vol_predictions(y_cpu, p_cpu)
             sigma2_pc = torch.clamp(p_cal.abs(), min=eps) ** 2
             ratio_cal = sigma2_y / sigma2_pc
             overall_qlike_cal = float((ratio_cal - torch.log(ratio_cal) - 1.0).mean().item())
             trainer.callback_metrics["val_qlike_cal"] = torch.tensor(overall_qlike_cal)
-            # persist calibrator to disk so TEST export can reuse it
-            _save_val_calibrator(self._val_calibrator, LOCAL_RUN_DIR / f"tft_val_calibrator_e{MAX_EPOCHS}_{RUN_SUFFIX}.json")
         except Exception as _e:
             overall_qlike_cal = None
             print(f"[WARN] Calibrated QLIKE failed: {_e}")
@@ -1625,23 +1536,8 @@ class PerAssetMetrics(pl.Callback):
                 yv_dec = self.vol_norm.decode(yv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
                 pv_dec = self.vol_norm.decode(pv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
 
-                # Optional: decode q05/q95 if collected
-                q05_dec = q95_dec = None
-                if self._pq05_dev:
-                    pq05_cpu = torch.cat(self._pq05_dev).detach().cpu()
-                    q05_dec = self.vol_norm.decode(pq05_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
-                if self._pq95_dev:
-                    pq95_cpu = torch.cat(self._pq95_dev).detach().cpu()
-                    q95_dec = self.vol_norm.decode(pq95_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
-
-                # Apply the same calibration used in metrics to the median so parquet matches plots
-                # Apply predicted-tercile calibrator (fitted on VAL) to q50 and propagate to q05/q95
-                calib = getattr(self, "_val_calibrator", None)
-                if calib is not None:
-                    pv_dec, q05_dec, q95_dec = apply_calibrator_to_quantiles(pv_dec, q05_dec, q95_dec, calib)
-                else:
-                    # legacy single-pass calibration fallback
-                    pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
+                # Legacy calibration on q50 only
+                pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
 
                 # map group id -> name
                 assets = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
@@ -3536,7 +3432,7 @@ if __name__ == "__main__":
         callbacks=[TQDMProgressBar(refresh_rate=50), es_cb, metrics_cb, mirror_cb, lr_cb, val_hist_cb] + EXTRA_CALLBACKS,
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
-        enable_progress_bar=True,
+        enable_progress_bar=False,
     )
 
 
