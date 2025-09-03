@@ -471,18 +471,38 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             vol_norm = None
 
     # 5) Predict in raw mode; handle multiple return layouts
-    raw_preds, raw_x = best_model.predict(dataloader, mode="raw", return_x=True)
+    # Some PF/Lightning versions return (preds, x), others (preds, x, idx), and
+    # sometimes a dict. We only need the first two: preds and x.
+    ret = best_model.predict(dataloader, mode="raw", return_x=True)
+
+    raw_preds, raw_x = None, None
+    if isinstance(ret, (list, tuple)):
+        # (preds, x) or (preds, x, idx, ...)
+        if len(ret) >= 2:
+            raw_preds, raw_x = ret[0], ret[1]
+        elif len(ret) == 1:
+            raw_preds = ret[0]
+    elif isinstance(ret, dict):
+        # try common keys
+        raw_preds = ret.get("prediction") or ret.get("predictions") or ret.get("y_hat") or ret.get("output")
+        raw_x     = ret.get("x") or ret.get("inputs") or ret.get("batch") or ret.get("decoder_input")
+    else:
+        # single object (just preds)
+        raw_preds = ret
+
+    if raw_preds is None:
+        raise RuntimeError("predict() returned no predictions")
 
     # Normalise to per-batch lists for easier zipping
     def _to_list(obj):
         if isinstance(obj, (list, tuple)):
             return list(obj)
-        return [obj]
+        return [obj] if obj is not None else []
 
     preds_list = _to_list(raw_preds)
-    x_list = _to_list(raw_x)
+    x_list     = _to_list(raw_x)
 
-    # If a single big tensor dict was returned for preds but x is list, replicate once per batch length
+    # If we got a single preds blob but many x batches, replicate preds to match
     if len(preds_list) == 1 and isinstance(preds_list[0], (dict, torch.Tensor)) and len(x_list) > 1:
         preds_list = preds_list * len(x_list)
 
@@ -2289,7 +2309,6 @@ class TailWeightRamp(pl.Callback):
         print(f"[TAIL] epoch={e} tail_weight={self.vol_loss.tail_weight:.4f} (ramp prog={prog:.2f}, gate={'on' if self.gate else 'off'})")
 
 
-
 class CosineLR(pl.Callback):
     """
     Cosine decay that ends at a near-zero floor, with an optional final hold
@@ -2303,19 +2322,22 @@ class CosineLR(pl.Callback):
         hold_last_epochs: Number of final epochs to hold LR at the floor
             (converted to steps at runtime) to settle in the minima.
         warmup_steps: Optional number of warmup steps (linear 0→1) before cosine.
+        min_lr: Absolute floor for LR (safeguard against collapse).
     """
     def __init__(
         self,
         start_epoch: int = 8,
-        eta_min_ratio: float = 1e-5,
+        eta_min_ratio: float = 1e-3,
         hold_last_epochs: int = 1,
         warmup_steps: int | None = None,
+        min_lr: float = 0.0,
     ):
         super().__init__()
         self.start_epoch = int(start_epoch)
         self.eta_min_ratio = float(eta_min_ratio)
         self.hold_last_epochs = int(max(0, hold_last_epochs))
         self.warmup_steps = None if warmup_steps is None else int(max(0, warmup_steps))
+        self.min_lr = float(min_lr)
 
         # resolved at fit start
         self._base_lrs = None
@@ -2332,7 +2354,7 @@ class CosineLR(pl.Callback):
         for opt in trainer.optimizers:
             for pg in opt.param_groups:
                 self._base_lrs.append(float(pg.get("lr", 1e-3)))
-        self._eta_mins = [lr * self.eta_min_ratio for lr in self._base_lrs]
+        self._eta_mins = [max(lr * self.eta_min_ratio, self.min_lr) for lr in self._base_lrs]
 
         max_epochs = int(getattr(trainer, "max_epochs", 1) or 1)
 
@@ -2365,7 +2387,8 @@ class CosineLR(pl.Callback):
         print(
             f"[LR Cosine(step)] total_steps={self._total_steps} steps/epoch={self._steps_per_epoch} "
             f"start_epoch={self.start_epoch} (start_steps={self._start_steps}) hold_last_epochs={self.hold_last_epochs} "
-            f"(hold_last_steps={self._hold_last_steps}) eta_min_ratio={self.eta_min_ratio} warmup_steps={self.warmup_steps}"
+            f"(hold_last_steps={self._hold_last_steps}) eta_min_ratio={self.eta_min_ratio} "
+            f"warmup_steps={self.warmup_steps} min_lr={self.min_lr}"
         )
 
     def _set_lrs(self, trainer, factor: float):
@@ -2376,7 +2399,7 @@ class CosineLR(pl.Callback):
                 base_lr = self._base_lrs[i]
                 eta_min = self._eta_mins[i]
                 lr = eta_min + (base_lr - eta_min) * float(max(0.0, min(1.0, factor)))
-                pg["lr"] = float(lr)
+                pg["lr"] = float(max(lr, self.min_lr))  # enforce absolute floor
                 i += 1
 
     def _compute_factor(self, step: int) -> float:
@@ -2490,8 +2513,8 @@ EXTRA_CALLBACKS = [
           save_top_k=2,
           save_last=True,
       ),
-      StochasticWeightAveraging(swa_lrs = 1e6 , annealing_epochs = 1, annealing_strategy="cos", swa_epoch_start=max(1, int(0.85 * MAX_EPOCHS))),
-      CosineLR(start_epoch=8, eta_min_ratio=1e-4, hold_last_epochs=3, warmup_steps=0),
+      StochasticWeightAveraging(swa_lrs = 8.5e-4, annealing_epochs = 1, annealing_strategy="cos", swa_epoch_start=max(1, int(0.85 * MAX_EPOCHS))),
+      CosineLR(start_epoch=8, eta_min_ratio=1e-3, hold_last_epochs=3, warmup_steps=0, min_lr = 3e-5),
       ]
 
 class ValLossHistory(pl.Callback):
