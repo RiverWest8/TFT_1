@@ -164,7 +164,7 @@ Q50_IDX = VOL_QUANTILES.index(0.50)
 Q05_IDX = VOL_QUANTILES.index(0.05)
 Q95_IDX = VOL_QUANTILES.index(0.95)
 # Floor used when computing decoded QLIKE to avoid blow-ups when y or ŷ ~ 0
-EVAL_VOL_FLOOR = 1e-6
+EVAL_VOL_FLOOR = 1e-8
 
 # Composite metric weights (override via --metric_weights "w_mae,w_rmse,w_qlike")
 COMP_WEIGHTS = (1.0, 1.0, 0.004)  # default: slightly emphasise QLIKE for RV focus
@@ -817,69 +817,51 @@ def safe_decode_vol(y: torch.Tensor, normalizer, group_ids: torch.Tensor | None)
 
 # ---------------- Regime-dependent calibration helper ----------------
 @torch.no_grad()
-def calibrate_vol_predictions(y_true_dec: torch.Tensor, y_pred_dec: torch.Tensor) -> torch.Tensor:
+def calibrate_vol_predictions(y_true_dec: torch.Tensor,
+                              y_pred_dec: torch.Tensor,
+                              asset_ids: torch.Tensor | None = None) -> torch.Tensor:
     """
-    Simple 2‑regime multiplicative calibration computed on validation targets.
-    We match the mean in the bottom and top terciles separately to stretch tails
-    (helps when predictions are cramped at the low end).
+    Two-regime (low/high) multiplicative calibration. If asset_ids is provided,
+    the scaling is computed and applied **per asset**; otherwise global.
     """
-    # ensure 1D
     y = y_true_dec.reshape(-1)
     p = y_pred_dec.reshape(-1).clone()
+
     if y.numel() == 0 or p.numel() == 0:
         return y_pred_dec
 
-    # compute terciles
-    q33, q66 = torch.quantile(y, torch.tensor([0.33, 0.66], device=y.device))
-    low_mask = y <= q33
-    high_mask = y >= q66
+    if asset_ids is None:
+        groups = [None]
+    else:
+        g = asset_ids.reshape(-1).detach().cpu().numpy()
+        groups = np.unique(g)
 
-    def _apply(mask: torch.Tensor):
-        if mask is None or mask.sum() == 0:
-            return
-        yp = p[mask].mean()
-        yt = y[mask].mean()
-        if torch.isfinite(yp) and torch.isfinite(yt) and float(torch.abs(yp)) > 1e-12:
-            s = (yt / yp).clamp(0.5, 2.0)
-            p[mask] = p[mask] * s
+    for grp in groups:
+        mask_g = (slice(None) if grp is None else (torch.tensor(g, device=y.device) == grp))
+        if mask_g is not slice(None) and mask_g.sum() == 0:
+            continue
+        yy = y[mask_g]
+        pp = p[mask_g]
 
-    _apply(low_mask)
-    _apply(high_mask)
+        if yy.numel() == 0 or pp.numel() == 0:
+            continue
+
+        q33, q66 = torch.quantile(yy, torch.tensor([0.33, 0.66], device=yy.device))
+        low_mask  = (yy <= q33)
+        high_mask = (yy >= q66)
+
+        for m in (low_mask, high_mask):
+            if m.sum() == 0:
+                continue
+            yp = pp[m].mean()
+            yt = yy[m].mean()
+            if torch.isfinite(yp) and torch.isfinite(yt) and float(torch.abs(yp)) > 1e-12:
+                s = (yt / yp).clamp(0.5, 2.0)
+                pp[m] = pp[m] * s
+
+        p[mask_g] = pp
 
     return p.view_as(y_pred_dec)
-
-if not hasattr(GroupNormalizer, "decode"):
-    def _gn_decode(self, y, group_ids=None, **kwargs):
-        """
-        Alias for `inverse_transform` to keep newer *and* older
-        PyTorch‑Forecasting versions compatible with the same call‑site.
-
-        The underlying `inverse_transform` API has changed a few times:
-        ▸ Newer versions accept ``group_ids=`` keyword
-        ▸ Some legacy variants want ``X=`` instead
-        ▸ Very old releases implement the method but raise ``NotImplementedError``  
-          (it was a placeholder).
-
-        The cascading fall‑backs below try each signature in turn and, as a
-        last resort, simply return the *input* unchanged so downstream code
-        can continue without crashing.
-        """
-        try:
-            # 1️⃣  Modern signature (>=0.10): accepts ``group_ids=``
-            return self.inverse_transform(y, group_ids=group_ids, **kwargs)
-        except (TypeError, NotImplementedError):
-            try:
-                # 2️⃣  Mid‑vintage signature: expects ``X=None`` instead
-                return self.inverse_transform(y, X=None, **kwargs)
-            except (TypeError, NotImplementedError):
-                try:
-                    # 3️⃣  Very early signature: just (y) positional
-                    return self.inverse_transform(y)
-                except (TypeError, NotImplementedError):
-                    # 4️⃣  Ultimate fall‑back – give up on denorm, return y
-                    return y
-
-    GroupNormalizer.decode = _gn_decode
 
 
 
@@ -1516,7 +1498,7 @@ class PerAssetMetrics(pl.Callback):
                     q95_dec = self.vol_norm.decode(pq95_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
 
                 # Apply the same calibration used in metrics to the median so parquet matches plots
-                pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
+                pv_dec = calibrate_vol_predictions(yv_dec, pv_dec, asset_ids=g_cpu)
 
                 # map group id -> name
                 assets = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
