@@ -511,6 +511,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     y_true_all, y_dirprob_all = [], []
     y_pred_q05_all, y_pred_q50_all, y_pred_q95_all = [], [], []
     y_dir_all = []
+    asset_id_all = []
     # Helper: extract x dict from a batch container
     def _get_x(b):
         if isinstance(b, dict):
@@ -618,6 +619,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
                 y_vol_true = safe_decode_vol(yt.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
             else:
                 y_vol_true = yt
+        
 
         # True direction target (optional)
         y_dir_true = None
@@ -643,6 +645,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
 
         # Map asset ids → names
         aset = [id_to_name.get(int(i), str(int(i))) for i in g.detach().cpu().tolist()]
+        
 
         # Append accumulators
         assets_all.extend(aset)
@@ -672,6 +675,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
 
     df = pd.DataFrame({
         "asset": assets_all,
+        "asset_id": asset_id_all,
         "time_idx": t_all,
         "y_vol": y_true_all,
         "y_vol_pred": y_pred_q50_all,    # point forecast = q50
@@ -827,100 +831,66 @@ def calibrate_vol_predictions(
     return_params: bool = False,
 ):
     """
-    Two- or three-regime multiplicative calibration (low/mid/high), kept as close
-    as possible to the original function:
-      • If `calib_params` is None, we FIT thresholds on y_true_dec (validation).
-      • If `calib_params` is provided, we APPLY them (e.g., on test).
-      • We always CHOOSE the regime using the **predicted median** (safe for test).
-      • The same scale factor is applied to q05 and q95 if provided.
-
-    Args
-    ----
-    y_true_dec : torch.Tensor | None
-        Decoded true vols (validation). Optional if `calib_params` is provided
-        (e.g., on test, set this to None).
-    y_pred_dec : torch.Tensor
-        Decoded predicted median (q50).
-    asset_ids : torch.Tensor | None
-        Group ids (e.g., per-asset). If None, treat as a single global group.
-    q05, q95 : torch.Tensor | None
-        Optional decoded quantile predictions to be scaled consistently.
-    calib_params : dict | None
-        Pre-fitted parameters: {group -> {"t33","t66","s_low","s_mid","s_high"}}.
-        If provided, we DO NOT fit anything and just apply these.
-    return_params : bool
-        If True and we fit, also return the learned params (for saving to JSON).
-
-    Returns
-    -------
-    p_cal : torch.Tensor
-        Calibrated median.
-    q05_cal : torch.Tensor | None
-        Calibrated q05 (if q05 was given), else None.
-    q95_cal : torch.Tensor | None
-        Calibrated q95 (if q95 was given), else None.
-    params : dict (optional)
-        Only returned if `return_params=True`. Same structure as `calib_params`.
+    Two- or three-regime multiplicative calibration (low/mid/high), kept close to your original:
+      • If `calib_params` is None, FIT thresholds/scales on y_true_dec (validation).
+      • If `calib_params` is provided, APPLY them (e.g., on test).
+      • Choose regime using **predicted median** (safe for test).
+      • Apply the same scale to q05 and q95 when provided.
+      • Works per-asset if `asset_ids` is given; otherwise global.
     """
     # Flatten views
-    p50 = y_pred_dec.reshape(-1).clone()
-    y   = None if y_true_dec is None else y_true_dec.reshape(-1)
+    p50  = y_pred_dec.reshape(-1).clone()
+    y    = None if y_true_dec is None else y_true_dec.reshape(-1)
     q05v = None if q05 is None else q05.reshape(-1).clone()
     q95v = None if q95 is None else q95.reshape(-1).clone()
 
     if p50.numel() == 0:
         return (y_pred_dec, q05, q95, {}) if return_params else (y_pred_dec, q05, q95)
 
-    # Handle grouping
+    # Grouping
     if asset_ids is None:
         groups = [None]
         g_np = None
     else:
-        g = asset_ids.reshape(-1).detach().cpu().numpy()
-        g_np = g
+        g_np = asset_ids.reshape(-1).detach().cpu().numpy()
         groups = list(np.unique(g_np))
 
-    # Either fit (VAL) or apply (TEST)
     params = calib_params if (calib_params is not None) else {}
 
-    # Helper to get mask for a group
+    # helper: mask for a group
     def _gmask(grp):
         if grp is None:
-            # all rows
             return slice(None)
         return (torch.tensor(g_np, device=p50.device) == grp)
 
-    # Fit from validation if no params provided
+    # -------- FIT (validation) if no params provided --------
     if calib_params is None:
         if y is None:
-            # Nothing to fit with
-            if return_params:
-                return y_pred_dec, q05, q95, {}
-            return y_pred_dec, q05, q95
+            # nothing to fit with
+            return (y_pred_dec, q05, q95, {}) if return_params else (y_pred_dec, q05, q95)
 
         for grp in groups:
-            m = _gmask(grp)
+            m  = _gmask(grp)
             yy = y[m]
             pp = p50[m]
             if yy.numel() == 0 or pp.numel() == 0:
                 continue
 
-            # Tercile thresholds from TRUE y (validation only)
             t33, t66 = torch.quantile(yy, torch.tensor([0.33, 0.66], device=yy.device))
-            # Define regimes by TRUE y for FITTING
+
             low_mask  = (yy <= t33)
             mid_mask  = (yy >  t33) & (yy <  t66)
             high_mask = (yy >= t66)
 
-            def _safe_scale(mask):
-                if mask.sum() == 0:
+            def _safe_scale(mask: torch.Tensor) -> float:
+                # FIX: use count_nonzero().item() instead of mask.sum() in boolean context
+                if torch.count_nonzero(mask).item() == 0:
                     return 1.0
                 yp = torch.mean(torch.abs(pp[mask]))
                 yt = torch.mean(torch.abs(yy[mask]))
                 if not (torch.isfinite(yp) and torch.isfinite(yt)) or float(torch.abs(yp)) <= 1e-12:
                     return 1.0
-                s = float((yt / yp).clamp(0.5, 2.0).item())
-                return s
+                return float((yt / yp).clamp(0.5, 2.0).item())
 
             s_low  = _safe_scale(low_mask)
             s_mid  = _safe_scale(mid_mask)
@@ -935,54 +905,48 @@ def calibrate_vol_predictions(
                 "s_high": float(s_high),
             }
 
-    # Apply (VAL or TEST): choose regime using PREDICTED median (safe for test)
+    # -------- APPLY (validation or test) --------
     p50_cal = p50.clone()
     q05_cal = q05v.clone() if q05v is not None else None
     q95_cal = q95v.clone() if q95v is not None else None
 
     for grp in groups:
         m = _gmask(grp)
-        if m is not slice(None) and (m.sum() == 0):
+        # FIX: avoid ambiguous boolean
+        if (not isinstance(m, slice)) and (torch.count_nonzero(m).item() == 0):
             continue
+
         key = "GLOBAL" if grp is None else str(grp)
-        par = params.get(key, None)
+        par = params.get(key)
         if par is None:
-            # No params for this group → leave as is
             continue
 
-        t33 = par["t33"]; t66 = par["t66"]
-        s_low = par["s_low"]; s_mid = par["s_mid"]; s_high = par["s_high"]
+        t33, t66 = par["t33"], par["t66"]
+        s_low, s_mid, s_high = par["s_low"], par["s_mid"], par["s_high"]
 
-        # Regime by predicted median
         p_local = p50_cal[m]
         reg = torch.zeros_like(p_local, dtype=torch.long)
-        reg = torch.where(p_local <= t33, torch.zeros_like(reg), reg)
-        reg = torch.where((p_local > t33) & (p_local < t66), torch.ones_like(reg), reg)
-        reg = torch.where(p_local >= t66, torch.full_like(reg, 2), reg)
+        reg = torch.where(p_local <= t33, reg, reg)  # 0
+        reg = torch.where((p_local > t33) & (p_local < t66), torch.ones_like(reg), reg)  # 1
+        reg = torch.where(p_local >= t66, torch.full_like(reg, 2), reg)  # 2
 
-        # Select scale per element
         s = torch.empty_like(p_local)
         s[reg == 0] = s_low
         s[reg == 1] = s_mid
         s[reg == 2] = s_high
 
         p50_cal[m] = p_local * s
-        if q05_cal is not None:
-            q05_cal[m] = q05_cal[m] * s
-        if q95_cal is not None:
-            q95_cal[m] = q95_cal[m] * s
+        if q05_cal is not None: q05_cal[m] = q05_cal[m] * s
+        if q95_cal is not None: q95_cal[m] = q95_cal[m] * s
 
-    # Restore original shapes
+    # restore shapes
     p50_cal = p50_cal.view_as(y_pred_dec)
-    if q05_cal is not None:
-        q05_cal = q05_cal.view_as(q05)
-    if q95_cal is not None:
-        q95_cal = q95_cal.view_as(q95)
+    if q05_cal is not None: q05_cal = q05_cal.view_as(q05)
+    if q95_cal is not None: q95_cal = q95_cal.view_as(q95)
 
     if return_params:
         return p50_cal, q05_cal, q95_cal, params
     return p50_cal, q05_cal, q95_cal
-
 
 
 from pytorch_forecasting.metrics import QuantileLoss, MultiLoss
@@ -3747,6 +3711,7 @@ def _safe_prob(t: torch.Tensor) -> torch.Tensor:
 def _collect_test_predictions(model, dl, id_to_name, vol_norm):
     model_device = next(model.parameters()).device
     assets_all, t_idx_all = [], []
+    asset_id_all = []
     yv_all, pv_all, yd_all, pdprob_all = [], [], [], []
 
     for batch in dl:
@@ -3818,6 +3783,11 @@ def _collect_test_predictions(model, dl, id_to_name, vol_norm):
 
         # append
         gn_list = g.detach().cpu().long().tolist()
+        # Map asset ids → names
+        aset = [id_to_name.get(int(i), str(int(i))) for i in g.detach().cpu().tolist()]
+
+        # Store raw asset ids as well  <-- ADD THIS
+        asset_id_all.extend(g.detach().cpu().long().tolist())
         assets_all.extend([id_to_name.get(int(i), str(int(i))) for i in gn_list])
 
         if torch.is_tensor(t_idx):
@@ -3853,7 +3823,7 @@ def _collect_test_predictions(model, dl, id_to_name, vol_norm):
 
 # ---------- EXPORT PREDICTIONS FROM BEST CHECKPOINT ----------
 try:
-    # ---------------- VAL parquet (fit + save calibrator happens inside callbacks) ----------------
+    # VAL parquet (unchanged)
     val_pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
     _export_split_from_best(trainer, val_dataloader, "val", val_pred_path)
     try:
@@ -3861,150 +3831,94 @@ try:
     except Exception as e:
         print(f"[WARN] Could not upload VAL parquet: {e}")
 
-    # ---------------- TEST parquet (load VAL calibrator ➜ apply to TEST) ----------------
+    # TEST parquet export
     test_pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
-    df_test = _export_split_from_best(trainer, test_dataloader, "test", test_pred_path)
+    _export_split_from_best(trainer, test_dataloader, "test", test_pred_path)
 
-    # If exporter didn't return a dataframe, read what it wrote
+    # Apply VAL-fitted calibration per asset to TEST parquet
     try:
-        import pandas as _pd
-        if df_test is None:
-            df_test = _pd.read_parquet(test_pred_path)
-    except Exception as e:
-        print(f"[WARN] Could not load TEST parquet for calibration: {e}")
-        df_test = None
+        calib_file = LOCAL_RUN_DIR / f"tft_val_calib_params_e{MAX_EPOCHS}_{RUN_SUFFIX}.json"
+        if calib_file.exists():
+            import json
+            df_test = pd.read_parquet(test_pred_path)
 
-    # Load calibration params (fitted on VAL); prefer helper if present
-    calib_params = None
-    try:
-        if '_load_val_calibrator' in globals():
-            calib_params = _load_val_calibrator(LOCAL_RUN_DIR)
-        else:
-            # fallback to a conventional filename
-            calib_file = LOCAL_RUN_DIR / f"tft_val_calib_params_e{MAX_EPOCHS}_{RUN_SUFFIX}.json"
-            if calib_file.exists():
-                import json
-                with open(calib_file, "r") as f:
-                    calib_params = json.load(f)
-    except Exception as e:
-        print(f"[WARN] Could not load validation calibrator: {e}")
-        calib_params = None
+            # tensors for predicted median and optional quantiles
+            y_pred_t = torch.tensor(df_test["y_vol_pred"].values, dtype=torch.float32)
+            q05_t = torch.tensor(df_test["y_vol_pred_q05"].values, dtype=torch.float32) if "y_vol_pred_q05" in df_test.columns else None
+            q95_t = torch.tensor(df_test["y_vol_pred_q95"].values, dtype=torch.float32) if "y_vol_pred_q95" in df_test.columns else None
 
-    # Apply VAL calibration to TEST (median + q05/q95), then overwrite parquet
-    if (df_test is not None) and (calib_params is not None) and ('calibrate_vol_predictions' in globals()):
-        try:
-            # Our export schema (both VAL & TEST):
-            #   asset, time_idx, Time (optional), y_vol (may be None on TEST), y_dir (may be None on TEST),
-            #   y_vol_pred, y_vol_pred_q05, y_vol_pred_q50, y_vol_pred_q95, y_dir_prob
-            import torch
+            # per-asset ids (if present)
+            g_ids = torch.tensor(df_test["asset_id"].values, dtype=torch.long) if "asset_id" in df_test.columns else None
 
-            # Build tensors (y_true may be missing on TEST; calibrator handles None)
-            y_true_t = None
-            if "y_vol" in df_test and df_test["y_vol"].notna().any():
-                y_true_t = torch.tensor(
-                    df_test["y_vol"].fillna(np.nan).values, dtype=torch.float32
-                )
+            with open(calib_file, "r") as f:
+                calib_params = json.load(f)
 
-            y_pred_t = torch.tensor(
-                df_test["y_vol_pred"].values, dtype=torch.float32
+            p_cal, q05_cal, q95_cal = calibrate_vol_predictions(
+                y_true_dec=None,
+                y_pred_dec=y_pred_t,
+                asset_ids=g_ids,
+                q05=q05_t,
+                q95=q95_t,
+                calib_params=calib_params,
+                return_params=False,
             )
 
-            q05_t = torch.tensor(df_test["y_vol_pred_q05"].values, dtype=torch.float32) \
-                if "y_vol_pred_q05" in df_test and df_test["y_vol_pred_q05"].notna().any() else None
-            q95_t = torch.tensor(df_test["y_vol_pred_q95"].values, dtype=torch.float32) \
-                if "y_vol_pred_q95" in df_test and df_test["y_vol_pred_q95"].notna().any() else None
-
-            # If you have integer asset ids available, pass them; otherwise None = global/per-regime only
-            g_ids = None  # optional: torch.tensor(..., dtype=torch.long)
-
-            # Calibrate using saved params (kept close to your original API)
-            _, y_pred_cal, q05_cal, q95_cal = calibrate_vol_predictions(
-                y_true_t, y_pred_t, asset_ids=g_ids, q05=q05_t, q95=q95_t, calib_params=calib_params
-            )
-
-            # Overwrite calibrated columns
-            df_test["y_vol_pred"] = y_pred_cal.detach().cpu().numpy()
-            # Keep y_vol_pred_q50 = median == y_vol_pred for convenience
-            df_test["y_vol_pred_q50"] = df_test["y_vol_pred"]
+            # overwrite calibrated columns and save
+            df_test["y_vol_pred"] = p_cal.cpu().numpy()
             if q05_cal is not None:
-                df_test["y_vol_pred_q05"] = q05_cal.detach().cpu().numpy()
+                df_test["y_vol_pred_q05"] = q05_cal.cpu().numpy()
             if q95_cal is not None:
-                df_test["y_vol_pred_q95"] = q95_cal.detach().cpu().numpy()
+                df_test["y_vol_pred_q95"] = q95_cal.cpu().numpy()
 
-            # Save back parquet (calibrated)
             df_test.to_parquet(test_pred_path, index=False)
-            print(f"✓ Calibrated TEST predictions saved → {test_pred_path}")
-        except Exception as e:
-            print(f"[WARN] Applying VAL calibration to TEST failed: {e}")
-    else:
-        if df_test is None:
-            print("[WARN] Skipping TEST calibration: no dataframe to modify.")
-        elif calib_params is None:
-            print("[WARN] Skipping TEST calibration: no saved VAL calibrator found.")
+            print(f"✓ Applied VAL calibration to TEST → {test_pred_path}")
         else:
-            print("[WARN] Skipping TEST calibration: calibrate_vol_predictions() not available.")
+            print(f"[WARN] No calibration file found at {calib_file}; leaving TEST uncalibrated.")
+    except Exception as e:
+        print(f"[WARN] Test calibration failed: {e}")
 
 except Exception as e:
-    print(f"[WARN] Export failed: {e}")
+    print(f"[WARN] Export/calibration failed: {e}")
 
 # ---------------- Compute TEST metrics on decoded scale from the calibrated parquet ----------------
+# paths
+test_pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+calib_file     = LOCAL_RUN_DIR / f"tft_val_calib_params_e{MAX_EPOCHS}_{RUN_SUFFIX}.json"
+
+# export from best checkpoint (unchanged)
+_export_split_from_best(trainer, test_dataloader, "test", test_pred_path)
+
+# apply VAL calibration per-asset to TEST parquet
 try:
-    import pandas as _pd
-    import torch
+    if calib_file.exists():
+        import json
+        df_test = pd.read_parquet(test_pred_path)
 
-    # Prefer the calibrated dataframe in-memory; else read from disk
-    if df_test is None:
-        df_test = _pd.read_parquet(test_pred_path)
+        y_pred_t = torch.tensor(df_test["y_vol_pred"].values, dtype=torch.float32)
+        q05_t    = torch.tensor(df_test["y_vol_pred_q05"].values, dtype=torch.float32) if "y_vol_pred_q05" in df_test.columns else None
+        q95_t    = torch.tensor(df_test["y_vol_pred_q95"].values, dtype=torch.float32) if "y_vol_pred_q95" in df_test.columns else None
+        g_ids    = torch.tensor(df_test["asset_id"].values, dtype=torch.long) if "asset_id" in df_test.columns else None
 
-    # Metrics require true y; if absent (typical for hold-out), we only report availability
-    if "y_vol" in df_test and df_test["y_vol"].notna().any():
-        _y = torch.tensor(df_test["y_vol"].tolist(), dtype=torch.float32)
-        _p = torch.tensor(df_test["y_vol_pred"].tolist(), dtype=torch.float32)[: _y.numel()]
-        eps = 1e-8
-        mae  = torch.mean(torch.abs(_p - _y)).item()
-        mse  = torch.mean((_p - _y) ** 2).item()
-        rmse = mse ** 0.5
-        sigma2_p = torch.clamp(torch.abs(_p), min=eps) ** 2
-        sigma2_y = torch.clamp(torch.abs(_y), min=eps) ** 2
-        ratio = sigma2_y / sigma2_p
-        qlike = torch.mean(ratio - torch.log(ratio) - 1.0).item()
+        with open(calib_file, "r") as f:
+            calib_params = json.load(f)
 
-        # Direction metrics if available
-        auroc_val, brier_val, acc_val = None, None, None
-        if "y_dir" in df_test and "y_dir_prob" in df_test and df_test["y_dir"].notna().any():
-            yd_t = torch.tensor(df_test["y_dir"].tolist(), dtype=torch.float32)
-            pd_t = torch.tensor(df_test["y_dir_prob"].tolist(), dtype=torch.float32)
-            # ensure probability
-            try:
-                if torch.isfinite(pd_t).any() and (pd_t.min() < 0 or pd_t.max() > 1):
-                    pd_t = torch.sigmoid(pd_t)
-            except Exception:
-                pd_t = torch.sigmoid(pd_t)
-            pd_t = torch.clamp(pd_t, 0.0, 1.0)
-            acc_val   = float(((pd_t >= 0.5).int() == yd_t.int()).float().mean().item())
-            brier_val = float(torch.mean((pd_t - yd_t) ** 2).item())
-            try:
-                from torchmetrics.classification import BinaryAUROC
-                auroc_val = float(BinaryAUROC()(pd_t, yd_t).item())
-            except Exception as e:
-                print(f"[WARN] AUROC (test) failed: {e}")
-
-        print(
-            f"[TEST] (decoded) MAE={mae:.6f} RMSE={rmse:.6f} MSE={mse:.6f} QLIKE={qlike:.6f}"
-            + (f" | ACC={acc_val:.3f}" if acc_val is not None else "")
-            + (f" | Brier={brier_val:.4f}" if brier_val is not None else "")
-            + (f" | AUROC={auroc_val:.3f}" if auroc_val is not None else "")
+        p_cal, q05_cal, q95_cal = calibrate_vol_predictions(
+            y_true_dec=None,
+            y_pred_dec=y_pred_t,
+            asset_ids=g_ids,
+            q05=q05_t,
+            q95=q95_t,
+            calib_params=calib_params,
+            return_params=False,
         )
+
+        df_test["y_vol_pred"] = p_cal.cpu().numpy()
+        if q05_cal is not None: df_test["y_vol_pred_q05"] = q05_cal.cpu().numpy()
+        if q95_cal is not None: df_test["y_vol_pred_q95"] = q95_cal.cpu().numpy()
+
+        df_test.to_parquet(test_pred_path, index=False)
+        print(f"✓ Applied VAL calibration to TEST → {test_pred_path}")
     else:
-        print("[TEST] Ground-truth y_vol not present in TEST parquet — skipping decoded error metrics.")
-
-    # (Re)save the final TEST parquet & upload (it’s already calibrated if above succeeded)
-    _pd.read_parquet(test_pred_path).to_parquet(test_pred_path, index=False)
-    print(f"✓ Saved TEST predictions → {test_pred_path}")
-    try:
-        upload_file_to_gcs(str(test_pred_path), f"{GCS_OUTPUT_PREFIX}/{test_pred_path.name}")
-    except Exception as e:
-        print(f"[WARN] Could not upload test predictions: {e}")
-
+        print(f"[WARN] No calibration file found at {calib_file}; leaving TEST uncalibrated.")
 except Exception as e:
-    print(f"[WARN] Failed to compute/save test predictions: {e}")
+    print(f"[WARN] Test calibration failed: {e}")
