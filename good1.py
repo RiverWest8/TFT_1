@@ -1598,7 +1598,7 @@ class BiasWarmupCallback(pl.Callback):
         mean_bias_ramp_until: int = 8,
         guard_patience: int = 2,
         guard_tol: float = 0.0,
-        alpha_step: float = 0.05,
+        alpha_step: float = 0.02,
         scale_ema_alpha: float = 0.99,
     ):
         super().__init__()
@@ -1745,9 +1745,9 @@ class BiasWarmupCallback(pl.Callback):
         if hasattr(vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
             q_target = float(self.qlike_target_weight)
             q_prog   = min(1.0, float(e) / float(max(self.warm, 8)))
-            near_ok  = (self._scale_ema is None) or (0.98 <= self._scale_ema <= 1.05)
+            near_ok  = (self._scale_ema is None) or (0.98 <= self._scale_ema <= 1.03)
 
-            qlike_floor = 0.02  # keep some scale pressure even when gated
+            qlike_floor = 0.01  # keep some scale pressure even when gated
             if near_ok:
                 vol_loss.qlike_weight = max(qlike_floor, q_target * q_prog)
             else:
@@ -2448,7 +2448,7 @@ class ReduceLROnPlateauCallback(pl.Callback):
 
 VOL_LOSS = AsymmetricQuantileLoss(
     quantiles=VOL_QUANTILES,
-    underestimation_factor=1.05,  # managed by BiasWarmupCallback
+    underestimation_factor=1.00,  # managed by BiasWarmupCallback
     mean_bias_weight=0.002,        # small centering on the median for MAE
     tail_q=0.9,
     tail_weight=1.0,              # will be ramped by TailWeightRamp
@@ -2459,24 +2459,24 @@ VOL_LOSS = AsymmetricQuantileLoss(
 EXTRA_CALLBACKS = [
       BiasWarmupCallback(
           vol_loss=VOL_LOSS,
-          target_under=1.09,
+          target_under=1.05,
           target_mean_bias=0.04,
-          warmup_epochs=6,
+          warmup_epochs=8,
           qlike_target_weight=0.08,   # keep out of the loss; diagnostics only
           start_mean_bias=0.02,
           mean_bias_ramp_until=12,
           guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
           guard_tol=getattr(ARGS, "warmup_guard_tol", 0.005),
-          alpha_step=0.05,
+          alpha_step=0.02,
       ),
       TailWeightRamp(
           vol_loss=VOL_LOSS,
           start=1.0,
-          end=1.1,
+          end=1.09,
           ramp_epochs=24,
           gate_by_calibration=True,
-          gate_low=0.9,
-          gate_high=1.1,
+          gate_low=0.95,
+          gate_high=1.05,
           gate_patience=2,
       ),
       ReduceLROnPlateauCallback(
