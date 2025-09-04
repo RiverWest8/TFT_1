@@ -416,33 +416,46 @@ def _extract_vol_quantiles(pred):
 def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     """
     Minimal, self-contained export that is robust to various PF/Lightning return layouts:
-      • Loads the best checkpoint
-      • Predicts in raw mode and iterates per-batch
-      • Extracts groups/time/targets from each batch dict
-      • Decodes realised_vol using the TRAIN normalizer
-      • Writes a harmonised parquet with columns: asset, time_idx, Time, y_vol, y_vol_pred, y_dir, y_dir_prob (optional)
+    • Loads the **last** (SWA) checkpoint if available; falls back to best, then most recent
+    • Predicts in raw mode and iterates per-batch
+    • Extracts groups/time/targets from each batch dict
+    • Decodes realised_vol using the TRAIN normalizer
+    • Writes a harmonised parquet with columns: asset, time_idx, Time, y_vol, y_vol_pred, y_dir, y_dir_prob (optional)
     """
-    # 1) Find best checkpoint
+    # 1) Prefer LAST (SWA) checkpoint; fall back to BEST, then most-recent file
+    last_ckpt = None
     best_ckpt = None
     for cb in getattr(trainer, "callbacks", []):
         if isinstance(cb, pl.callbacks.ModelCheckpoint):
-            if getattr(cb, "best_model_path", None):
-                if cb.best_model_path and os.path.exists(cb.best_model_path):
-                    best_ckpt = cb.best_model_path
-                    break
-    if best_ckpt is None:
+            last_attr = getattr(cb, "last_model_path", None)
+            if last_attr and isinstance(last_attr, str) and os.path.exists(last_attr):
+                last_ckpt = last_attr
+            best_attr = getattr(cb, "best_model_path", None)
+            if best_attr and isinstance(best_attr, str) and os.path.exists(best_attr):
+                best_ckpt = best_attr
+
+    # common fallback for last.ckpt if the callback doesn't expose it
+    try:
+        cand = LOCAL_CKPT_DIR / "last.ckpt"
+        if cand.exists():
+            last_ckpt = str(cand)
+    except Exception:
+        pass
+
+    ckpt_path = last_ckpt or best_ckpt
+    if ckpt_path is None:
         try:
             cks = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
             if cks:
-                best_ckpt = str(cks[0])
+                ckpt_path = str(cks[0])
         except Exception:
             pass
-    if best_ckpt is None:
-        raise RuntimeError("Best checkpoint not found for export.")
+    if ckpt_path is None:
+        raise RuntimeError("Checkpoint not found for export (looked for last→best→latest).")
 
     # 2) Recreate model from best ckpt on current device
     LM = type(trainer.lightning_module)
-    best_model = LM.load_from_checkpoint(best_ckpt)
+    best_model = LM.load_from_checkpoint(ckpt_path)
     best_model.eval().to(trainer.lightning_module.device)
 
     # 3) id->name map from PerAssetMetrics if available
@@ -796,37 +809,137 @@ def safe_decode_vol(y: torch.Tensor, normalizer, group_ids: torch.Tensor | None)
 
 
 # ---------------- Regime-dependent calibration helper ----------------
+# ---------------- Regime-dependent calibration helper ----------------
 @torch.no_grad()
-def calibrate_vol_predictions(y_true_dec: torch.Tensor, y_pred_dec: torch.Tensor) -> torch.Tensor:
+def calibrate_vol_predictions(
+    y_true_dec: torch.Tensor | None,
+    y_pred_dec: torch.Tensor,
+    asset_ids: torch.Tensor | None = None,
+    q05: torch.Tensor | None = None,
+    q95: torch.Tensor | None = None,
+    calib_params: dict | None = None,
+    return_params: bool = False,
+):
     """
-    Simple 2‑regime multiplicative calibration computed on validation targets.
-    We match the mean in the bottom and top terciles separately to stretch tails
-    (helps when predictions are cramped at the low end).
+    Two‑regime multiplicative calibration (median split: low / high).
+
+      • If `calib_params` is None  → FIT on validation truths (decoded) using the median of y.
+      • If `calib_params` provided → APPLY to any split (e.g., test).
+      • Regime is chosen using the **predicted median** p50 relative to the fitted y‑median.
+      • The same per‑regime scale factor is applied to q05 and q95 if provided.
+      • Per‑asset if `asset_ids` is given; otherwise GLOBAL.
+
+    Returns
+    -------
+    p50_cal, q05_cal, q95_cal[, params]
     """
-    # ensure 1D
-    y = y_true_dec.reshape(-1)
-    p = y_pred_dec.reshape(-1).clone()
-    if y.numel() == 0 or p.numel() == 0:
-        return y_pred_dec
+    # Flatten to 1D views
+    p50  = y_pred_dec.reshape(-1).clone()
+    y    = None if y_true_dec is None else y_true_dec.reshape(-1)
+    q05v = None if q05 is None else q05.reshape(-1).clone()
+    q95v = None if q95 is None else q95.reshape(-1).clone()
 
-    # compute terciles
-    q33, q66 = torch.quantile(y, torch.tensor([0.33, 0.66], device=y.device))
-    low_mask = y <= q33
-    high_mask = y >= q66
+    if p50.numel() == 0:
+        return (y_pred_dec, q05, q95, {}) if return_params else (y_pred_dec, q05, q95)
 
-    def _apply(mask: torch.Tensor):
-        if mask is None or mask.sum() == 0:
-            return
-        yp = p[mask].mean()
-        yt = y[mask].mean()
-        if torch.isfinite(yp) and torch.isfinite(yt) and float(torch.abs(yp)) > 1e-12:
-            s = (yt / yp).clamp(0.5, 2.0)
-            p[mask] = p[mask] * s
+    # Grouping
+    if asset_ids is None:
+        groups = [None]
+        g_np = None
+    else:
+        g_np = asset_ids.reshape(-1).detach().cpu().numpy()
+        groups = list(np.unique(g_np))
 
-    _apply(low_mask)
-    _apply(high_mask)
+    params = calib_params if (calib_params is not None) else {}
 
-    return p.view_as(y_pred_dec)
+    # helper: boolean mask for a group
+    def _gmask(grp):
+        if grp is None:
+            return slice(None)
+        return (torch.tensor(g_np, device=p50.device) == grp)
+
+    # --------------------- FIT (on VAL) ---------------------
+    if calib_params is None:
+        if y is None:
+            return (y_pred_dec, q05, q95, {}) if return_params else (y_pred_dec, q05, q95)
+
+        for grp in groups:
+            m  = _gmask(grp)
+            yy = y[m]
+            pp = p50[m]
+            if yy.numel() == 0 or pp.numel() == 0:
+                continue
+
+            # Median threshold from TRUE y (decoded)
+            t50 = torch.quantile(yy, torch.tensor(0.50, device=yy.device))
+
+            # Define regimes by TRUE y for FITTING
+            low_mask  = (yy <= t50)
+            high_mask = (yy >  t50)
+
+            def _safe_scale(mask: torch.Tensor) -> float:
+                if torch.count_nonzero(mask).item() == 0:
+                    return 1.0
+                yp = torch.mean(torch.abs(pp[mask]))
+                yt = torch.mean(torch.abs(yy[mask]))
+                if not (torch.isfinite(yp) and torch.isfinite(yt)) or float(torch.abs(yp)) <= 1e-12:
+                    return 1.0
+                # clamp for robustness
+                return float((yt / yp).clamp(0.5, 2.0).item())
+
+            s_low  = _safe_scale(low_mask)
+            s_high = _safe_scale(high_mask)
+
+            key = "GLOBAL" if grp is None else str(grp)
+            params[key] = {
+                "t50":   float(t50.item()),
+                "s_low":  float(s_low),
+                "s_high": float(s_high),
+            }
+
+    # --------------------- APPLY (VAL/TEST) ---------------------
+    p50_cal = p50.clone()
+    q05_cal = q05v.clone() if q05v is not None else None
+    q95_cal = q95v.clone() if q95v is not None else None
+
+    for grp in groups:
+        m = _gmask(grp)
+        if (not isinstance(m, slice)) and (torch.count_nonzero(m).item() == 0):
+            continue
+
+        key = "GLOBAL" if grp is None else str(grp)
+        par = params.get(key, None)
+        if par is None:
+            continue
+
+        t50   = par["t50"]
+        s_low = par["s_low"]
+        s_high= par["s_high"]
+
+        p_local = p50_cal[m]
+
+        # Decide regime by **predicted** median
+        reg_low  = (p_local <= t50)
+        reg_high = ~reg_low
+
+        # Select scale per element
+        s = torch.empty_like(p_local)
+        s[reg_low]  = s_low
+        s[reg_high] = s_high
+
+        p50_cal[m] = p_local * s
+        if q05_cal is not None: q05_cal[m] = q05_cal[m] * s
+        if q95_cal is not None: q95_cal[m] = q95_cal[m] * s
+
+    # Restore shapes
+    p50_cal = p50_cal.view_as(y_pred_dec)
+    if q05_cal is not None: q05_cal = q05_cal.view_as(q05)
+    if q95_cal is not None: q95_cal = q95_cal.view_as(q95)
+
+    if return_params:
+        return p50_cal, q05_cal, q95_cal, params
+    return p50_cal, q05_cal, q95_cal
+
 
 if not hasattr(GroupNormalizer, "decode"):
     def _gn_decode(self, y, group_ids=None, **kwargs):
@@ -2548,7 +2661,7 @@ EMBEDDING_CARDINALITY = {}
 
 BATCH_SIZE   = 128
 MAX_EPOCHS   = 35
-EARLY_STOP_PATIENCE = 15
+EARLY_STOP_PATIENCE = 10
 PERM_BLOCK_SIZE = 288
 
 # Artifacts are written locally then uploaded to GCS
