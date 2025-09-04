@@ -61,18 +61,7 @@ MAX_EPOCHS   = 35
 EARLY_STOP_PATIENCE = 15
 PERM_BLOCK_SIZE = 288
 
-# Extra belt-and-braces: swallow BrokenPipe errors on stdout.flush() if any other lib calls it.
-try:
-    import sys
-    _orig_flush = sys.stdout.flush
-    def _safe_flush(*a, **k):
-        try:
-            return _orig_flush(*a, **k)
-        except BrokenPipeError:
-            return None
-    sys.stdout.flush = _safe_flush
-except Exception:
-    pass
+
 
 # Route all prints to stderr and swallow BrokenPipe to avoid crashes during teardown
 import builtins as _builtins, sys as _sys
