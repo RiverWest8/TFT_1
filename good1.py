@@ -164,7 +164,7 @@ Q50_IDX = VOL_QUANTILES.index(0.50)
 Q05_IDX = VOL_QUANTILES.index(0.05)
 Q95_IDX = VOL_QUANTILES.index(0.95)
 # Floor used when computing decoded QLIKE to avoid blow-ups when y or ŷ ~ 0
-EVAL_VOL_FLOOR = 1e-6
+EVAL_VOL_FLOOR = 1e-8
 
 # Composite metric weights (override via --metric_weights "w_mae,w_rmse,w_qlike")
 COMP_WEIGHTS = (1.0, 1.0, 0.004)  # default: slightly emphasise QLIKE for RV focus
@@ -1656,7 +1656,7 @@ class BiasWarmupCallback(pl.Callback):
             vol_loss.underestimation_factor = float(max(1.0, min(getattr(self, "target_under", 1.09), 1.09)))
             # keep QLIKE pressure constant and mild in decay
             if hasattr(vol_loss, "qlike_weight"):
-                vol_loss.qlike_weight = 0.08
+                vol_loss.qlike_weight = 0.06
 
         # Freeze if getting worse
         if self._frozen:
@@ -1734,30 +1734,6 @@ class MedianMSELoss(nn.Module):
         q50 = y_hat_quantiles[:, 3]  # index of 0.50
         return F.mse_loss(q50, y_true)
 
-class EpochLRDecay(pl.Callback):
-    def __init__(self, gamma: float = 1, start_epoch: int = 1):
-        """
-        gamma: multiplicative decay per epoch (0.95 = -5%/epoch)
-        start_epoch: begin decaying after this epoch index (0-based)
-        """
-        super().__init__()
-        self.gamma = float(gamma)
-        self.start_epoch = int(start_epoch)
-
-    def on_train_epoch_end(self, trainer, pl_module):
-        e = int(getattr(trainer, "current_epoch", 0))
-        if e < self.start_epoch:
-            return
-        # scale all param_group LRs
-        try:
-            for opt in trainer.optimizers:
-                for pg in opt.param_groups:
-                    if "lr" in pg and pg["lr"] is not None:
-                        pg["lr"] = float(pg["lr"]) * self.gamma
-            new_lr = trainer.optimizers[0].param_groups[0]["lr"]
-            print(f"[LR] epoch={e} → decayed lr to {new_lr:.6g}")
-        except Exception as err:
-            print(f"[LR] decay skipped: {err}")
             
 # -----------------------------------------------------------------------
 # Compute / device configuration (optimised for NVIDIA L4 on GCP)
@@ -2253,7 +2229,7 @@ class CosineLR(pl.Callback):
     def __init__(
         self,
         start_epoch: int = 8,
-        eta_min_ratio: float = 1e-5,
+        eta_min_ratio: float = 1e-2,
         hold_last_epochs: int = 1,
         warmup_steps: int | None = None,
     ):
@@ -2407,13 +2383,13 @@ EXTRA_CALLBACKS = [
           vol_loss=VOL_LOSS,
           target_under=1.08,
           target_mean_bias=0.04,
-          warmup_epochs=6,
+          warmup_epochs=12,
           qlike_target_weight=0.06,   # keep out of the loss; diagnostics only
           start_mean_bias=0.02,
           mean_bias_ramp_until=12,
-          guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
-          guard_tol=getattr(ARGS, "warmup_guard_tol", 0.005),
-          alpha_step=0.05,
+          guard_patience=getattr(ARGS, "warmup_guard_patience", 3),
+          guard_tol=getattr(ARGS, "warmup_guard_tol", 0.001),
+          alpha_step=0.02,
       ),
       TailWeightRamp(
           vol_loss=VOL_LOSS,
@@ -2426,7 +2402,7 @@ EXTRA_CALLBACKS = [
           gate_patience=2,
       ),
       ReduceLROnPlateauCallback(
-          monitor="val_composite_overall", factor=0.5, patience=4, min_lr=3e-5, cooldown=1, stop_after_epoch=5
+          monitor="val_composite_overall", factor=0.5, patience=6, min_lr=3e-5, cooldown=1, stop_after_epoch=8
       ),
       ModelCheckpoint(
           dirpath=str(LOCAL_CKPT_DIR),
@@ -2437,7 +2413,7 @@ EXTRA_CALLBACKS = [
           save_last=True,
       ),
       StochasticWeightAveraging(swa_lrs = 1e6 , annealing_epochs = 1, annealing_strategy="cos", swa_epoch_start=max(1, int(0.85 * MAX_EPOCHS))),
-      CosineLR(start_epoch=8, eta_min_ratio=1e-4, hold_last_epochs=2, warmup_steps=0),
+      CosineLR(start_epoch=9, eta_min_ratio=0.05, hold_last_epochs=2, warmup_steps=0),
       ]
 
 class ValLossHistory(pl.Callback):
@@ -3335,7 +3311,7 @@ if __name__ == "__main__":
         callbacks=[TQDMProgressBar(refresh_rate=50), es_cb, metrics_cb, mirror_cb, lr_cb, val_hist_cb] + EXTRA_CALLBACKS,
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
-        enable_progress_bar=True,
+        enable_progress_bar=False,
     )
 
 
