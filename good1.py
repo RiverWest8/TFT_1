@@ -1545,7 +1545,7 @@ class BiasWarmupCallback(pl.Callback):
         guard_patience: int = 2,
         guard_tol: float = 0.0,
         alpha_step: float = 0.05,
-        scale_ema_alpha: float = 0.4,
+        scale_ema_alpha: float = 0.05,
     ):
         super().__init__()
         self._vol_loss_hint = vol_loss
@@ -1605,7 +1605,7 @@ class BiasWarmupCallback(pl.Callback):
             vms = trainer.callback_metrics.get("val_mean_scale", None)
             if vms is not None:
                 s = float(vms.item() if hasattr(vms, "item") else vms)
-                a = getattr(self, "scale_ema_alpha", 0.4)
+                a = getattr(self, "scale_ema_alpha", 0.05)
                 self._scale_ema = s if (self._scale_ema is None) else (1.0 - a) * self._scale_ema + a * s
         except Exception:
             pass
@@ -2394,7 +2394,7 @@ EXTRA_CALLBACKS = [
       TailWeightRamp(
           vol_loss=VOL_LOSS,
           start=1.0,
-          end=1.1,
+          end=1.15,
           ramp_epochs=24,
           gate_by_calibration=True,
           gate_low=0.97,
