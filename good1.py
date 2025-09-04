@@ -416,46 +416,33 @@ def _extract_vol_quantiles(pred):
 def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     """
     Minimal, self-contained export that is robust to various PF/Lightning return layouts:
-    • Loads the **last** (SWA) checkpoint if available; falls back to best, then most recent
-    • Predicts in raw mode and iterates per-batch
-    • Extracts groups/time/targets from each batch dict
-    • Decodes realised_vol using the TRAIN normalizer
-    • Writes a harmonised parquet with columns: asset, time_idx, Time, y_vol, y_vol_pred, y_dir, y_dir_prob (optional)
+      • Loads the best checkpoint
+      • Predicts in raw mode and iterates per-batch
+      • Extracts groups/time/targets from each batch dict
+      • Decodes realised_vol using the TRAIN normalizer
+      • Writes a harmonised parquet with columns: asset, time_idx, y_vol, y_vol_pred, y_dir_prob (optional)
     """
-    # 1) Prefer LAST (SWA) checkpoint; fall back to BEST, then most-recent file
-    last_ckpt = None
+    # 1) Find best checkpoint
     best_ckpt = None
     for cb in getattr(trainer, "callbacks", []):
         if isinstance(cb, pl.callbacks.ModelCheckpoint):
-            last_attr = getattr(cb, "last_model_path", None)
-            if last_attr and isinstance(last_attr, str) and os.path.exists(last_attr):
-                last_ckpt = last_attr
-            best_attr = getattr(cb, "best_model_path", None)
-            if best_attr and isinstance(best_attr, str) and os.path.exists(best_attr):
-                best_ckpt = best_attr
-
-    # common fallback for last.ckpt if the callback doesn't expose it
-    try:
-        cand = LOCAL_CKPT_DIR / "last.ckpt"
-        if cand.exists():
-            last_ckpt = str(cand)
-    except Exception:
-        pass
-
-    ckpt_path = last_ckpt or best_ckpt
-    if ckpt_path is None:
+            if getattr(cb, "best_model_path", None):
+                if cb.best_model_path and os.path.exists(cb.best_model_path):
+                    best_ckpt = cb.best_model_path
+                    break
+    if best_ckpt is None:
         try:
             cks = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
             if cks:
-                ckpt_path = str(cks[0])
+                best_ckpt = str(cks[0])
         except Exception:
             pass
-    if ckpt_path is None:
-        raise RuntimeError("Checkpoint not found for export (looked for last→best→latest).")
+    if best_ckpt is None:
+        raise RuntimeError("Best checkpoint not found for export.")
 
     # 2) Recreate model from best ckpt on current device
     LM = type(trainer.lightning_module)
-    best_model = LM.load_from_checkpoint(ckpt_path)
+    best_model = LM.load_from_checkpoint(best_ckpt)
     best_model.eval().to(trainer.lightning_module.device)
 
     # 3) id->name map from PerAssetMetrics if available
@@ -503,7 +490,6 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     assets_all, t_all = [], []
     y_true_all, y_dirprob_all = [], []
     y_pred_q05_all, y_pred_q50_all, y_pred_q95_all = [], [], []
-    y_dir_all = []
     # Helper: extract x dict from a batch container
     def _get_x(b):
         if isinstance(b, dict):
@@ -612,17 +598,6 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             else:
                 y_vol_true = yt
 
-        # True direction target (optional)
-        y_dir_true = None
-        dec_t = x.get("decoder_target")
-        if torch.is_tensor(dec_t):
-            if dec_t.ndim == 3 and dec_t.size(-1) > 1:
-                y_dir_true = dec_t[:, 0, 1]
-            elif dec_t.ndim == 2 and dec_t.size(1) > 1:
-                y_dir_true = dec_t[:, 1]
-        if y_dir_true is not None:
-            y_dir_true = y_dir_true.reshape(-1)[:L]
-
         # Direction → probability in [0,1]
         y_dir_prob = None
         if p_dir is not None and torch.is_tensor(p_dir):
@@ -654,10 +629,6 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             y_true_all.extend(y_vol_true.detach().cpu().tolist())
         else:
             y_true_all.extend([None] * L)
-        if y_dir_true is not None:
-            y_dir_all.extend(y_dir_true.detach().cpu().tolist())
-        else:
-            y_dir_all.extend([None] * L)
         if y_dir_prob is not None:
             y_dirprob_all.extend(y_dir_prob.detach().cpu().tolist())
         else:
@@ -671,69 +642,31 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
         "y_vol_pred_q05": y_pred_q05_all,
         "y_vol_pred_q50": y_pred_q50_all,
         "y_vol_pred_q95": y_pred_q95_all,
-        "y_dir": y_dir_all,
         "y_dir_prob": y_dirprob_all,
     })
 
-    # --- Attach Time column robustly (handles dtype mismatches, dups, missing) ---
+    # Try to attach actual 'Time' if a compatible source df is cached
     try:
-        # 1) choose the best source DF for this split, then fall back to others
-        candidates = []
-        if split and isinstance(split, str):
-            s = split.lower()
-            if s == "val" and "val_df" in globals() and isinstance(val_df, pd.DataFrame):
-                candidates.append(val_df)
-            if s == "test" and "test_df" in globals() and isinstance(test_df, pd.DataFrame):
-                candidates.append(test_df)
-        # generic fallbacks
-        for nm in ("raw_df", "full_df", "df"):
-            obj = globals().get(nm)
-            if isinstance(obj, pd.DataFrame):
-                candidates.append(obj)
-
+        cand_names = ["val_df", "test_df", "raw_df", "full_df", "df"]
         src = None
-        for cand in candidates:
-            if {"asset", "time_idx", "Time"}.issubset(cand.columns):
-                src = cand.loc[:, ["asset", "time_idx", "Time"]].copy()
+        for nm in cand_names:
+            obj = globals().get(nm)
+            if isinstance(obj, pd.DataFrame) and {"asset","time_idx","Time"}.issubset(obj.columns):
+                src = obj[["asset","time_idx","Time"]].copy()
                 break
-
-        if src is None:
-            print(f"[EXPORT][Time] No suitable source dataframe found; leaving Time empty for split={split}")
-        else:
-            # 2) harmonise dtypes for a clean merge
-            df["asset"] = df["asset"].astype(str)
+        if src is not None:
             src["asset"] = src["asset"].astype(str)
-
-            def _to_int64_safe(s):
-                s2 = pd.to_numeric(s, errors="coerce")
-                # if float-like, floor to nearest lower int (time_idx should be integral)
-                if pd.api.types.is_float_dtype(s2):
-                    s2 = np.floor(s2)
-                # Int64 (nullable) ➜ int64
-                s2 = s2.astype("Int64").astype("int64")
-                return s2
-
-            df["time_idx"] = _to_int64_safe(df["time_idx"])
-            src["time_idx"] = _to_int64_safe(src["time_idx"])
-
-            # 3) normalise Time and drop duplicates in the source (keep the latest)
-            src["Time"] = pd.to_datetime(src["Time"], errors="coerce")
+            src["time_idx"] = pd.to_numeric(src["time_idx"], errors="coerce").astype("Int64").astype("int64")
+            df["asset"] = df["asset"].astype(str)
+            df["time_idx"] = pd.to_numeric(df["time_idx"], errors="coerce").astype("Int64").astype("int64")
+            df = df.merge(src, on=["asset","time_idx"], how="left", validate="m:1")
+            df["Time"] = pd.to_datetime(df["Time"], errors="coerce")
             try:
-                src["Time"] = src["Time"].dt.tz_localize(None)
+                df["Time"] = df["Time"].dt.tz_localize(None)
             except Exception:
                 pass
-            src = src.drop_duplicates(subset=["asset", "time_idx"], keep="last")
-
-            # 4) merge and report coverage
-            n_before = len(df)
-            df = df.merge(src, on=["asset", "time_idx"], how="left", validate="m:1")
-            n_missing = int(df["Time"].isna().sum())
-            if n_missing:
-                print(f"[EXPORT][Time] Attached Time for {n_before - n_missing}/{n_before} rows; "
-                      f"{n_missing} rows had no match in source.")
-
     except Exception as e:
-        print(f"[WARN][Time] attach failed: {e}")
+        print(f"[WARN] Could not attach Time column: {e}")
 
     # Save parquet
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -809,137 +742,37 @@ def safe_decode_vol(y: torch.Tensor, normalizer, group_ids: torch.Tensor | None)
 
 
 # ---------------- Regime-dependent calibration helper ----------------
-# ---------------- Regime-dependent calibration helper ----------------
 @torch.no_grad()
-def calibrate_vol_predictions(
-    y_true_dec: torch.Tensor | None,
-    y_pred_dec: torch.Tensor,
-    asset_ids: torch.Tensor | None = None,
-    q05: torch.Tensor | None = None,
-    q95: torch.Tensor | None = None,
-    calib_params: dict | None = None,
-    return_params: bool = False,
-):
+def calibrate_vol_predictions(y_true_dec: torch.Tensor, y_pred_dec: torch.Tensor) -> torch.Tensor:
     """
-    Two‑regime multiplicative calibration (median split: low / high).
-
-      • If `calib_params` is None  → FIT on validation truths (decoded) using the median of y.
-      • If `calib_params` provided → APPLY to any split (e.g., test).
-      • Regime is chosen using the **predicted median** p50 relative to the fitted y‑median.
-      • The same per‑regime scale factor is applied to q05 and q95 if provided.
-      • Per‑asset if `asset_ids` is given; otherwise GLOBAL.
-
-    Returns
-    -------
-    p50_cal, q05_cal, q95_cal[, params]
+    Simple 2‑regime multiplicative calibration computed on validation targets.
+    We match the mean in the bottom and top terciles separately to stretch tails
+    (helps when predictions are cramped at the low end).
     """
-    # Flatten to 1D views
-    p50  = y_pred_dec.reshape(-1).clone()
-    y    = None if y_true_dec is None else y_true_dec.reshape(-1)
-    q05v = None if q05 is None else q05.reshape(-1).clone()
-    q95v = None if q95 is None else q95.reshape(-1).clone()
+    # ensure 1D
+    y = y_true_dec.reshape(-1)
+    p = y_pred_dec.reshape(-1).clone()
+    if y.numel() == 0 or p.numel() == 0:
+        return y_pred_dec
 
-    if p50.numel() == 0:
-        return (y_pred_dec, q05, q95, {}) if return_params else (y_pred_dec, q05, q95)
+    # compute terciles
+    q33, q66 = torch.quantile(y, torch.tensor([0.33, 0.66], device=y.device))
+    low_mask = y <= q33
+    high_mask = y >= q66
 
-    # Grouping
-    if asset_ids is None:
-        groups = [None]
-        g_np = None
-    else:
-        g_np = asset_ids.reshape(-1).detach().cpu().numpy()
-        groups = list(np.unique(g_np))
+    def _apply(mask: torch.Tensor):
+        if mask is None or mask.sum() == 0:
+            return
+        yp = p[mask].mean()
+        yt = y[mask].mean()
+        if torch.isfinite(yp) and torch.isfinite(yt) and float(torch.abs(yp)) > 1e-12:
+            s = (yt / yp).clamp(0.5, 2.0)
+            p[mask] = p[mask] * s
 
-    params = calib_params if (calib_params is not None) else {}
+    _apply(low_mask)
+    _apply(high_mask)
 
-    # helper: boolean mask for a group
-    def _gmask(grp):
-        if grp is None:
-            return slice(None)
-        return (torch.tensor(g_np, device=p50.device) == grp)
-
-    # --------------------- FIT (on VAL) ---------------------
-    if calib_params is None:
-        if y is None:
-            return (y_pred_dec, q05, q95, {}) if return_params else (y_pred_dec, q05, q95)
-
-        for grp in groups:
-            m  = _gmask(grp)
-            yy = y[m]
-            pp = p50[m]
-            if yy.numel() == 0 or pp.numel() == 0:
-                continue
-
-            # Median threshold from TRUE y (decoded)
-            t50 = torch.quantile(yy, torch.tensor(0.50, device=yy.device))
-
-            # Define regimes by TRUE y for FITTING
-            low_mask  = (yy <= t50)
-            high_mask = (yy >  t50)
-
-            def _safe_scale(mask: torch.Tensor) -> float:
-                if torch.count_nonzero(mask).item() == 0:
-                    return 1.0
-                yp = torch.mean(torch.abs(pp[mask]))
-                yt = torch.mean(torch.abs(yy[mask]))
-                if not (torch.isfinite(yp) and torch.isfinite(yt)) or float(torch.abs(yp)) <= 1e-12:
-                    return 1.0
-                # clamp for robustness
-                return float((yt / yp).clamp(0.5, 2.0).item())
-
-            s_low  = _safe_scale(low_mask)
-            s_high = _safe_scale(high_mask)
-
-            key = "GLOBAL" if grp is None else str(grp)
-            params[key] = {
-                "t50":   float(t50.item()),
-                "s_low":  float(s_low),
-                "s_high": float(s_high),
-            }
-
-    # --------------------- APPLY (VAL/TEST) ---------------------
-    p50_cal = p50.clone()
-    q05_cal = q05v.clone() if q05v is not None else None
-    q95_cal = q95v.clone() if q95v is not None else None
-
-    for grp in groups:
-        m = _gmask(grp)
-        if (not isinstance(m, slice)) and (torch.count_nonzero(m).item() == 0):
-            continue
-
-        key = "GLOBAL" if grp is None else str(grp)
-        par = params.get(key, None)
-        if par is None:
-            continue
-
-        t50   = par["t50"]
-        s_low = par["s_low"]
-        s_high= par["s_high"]
-
-        p_local = p50_cal[m]
-
-        # Decide regime by **predicted** median
-        reg_low  = (p_local <= t50)
-        reg_high = ~reg_low
-
-        # Select scale per element
-        s = torch.empty_like(p_local)
-        s[reg_low]  = s_low
-        s[reg_high] = s_high
-
-        p50_cal[m] = p_local * s
-        if q05_cal is not None: q05_cal[m] = q05_cal[m] * s
-        if q95_cal is not None: q95_cal[m] = q95_cal[m] * s
-
-    # Restore shapes
-    p50_cal = p50_cal.view_as(y_pred_dec)
-    if q05_cal is not None: q05_cal = q05_cal.view_as(q05)
-    if q95_cal is not None: q95_cal = q95_cal.view_as(q95)
-
-    if return_params:
-        return p50_cal, q05_cal, q95_cal, params
-    return p50_cal, q05_cal, q95_cal
-
+    return p.view_as(y_pred_dec)
 
 if not hasattr(GroupNormalizer, "decode"):
     def _gn_decode(self, y, group_ids=None, **kwargs):
@@ -1361,6 +1194,16 @@ class PerAssetMetrics(pl.Callback):
         ratio    = sigma2_y / sigma2_p
         overall_qlike = float((ratio - torch.log(ratio) - 1.0).mean().item())
 
+        # Calibrated QLIKE (diagnostic only; not used for scheduling)
+        try:
+            p_cal = calibrate_vol_predictions(y_cpu, p_cpu)
+            sigma2_pc = torch.clamp(p_cal.abs(), min=eps) ** 2
+            ratio_cal = sigma2_y / sigma2_pc
+            overall_qlike_cal = float((ratio_cal - torch.log(ratio_cal) - 1.0).mean().item())
+            trainer.callback_metrics["val_qlike_cal"] = torch.tensor(overall_qlike_cal)
+        except Exception as _e:
+            pass
+
         # --- Optional direction metrics (overall) ---
         acc = None
         brier = None
@@ -1412,6 +1255,7 @@ class PerAssetMetrics(pl.Callback):
         trainer.callback_metrics["val_rmse_overall"]      = torch.tensor(overall_rmse)
         trainer.callback_metrics["val_mse_overall"]       = torch.tensor(overall_mse)
         trainer.callback_metrics["val_qlike_overall"]     = torch.tensor(overall_qlike)
+        trainer.callback_metrics["val_qlike_cal"]     = torch.tensor(overall_qlike_cal)
         trainer.callback_metrics["val_N_overall"]         = torch.tensor(float(N))
 
         msg = (
@@ -1421,6 +1265,7 @@ class PerAssetMetrics(pl.Callback):
             f"MSE={overall_mse:.6f} "
             f"QLIKE={overall_qlike:.6f} "
             f"CompLoss = {val_comp:.6f}"
+            + (f"QLIKE_CAL={overall_qlike_cal:.6f} " if overall_qlike_cal is not None else "")
             + (f" | ACC={acc:.3f}"   if acc   is not None else "")
             + (f" | Brier={brier:.4f}" if brier is not None else "")
             + (f" | AUROC={auroc:.3f}" if auroc is not None else "")
@@ -1699,8 +1544,8 @@ class BiasWarmupCallback(pl.Callback):
         mean_bias_ramp_until: int = 8,
         guard_patience: int = 2,
         guard_tol: float = 0.0,
-        alpha_step: float = 0.02,
-        scale_ema_alpha: float = 0.99,
+        alpha_step: float = 0.05,
+        scale_ema_alpha: float = 0.4,
     ):
         super().__init__()
         self._vol_loss_hint = vol_loss
@@ -1760,7 +1605,7 @@ class BiasWarmupCallback(pl.Callback):
             vms = trainer.callback_metrics.get("val_mean_scale", None)
             if vms is not None:
                 s = float(vms.item() if hasattr(vms, "item") else vms)
-                a = getattr(self, "scale_ema_alpha", 0.005)
+                a = getattr(self, "scale_ema_alpha", 0.4)
                 self._scale_ema = s if (self._scale_ema is None) else (1.0 - a) * self._scale_ema + a * s
         except Exception:
             pass
@@ -1846,9 +1691,9 @@ class BiasWarmupCallback(pl.Callback):
         if hasattr(vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
             q_target = float(self.qlike_target_weight)
             q_prog   = min(1.0, float(e) / float(max(self.warm, 8)))
-            near_ok  = (self._scale_ema is None) or (0.98 <= self._scale_ema <= 1.03)
+            near_ok  = (self._scale_ema is None) or (0.98 <= self._scale_ema <= 1.05)
 
-            qlike_floor = 0.01  # keep some scale pressure even when gated
+            qlike_floor = 0.02  # keep some scale pressure even when gated
             if near_ok:
                 vol_loss.qlike_weight = max(qlike_floor, q_target * q_prog)
             else:
@@ -2550,34 +2395,34 @@ class ReduceLROnPlateauCallback(pl.Callback):
 VOL_LOSS = AsymmetricQuantileLoss(
     quantiles=VOL_QUANTILES,
     underestimation_factor=1.00,  # managed by BiasWarmupCallback
-    mean_bias_weight=0.002,        # small centering on the median for MAE
-    tail_q=0.9,
+    mean_bias_weight=0.01,        # small centering on the median for MAE
+    tail_q=0.85,
     tail_weight=1.0,              # will be ramped by TailWeightRamp
-    qlike_weight=0.02,             # QLIKE weight is ramped safely in BiasWarmupCallback
+    qlike_weight=0.0,             # QLIKE weight is ramped safely in BiasWarmupCallback
     reduction="mean",
 )
 # ---------------- Callback bundle (bias warm-up, tail ramp, LR control) ----------------
 EXTRA_CALLBACKS = [
       BiasWarmupCallback(
           vol_loss=VOL_LOSS,
-          target_under=1.05,
+          target_under=1.08,
           target_mean_bias=0.04,
-          warmup_epochs=8,
-          qlike_target_weight=0.08,   # keep out of the loss; diagnostics only
+          warmup_epochs=6,
+          qlike_target_weight=0.06,   # keep out of the loss; diagnostics only
           start_mean_bias=0.02,
           mean_bias_ramp_until=12,
           guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
           guard_tol=getattr(ARGS, "warmup_guard_tol", 0.005),
-          alpha_step=0.02,
+          alpha_step=0.05,
       ),
       TailWeightRamp(
           vol_loss=VOL_LOSS,
           start=1.0,
-          end=1.09,
+          end=1.1,
           ramp_epochs=24,
           gate_by_calibration=True,
-          gate_low=0.95,
-          gate_high=1.05,
+          gate_low=0.97,
+          gate_high=1.03,
           gate_patience=2,
       ),
       ReduceLROnPlateauCallback(
@@ -2592,7 +2437,7 @@ EXTRA_CALLBACKS = [
           save_last=True,
       ),
       StochasticWeightAveraging(swa_lrs = 1e6 , annealing_epochs = 1, annealing_strategy="cos", swa_epoch_start=max(1, int(0.85 * MAX_EPOCHS))),
-      CosineLR(start_epoch=8, eta_min_ratio=1e-4, hold_last_epochs=3, warmup_steps=0),
+      CosineLR(start_epoch=8, eta_min_ratio=1e-4, hold_last_epochs=2, warmup_steps=0),
       ]
 
 class ValLossHistory(pl.Callback):
@@ -2622,6 +2467,7 @@ class ValLossHistory(pl.Callback):
             "epoch": int(getattr(trainer, "current_epoch", -1)) + 1,
             "val_loss":            self._as_float(m.get("val_loss", float("nan"))),
             "val_qlike_overall":   self._as_float(m.get("val_qlike_overall", float("nan"))),
+            "val_qlike_cal":      self._as_float(m.get("val_qlike_cal", float("nan"))),
             "val_mae_overall":     self._as_float(m.get("val_mae_overall", float("nan"))),
             "val_rmse_overall":    self._as_float(m.get("val_rmse_overall", float("nan"))),
             "val_acc_overall":     self._as_float(m.get("val_acc_overall", float("nan"))),
@@ -2648,7 +2494,7 @@ EMBEDDING_CARDINALITY = {}
 
 BATCH_SIZE   = 128
 MAX_EPOCHS   = 35
-EARLY_STOP_PATIENCE = 10
+EARLY_STOP_PATIENCE = 7
 PERM_BLOCK_SIZE = 288
 
 # Artifacts are written locally then uploaded to GCS
@@ -3396,7 +3242,7 @@ if __name__ == "__main__":
     print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.00091}")
     
     es_cb = EarlyStopping(
-    monitor="val_composite_overall",
+    monitor="val_qlike_overall",
     patience=EARLY_STOP_PATIENCE,
     mode="min",
     min_delta = 1e-4
@@ -3489,7 +3335,7 @@ if __name__ == "__main__":
         callbacks=[TQDMProgressBar(refresh_rate=50), es_cb, metrics_cb, mirror_cb, lr_cb, val_hist_cb] + EXTRA_CALLBACKS,
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
-        enable_progress_bar=False,
+        enable_progress_bar=True,
     )
 
 
