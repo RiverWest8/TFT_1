@@ -164,7 +164,7 @@ Q50_IDX = VOL_QUANTILES.index(0.50)
 Q05_IDX = VOL_QUANTILES.index(0.05)
 Q95_IDX = VOL_QUANTILES.index(0.95)
 # Floor used when computing decoded QLIKE to avoid blow-ups when y or ŷ ~ 0
-EVAL_VOL_FLOOR = 1e-6
+EVAL_VOL_FLOOR = 1e-8
 
 # Composite metric weights (override via --metric_weights "w_mae,w_rmse,w_qlike")
 COMP_WEIGHTS = (1.0, 1.0, 0.004)  # default: slightly emphasise QLIKE for RV focus
@@ -1545,7 +1545,7 @@ class BiasWarmupCallback(pl.Callback):
         guard_patience: int = 2,
         guard_tol: float = 0.0,
         alpha_step: float = 0.05,
-        scale_ema_alpha: float = 0.99,
+        scale_ema_alpha: float = 0.88,
     ):
         super().__init__()
         self._vol_loss_hint = vol_loss
@@ -1605,7 +1605,7 @@ class BiasWarmupCallback(pl.Callback):
             vms = trainer.callback_metrics.get("val_mean_scale", None)
             if vms is not None:
                 s = float(vms.item() if hasattr(vms, "item") else vms)
-                a = getattr(self, "scale_ema_alpha", 0.005)
+                a = getattr(self, "scale_ema_alpha", 0.88)
                 self._scale_ema = s if (self._scale_ema is None) else (1.0 - a) * self._scale_ema + a * s
         except Exception:
             pass
@@ -1656,7 +1656,7 @@ class BiasWarmupCallback(pl.Callback):
             vol_loss.underestimation_factor = float(max(1.0, min(getattr(self, "target_under", 1.09), 1.09)))
             # keep QLIKE pressure constant and mild in decay
             if hasattr(vol_loss, "qlike_weight"):
-                vol_loss.qlike_weight = 0.08
+                vol_loss.qlike_weight = 0.06
 
         # Freeze if getting worse
         if self._frozen:
@@ -1693,7 +1693,7 @@ class BiasWarmupCallback(pl.Callback):
             q_prog   = min(1.0, float(e) / float(max(self.warm, 8)))
             near_ok  = (self._scale_ema is None) or (0.98 <= self._scale_ema <= 1.05)
 
-            qlike_floor = 0.05  # keep some scale pressure even when gated
+            qlike_floor = 0.02  # keep some scale pressure even when gated
             if near_ok:
                 vol_loss.qlike_weight = max(qlike_floor, q_target * q_prog)
             else:
@@ -1734,30 +1734,6 @@ class MedianMSELoss(nn.Module):
         q50 = y_hat_quantiles[:, 3]  # index of 0.50
         return F.mse_loss(q50, y_true)
 
-class EpochLRDecay(pl.Callback):
-    def __init__(self, gamma: float = 1, start_epoch: int = 1):
-        """
-        gamma: multiplicative decay per epoch (0.95 = -5%/epoch)
-        start_epoch: begin decaying after this epoch index (0-based)
-        """
-        super().__init__()
-        self.gamma = float(gamma)
-        self.start_epoch = int(start_epoch)
-
-    def on_train_epoch_end(self, trainer, pl_module):
-        e = int(getattr(trainer, "current_epoch", 0))
-        if e < self.start_epoch:
-            return
-        # scale all param_group LRs
-        try:
-            for opt in trainer.optimizers:
-                for pg in opt.param_groups:
-                    if "lr" in pg and pg["lr"] is not None:
-                        pg["lr"] = float(pg["lr"]) * self.gamma
-            new_lr = trainer.optimizers[0].param_groups[0]["lr"]
-            print(f"[LR] epoch={e} → decayed lr to {new_lr:.6g}")
-        except Exception as err:
-            print(f"[LR] decay skipped: {err}")
             
 # -----------------------------------------------------------------------
 # Compute / device configuration (optimised for NVIDIA L4 on GCP)
@@ -1953,12 +1929,26 @@ else:
     )
 
 def get_resume_ckpt_path(args=None):
-    # 1) explicit path wins
+    """
+    Resolve a checkpoint to resume from, with robust GCS fallback:
+      1) explicit --ckpt_path
+      2) local last.ckpt
+      3) newest local *.ckpt in LOCAL_CKPT_DIR
+      4) GCS: current CKPT_GCS_PREFIX (/checkpoints) -> last.ckpt or newest *.ckpt
+      5) GCS: parent of timestamped GCS_OUTPUT_PREFIX -> scan all sibling run folders' /checkpoints
+    Returns local filesystem path or None.
+    """
+    # ---- 1) explicit path wins ----
     if args is not None and getattr(args, "ckpt_path", None):
         return args.ckpt_path
 
-    # 2) local last.ckpt
-    base = globals().get("LOCAL_CKPT_DIR") or globals().get("LOCAL_OUTPUT_DIR") or Path("./checkpoints")
+    base = globals().get("LOCAL_CKPT_DIR", Path("./checkpoints"))
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    # ---- 2) local last.ckpt ----
     last = base / "last.ckpt"
     try:
         if last.exists():
@@ -1966,7 +1956,7 @@ def get_resume_ckpt_path(args=None):
     except Exception:
         pass
 
-    # 3) newest local *.ckpt
+    # ---- 3) newest local *.ckpt ----
     try:
         ckpts = sorted(base.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
         if ckpts:
@@ -1974,21 +1964,132 @@ def get_resume_ckpt_path(args=None):
     except Exception:
         pass
 
-    # 4) optional remote last.ckpt → copy to local for Lightning
+    # ---- helpers for GCS pulling ----
+    def _pull_gcs_to_local(gcs_uri: str, local_name: str = "last.ckpt") -> str | None:
+        """Copy a single ckpt from GCS to LOCAL_CKPT_DIR/local_name and return its path."""
+        try:
+            import fsspec, shutil
+            if fs is None:
+                return None
+            if not fs.exists(gcs_uri):
+                return None
+            dst = base / local_name
+            with fsspec.open(gcs_uri, "rb") as f_in, open(dst, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            return str(dst)
+        except Exception:
+            return None
+
+    def _list_gcs_ckpts(prefix: str) -> list[tuple[str, float]]:
+        """
+        List *.ckpt under a GCS prefix. Returns list of (uri, mtime) sorted by mtime desc.
+        """
+        out = []
+        try:
+            if fs is None:
+                return out
+            # Make sure we have a trailing slash for ls semantics
+            pref = prefix.rstrip("/") + "/"
+            # Some fs impls support glob; fall back to ls
+            try:
+                entries = fs.glob(pref + "*.ckpt")
+                # fs.glob returns full uris; need to stat each for mtime
+                for uri in entries:
+                    try:
+                        info = fs.info(uri)
+                        mtime = float(info.get("mtime", 0.0) or info.get("updated", 0.0) or 0.0)
+                    except Exception:
+                        mtime = 0.0
+                    out.append((uri, mtime))
+            except Exception:
+                # fallback: list then filter
+                for e in fs.ls(pref):
+                    if isinstance(e, str):
+                        uri = e
+                        name = uri.split("/")[-1]
+                        if not name.endswith(".ckpt"):
+                            continue
+                        try:
+                            info = fs.info(uri)
+                            mtime = float(info.get("mtime", 0.0) or info.get("updated", 0.0) or 0.0)
+                        except Exception:
+                            mtime = 0.0
+                        out.append((uri, mtime))
+            out.sort(key=lambda t: t[1], reverse=True)
+        except Exception:
+            return []
+        return out
+
+    # Build candidate GCS prefixes to search
+    prefixes = []
+
+    # Current run’s checkpoints prefix (your global)
+    cur_ckpt_prefix = globals().get("CKPT_GCS_PREFIX", None)
+    if cur_ckpt_prefix:
+        prefixes.append(cur_ckpt_prefix)
+
+    # If ARGS provides gcs_output_prefix, add its /checkpoints
+    gcs_out = None
+    if args is not None:
+        gcs_out = getattr(args, "gcs_output_prefix", None)
+    if gcs_out:
+        prefixes.append(gcs_out.rstrip("/") + "/checkpoints")
+
+    # Also try the parent of a timestamped prefix (e.g., .../Feature_Ablation/f_1234567890 → .../Feature_Ablation)
+    # and scan ALL sibling runs' /checkpoints for the newest ckpt.
+    parent_prefix = None
     try:
-        import fsspec
-        prefix = globals().get("CKPT_GCS_PREFIX") or (getattr(args, "gcs_output_prefix", None) or "")
-        if prefix:
-            uri = prefix.rstrip("/") + "/last.ckpt"
-            fs = fsspec.open(uri, "rb").fs
-            if fs.exists(uri):
-                base.mkdir(parents=True, exist_ok=True)
-                dst = base / "last.ckpt"
-                with fsspec.open(uri, "rb") as f_in, open(dst, "wb") as f_out:
-                    import shutil; shutil.copyfileobj(f_in, f_out)
-                return str(dst)
+        # e.g., gs://bucket/path/.../f_1693578230  →  gs://bucket/path/... (strip last segment)
+        parts = gcs_out.rstrip("/").split("/") if gcs_out else []
+        if parts and parts[-1].startswith("f_"):
+            parent_prefix = "/".join(parts[:-1])  # no trailing slash
+        elif gcs_out:
+            # even if not timestamped, consider its parent anyway
+            parent_prefix = "/".join(parts[:-1])
     except Exception:
-        pass
+        parent_prefix = None
+
+    # 4) Try current prefix first: last.ckpt or newest *.ckpt
+    for pref in prefixes:
+        # last.ckpt
+        uri = pref.rstrip("/") + "/last.ckpt"
+        pulled = _pull_gcs_to_local(uri, local_name="last.ckpt")
+        if pulled:
+            return pulled
+        # newest *.ckpt
+        cand = _list_gcs_ckpts(pref)
+        if cand:
+            pulled = _pull_gcs_to_local(cand[0][0], local_name="last.ckpt")
+            if pulled:
+                return pulled
+
+    # 5) Scan siblings under parent of timestamped folder (find newest across runs)
+    if parent_prefix and fs is not None:
+        try:
+            # list directories under parent (e.g., .../Feature_Ablation/)
+            # then, for each child, look for child/checkpoints/*.ckpt
+            base_dir = parent_prefix.rstrip("/") + "/"
+            children = fs.ls(base_dir)
+            best_uri, best_mtime = None, -1.0
+            for child in children:
+                # child may be str or dict depending on fs; normalize to uri string
+                if isinstance(child, dict):
+                    child_uri = child.get("name") or child.get("path")
+                else:
+                    child_uri = child
+                if not isinstance(child_uri, str):
+                    continue
+                # Expect subdirs like .../f_169xxxx
+                ckpt_pref = child_uri.rstrip("/") + "/checkpoints"
+                for uri, mtime in _list_gcs_ckpts(ckpt_pref):
+                    if mtime > best_mtime:
+                        best_uri, best_mtime = uri, mtime
+            if best_uri:
+                pulled = _pull_gcs_to_local(best_uri, local_name="last.ckpt")
+                if pulled:
+                    return pulled
+        except Exception:
+            pass
 
     return None
 
@@ -2128,7 +2229,7 @@ class CosineLR(pl.Callback):
     def __init__(
         self,
         start_epoch: int = 8,
-        eta_min_ratio: float = 1e-5,
+        eta_min_ratio: float = 1e-2,
         hold_last_epochs: int = 1,
         warmup_steps: int | None = None,
     ):
@@ -2285,7 +2386,7 @@ EXTRA_CALLBACKS = [
           warmup_epochs=6,
           qlike_target_weight=0.08,   # keep out of the loss; diagnostics only
           start_mean_bias=0.02,
-          mean_bias_ramp_until=12,
+          mean_bias_ramp_until=6,
           guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
           guard_tol=getattr(ARGS, "warmup_guard_tol", 0.005),
           alpha_step=0.05,
@@ -2301,7 +2402,7 @@ EXTRA_CALLBACKS = [
           gate_patience=2,
       ),
       ReduceLROnPlateauCallback(
-          monitor="val_composite_overall", factor=0.5, patience=4, min_lr=3e-5, cooldown=1, stop_after_epoch=5
+          monitor="val_composite_overall", factor=0.5, patience=6, min_lr=3e-5, cooldown=1, stop_after_epoch=8
       ),
       ModelCheckpoint(
           dirpath=str(LOCAL_CKPT_DIR),
@@ -2311,8 +2412,8 @@ EXTRA_CALLBACKS = [
           save_top_k=2,
           save_last=True,
       ),
-      StochasticWeightAveraging(swa_lrs = 1e6 , annealing_epochs = 1, annealing_strategy="cos", swa_epoch_start=max(1, int(0.85 * MAX_EPOCHS))),
-      CosineLR(start_epoch=8, eta_min_ratio=1e-4, hold_last_epochs=2, warmup_steps=0),
+      StochasticWeightAveraging(swa_lrs = 1e6 , annealing_epochs = 1, annealing_strategy="cos", swa_epoch_start=max(1, int(0.9 * MAX_EPOCHS))),
+      CosineLR(start_epoch=10, eta_min_ratio=0.05, hold_last_epochs=2, warmup_steps=0),
       ]
 
 class ValLossHistory(pl.Callback):
@@ -3210,7 +3311,7 @@ if __name__ == "__main__":
         callbacks=[TQDMProgressBar(refresh_rate=50), es_cb, metrics_cb, mirror_cb, lr_cb, val_hist_cb] + EXTRA_CALLBACKS,
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
-        enable_progress_bar=True,
+        enable_progress_bar=False,
     )
 
 
