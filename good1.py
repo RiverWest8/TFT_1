@@ -1662,6 +1662,11 @@ class PerAssetMetrics(pl.Callback):
                         print("[WARN] No usable source for val Time; saving without Time column.")
                 except Exception as e:
                     print(f"[WARN] Time merge skipped: {e}")
+                
+                print("[DEBUG parquet] g_cpu:", None if g_cpu is None else len(g_cpu))
+                print("[DEBUG parquet] yv_cpu:", None if yv_cpu is None else len(yv_cpu))
+                print("[DEBUG parquet] pv_cpu:", None if pv_cpu is None else len(pv_cpu))
+                print("[DEBUG parquet] df_out rows before Time merge:", None if df_out is None else len(df_out))
 
                 # Save once, then upload once
                 df_out.to_parquet(pred_path, index=False)
