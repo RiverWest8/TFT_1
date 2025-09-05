@@ -412,26 +412,24 @@ def _extract_vol_quantiles(pred):
         return flat[:, :K]
     return None
 
-
 @torch.no_grad()
-def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, calibrator: dict | None = None):
+def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     """
-    Robust export:
-      • Reload best checkpoint found on the current trainer
-      • Runs predict(..., mode="raw", return_x=True) and tolerates tuple/dict/single returns
+    Minimal, self-contained export that is robust to various PF/Lightning return layouts:
+      • Loads the best checkpoint
+      • Predicts in raw mode and iterates per-batch
       • Extracts groups/time/targets from each batch dict
-      • Decodes realised_vol using the TRAIN GroupNormalizer
-      • (TEST only) applies piecewise validation calibrator to q05/q50/q95
-      • Writes parquet with: asset, time_idx, y_vol, y_dir, y_vol_pred, y_vol_pred_q05/50/95, y_dir_prob
+      • Decodes realised_vol using the TRAIN normalizer
+      • Writes a harmonised parquet with columns: asset, time_idx, y_vol, y_vol_pred, y_dir_prob (optional)
     """
-    # 1) Find best checkpoint from the trainer callbacks; else newest local *.ckpt
+    # 1) Find best checkpoint
     best_ckpt = None
     for cb in getattr(trainer, "callbacks", []):
         if isinstance(cb, pl.callbacks.ModelCheckpoint):
-            p = getattr(cb, "best_model_path", None)
-            if p and os.path.exists(p):
-                best_ckpt = p
-                break
+            if getattr(cb, "best_model_path", None):
+                if cb.best_model_path and os.path.exists(cb.best_model_path):
+                    best_ckpt = cb.best_model_path
+                    break
     if best_ckpt is None:
         try:
             cks = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -442,86 +440,94 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, cal
     if best_ckpt is None:
         raise RuntimeError("Best checkpoint not found for export.")
 
-    # 2) Load best model on current device
+    # 2) Recreate model from best ckpt on current device
     LM = type(trainer.lightning_module)
     best_model = LM.load_from_checkpoint(best_ckpt)
     best_model.eval().to(trainer.lightning_module.device)
 
-    # 3) id->name map and (optional) default calibrator from PerAssetMetrics
+    # 3) id->name map from PerAssetMetrics if available
     metrics_cb = None
     for cb in getattr(trainer, "callbacks", []):
         if isinstance(cb, PerAssetMetrics):
             metrics_cb = cb
             break
-    id_to_name = {int(k): str(v) for k, v in getattr(metrics_cb, "id_to_name", {}).items()} if metrics_cb else {}
-    if calibrator is None and metrics_cb is not None and str(split).lower() == "test":
-        calibrator = getattr(metrics_cb, "_calibrator", None)
+    id_to_name = None
+    if metrics_cb is not None:
+        id_to_name = {int(k): str(v) for k, v in metrics_cb.id_to_name.items()}
+    else:
+        # fallback: identity mapping added later if needed
+        id_to_name = {}
 
-    # 4) Resolve TRAIN normalizer used for realised_vol
+    # Try to load calibrator saved from validation (optional)
+    calibrator = None
+    try:
+        _cal_path = _calibrator_json_path()
+        if os.path.exists(_cal_path):
+            with open(_cal_path, "r") as f:
+                calibrator = json.load(f)
+    except Exception as e:
+        print(f"[WARN] Could not load calibrator: {e}")
+
+    # 4) Resolve TRAIN normalizer for decoding realised_vol
     vol_norm = None
     try:
         vol_norm = _extract_norm_from_dataset(getattr(best_model, "dataset", None))
     except Exception:
-        pass
+        vol_norm = None
     if vol_norm is None:
         try:
             vol_norm = _extract_norm_from_dataset(getattr(dataloader, "dataset", None))
         except Exception:
-            pass
+            vol_norm = None
 
     # 5) Predict in raw mode; handle multiple return layouts
-    _pred_out = best_model.predict(dataloader, mode="raw", return_x=True)
-    if isinstance(_pred_out, (list, tuple)):
-        raw_preds = _pred_out[0] if len(_pred_out) >= 1 else None
-        raw_x     = _pred_out[1] if len(_pred_out) >= 2 else None
-    elif isinstance(_pred_out, dict):
-        raw_preds = _pred_out.get("prediction", _pred_out.get("predictions", _pred_out))
-        raw_x     = _pred_out.get("x", None)
-    else:
-        raw_preds = _pred_out
-        raw_x     = None
-    if raw_preds is None:
-        raise RuntimeError("predict() returned no predictions")
+    raw_preds, raw_x = best_model.predict(dataloader, mode="raw", return_x=True)
 
+    # Normalise to per-batch lists for easier zipping
     def _to_list(obj):
         if isinstance(obj, (list, tuple)):
             return list(obj)
         return [obj]
 
     preds_list = _to_list(raw_preds)
-    x_list = _to_list(raw_x) if raw_x is not None else [None] * len(preds_list)
+    x_list = _to_list(raw_x)
+
+    # If a single big tensor dict was returned for preds but x is list, replicate once per batch length
     if len(preds_list) == 1 and isinstance(preds_list[0], (dict, torch.Tensor)) and len(x_list) > 1:
         preds_list = preds_list * len(x_list)
 
-    # --- Accumulators
+    # Accumulators
     assets_all, t_all = [], []
-    y_true_all, y_dir_true_all, y_dirprob_all = [], [], []
+    y_true_all, y_dirprob_all = [], []
     y_pred_q05_all, y_pred_q50_all, y_pred_q95_all = [], [], []
-
+    # Helper: extract x dict from a batch container
     def _get_x(b):
         if isinstance(b, dict):
             return b
-        if isinstance(b, (list, tuple)) and b and isinstance(b[0], dict):
+        if isinstance(b, (list, tuple)) and len(b) >= 1 and isinstance(b[0], dict):
             return b[0]
         return None
 
-    # --- Iterate batches
-    for i in range(len(preds_list)):
-        pred_b = preds_list[i]
-        x = _get_x(x_list[i]) if i < len(x_list) else None
+    # Iterate batches
+    for pred_b, xb in zip(preds_list, x_list):
+        x = _get_x(xb)
+        if x is None:
+            continue
 
         # Resolve prediction tensor for this batch
-        pred_t = pred_b["prediction"] if isinstance(pred_b, dict) and "prediction" in pred_b else pred_b
+        if isinstance(pred_b, dict) and "prediction" in pred_b:
+            pred_t = pred_b["prediction"]
+        else:
+            pred_t = pred_b
         if pred_t is None:
             continue
 
         # Groups (asset ids)
         g = None
-        if isinstance(x, dict):
-            for k in ("groups", "group_ids", "group_id"):
-                if k in x and x[k] is not None:
-                    g = x[k]
-                    break
+        for k in ("groups", "group_ids", "group_id"):
+            if k in x and x[k] is not None:
+                g = x[k]
+                break
         if g is None:
             continue
         if isinstance(g, (list, tuple)) and len(g) > 0:
@@ -530,14 +536,10 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, cal
             g = g.squeeze(-1)
         if not torch.is_tensor(g):
             continue
-        L = int(g.shape[0])
+        L = g.shape[0]
 
-        # Time index (no boolean eval on tensors)
-        t = None
-        if isinstance(x, dict):
-            t = x.get("decoder_time_idx", None)
-            if t is None:
-                t = x.get("decoder_relative_idx", None)
+        # Time index (optional)
+        t = x.get("decoder_time_idx") or x.get("decoder_relative_idx")
         if torch.is_tensor(t):
             while t.ndim > 1 and t.size(-1) == 1:
                 t = t.squeeze(-1)
@@ -545,127 +547,120 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, cal
         else:
             t = None
 
-        # Heads: median-enc vol & direction logit/prob
+        # Extract heads
         p_vol_enc, p_dir = _extract_heads(pred_t)
         if p_vol_enc is None:
             continue
         p_vol_enc = p_vol_enc.reshape(-1)[:L]
 
-        # ---- Unified quantile decoding (q05, q50, q95)
-        floor_val = float(globals().get("EVAL_VOL_FLOOR", 1e-8))
-        y_q05 = y_q50 = y_q95 = None
-        V = _extract_vol_quantiles(pred_t)
-        if torch.is_tensor(V) and V.ndim == 2:
-            V = torch.cummax(V, dim=-1).values  # ensure monotone
-            q05_enc = V[:, Q05_IDX].reshape(-1)[:L] if V.size(1) > Q05_IDX else None
-            q50_enc = V[:, Q50_IDX].reshape(-1)[:L] if V.size(1) > Q50_IDX else None
-            q95_enc = V[:, Q95_IDX].reshape(-1)[:L] if V.size(1) > Q95_IDX else None
-
-            # decode each present quantile; fall back to median head if q50 missing
-            if q50_enc is not None:
-                y_q50 = safe_decode_vol(q50_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1) if vol_norm is not None else q50_enc
-                y_q50 = torch.clamp(y_q50, min=floor_val)
-            else:
-                y_q50 = safe_decode_vol(p_vol_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1) if vol_norm is not None else p_vol_enc
-                y_q50 = torch.clamp(y_q50, min=floor_val) if torch.is_tensor(y_q50) else y_q50
-
-            if q05_enc is not None:
-                y_q05 = safe_decode_vol(q05_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1) if vol_norm is not None else q05_enc
-                y_q05 = torch.clamp(y_q05, min=floor_val)
-            if q95_enc is not None:
-                y_q95 = safe_decode_vol(q95_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1) if vol_norm is not None else q95_enc
-                y_q95 = torch.clamp(y_q95, min=floor_val)
+        # Decode q50 and q95 (uncertainty bars)
+        vol_q = _extract_vol_quantiles(pred_t)
+        q50_enc, q95_enc = None, None
+        if torch.is_tensor(vol_q) and vol_q.ndim == 2 and vol_q.size(1) >= (max(Q50_IDX, Q95_IDX) + 1):
+            vol_q = torch.cummax(vol_q, dim=-1).values
+            q50_enc = vol_q[:, Q50_IDX].reshape(-1)[:L]
+            q95_enc = vol_q[:, Q95_IDX].reshape(-1)[:L]
         else:
-            y_q50 = safe_decode_vol(p_vol_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1) if vol_norm is not None else p_vol_enc
-            y_q50 = torch.clamp(y_q50, min=floor_val) if torch.is_tensor(y_q50) else y_q50
-            y_q05, y_q95 = None, None
+            # fallback: use the median we already parsed
+            q50_enc = p_vol_enc.reshape(-1)[:L]
+
+        # Decode median (q50) for the point forecast
+        floor_val = float(globals().get("EVAL_VOL_FLOOR", 1e-8))
+        if vol_norm is not None:
+            y_q50 = safe_decode_vol(p_vol_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+            y_q50 = torch.clamp(y_q50, min=floor_val)
+        else:
+            y_q50 = p_vol_enc
+
+        # Also extract q05 and q95 for uncertainty bars
+        vol_q = _extract_vol_quantiles(pred_t)
+        q05_enc, q95_enc = None, None
+        if torch.is_tensor(vol_q) and vol_q.ndim == 2 and vol_q.size(1) >= (max(Q05_IDX, Q95_IDX) + 1):
+            vol_q = torch.cummax(vol_q, dim=-1).values
+            q05_enc = vol_q[:, Q05_IDX].reshape(-1)[:L]
+            q95_enc = vol_q[:, Q95_IDX].reshape(-1)[:L]
+
+        # Decode q05/q95 if present
+        y_q05, y_q95 = None, None
+        if q05_enc is not None and vol_norm is not None:
+            y_q05 = safe_decode_vol(q05_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+            y_q05 = torch.clamp(y_q05, min=floor_val)
+        elif q05_enc is not None:
+            y_q05 = q05_enc
+
+        if q95_enc is not None and vol_norm is not None:
+            y_q95 = safe_decode_vol(q95_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+            y_q95 = torch.clamp(y_q95, min=floor_val)
+        elif q95_enc is not None:
+            y_q95 = q95_enc
+
+        # TEST-only: apply piecewise validation calibrator to decoded predictions
+        try:
+            if calibrator is not None and str(split).lower() == "test":
+                if y_q50 is not None:
+                    y_q50 = apply_piecewise_calibrator_on_preds(y_q50, calibrator)
+                if y_q05 is not None:
+                    y_q05 = apply_piecewise_calibrator_on_preds(y_q05, calibrator)
+                if y_q95 is not None:
+                    y_q95 = apply_piecewise_calibrator_on_preds(y_q95, calibrator)
+        except Exception as _e:
+            print(f"[WARN] test calibration skipped: {_e}")
 
         # True targets (optional)
-        y_vol_true, y_dir_true = None, None
-        if isinstance(x, dict):
-            dec_t = _first_not_none(x, ["decoder_target", "target", "targets", "y", "decoder_y"])
-        else:
-            dec_t = None
+        y_vol_true = None
+        dec_t = x.get("decoder_target")
         if torch.is_tensor(dec_t):
-            ytmp = dec_t
-            if ytmp.ndim == 3 and ytmp.size(1) == 1:
-                ytmp = ytmp[:, 0, :]
-            if ytmp.ndim == 3 and ytmp.size(-1) == 1:
-                ytmp = ytmp[..., 0]
-            if ytmp.ndim == 2 and ytmp.size(1) >= 1:
-                yv_enc = ytmp[:, 0]
-                y_vol_true = safe_decode_vol(yv_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1) if vol_norm is not None else yv_enc
-                y_vol_true = torch.clamp(y_vol_true, min=floor_val) if torch.is_tensor(y_vol_true) else y_vol_true
-                if ytmp.size(1) > 1:
-                    y_dir_true = ytmp[:, 1]
-            elif ytmp.ndim == 1:
-                y_vol_true = safe_decode_vol(ytmp.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1) if vol_norm is not None else ytmp
-                y_vol_true = torch.clamp(y_vol_true, min=floor_val) if torch.is_tensor(y_vol_true) else y_vol_true
-        elif isinstance(dec_t, (list, tuple)) and len(dec_t) >= 1:
-            yv_enc = dec_t[0]
-            if torch.is_tensor(yv_enc):
-                if yv_enc.ndim == 3 and yv_enc.size(-1) == 1:
-                    yv_enc = yv_enc[..., 0]
-                if yv_enc.ndim == 2 and yv_enc.size(-1) == 1:
-                    yv_enc = yv_enc[:, 0]
-                y_vol_true = safe_decode_vol(yv_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1) if vol_norm is not None else yv_enc
-                y_vol_true = torch.clamp(y_vol_true, min=floor_val)
-            if len(dec_t) > 1 and torch.is_tensor(dec_t[1]):
-                y_dir_true = dec_t[1]
-                if y_dir_true.ndim == 3 and y_dir_true.size(-1) == 1:
-                    y_dir_true = y_dir_true[..., 0]
-                if y_dir_true.ndim == 2 and y_dir_true.size(-1) == 1:
-                    y_dir_true = y_dir_true[:, 0]
+            yt = dec_t
+            if yt.ndim == 3 and yt.size(-1) >= 1:
+                yt = yt[:, 0, 0]
+            elif yt.ndim == 2:
+                yt = yt[:, 0]
+            if vol_norm is not None:
+                y_vol_true = safe_decode_vol(yt.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+            else:
+                y_vol_true = yt
 
-        # Direction probability in [0,1] (scalar-safe checks)
+        # Direction → probability in [0,1]
         y_dir_prob = None
         if p_dir is not None and torch.is_tensor(p_dir):
             y_dir_prob = p_dir.reshape(-1)[:L]
             try:
-                finite_any = bool(torch.isfinite(y_dir_prob).any().item())
-                mn = float(torch.min(y_dir_prob).item())
-                mx = float(torch.max(y_dir_prob).item())
-                if finite_any and (mn < 0.0 or mx > 1.0):
+                if torch.isfinite(y_dir_prob).any() and (y_dir_prob.min() < 0 or y_dir_prob.max() > 1):
                     y_dir_prob = torch.sigmoid(y_dir_prob)
             except Exception:
                 y_dir_prob = torch.sigmoid(y_dir_prob)
             y_dir_prob = torch.clamp(y_dir_prob, 0.0, 1.0)
 
-        # TEST-only: apply validation calibrator to decoded preds (does NOT touch validation parquet)
-        try:
-            if calibrator is not None and isinstance(calibrator, dict) and str(split).lower() == "test":
-                if y_q50 is not None and torch.is_tensor(y_q50):
-                    y_q50 = apply_piecewise_calibrator_on_preds(y_q50, calibrator)
-                if y_q05 is not None and torch.is_tensor(y_q05):
-                    y_q05 = apply_piecewise_calibrator_on_preds(y_q05, calibrator)
-                if y_q95 is not None and torch.is_tensor(y_q95):
-                    y_q95 = apply_piecewise_calibrator_on_preds(y_q95, calibrator)
-        except Exception as _e:
-            print(f"[WARN] test calibration skipped: {_e}")
-
-        # Map ids → names
+        # Map asset ids → names
         aset = [id_to_name.get(int(i), str(int(i))) for i in g.detach().cpu().tolist()]
 
-        # Append
+        # Append accumulators
         assets_all.extend(aset)
-        t_all.extend(t.detach().cpu().tolist() if torch.is_tensor(t) else [None] * L)
-        # predictions
-        y_pred_q50_all.extend((y_q50.detach().cpu().tolist() if torch.is_tensor(y_q50) else [float(y_q50)] * L) if y_q50 is not None else [None] * L)
-        y_pred_q05_all.extend(y_q05.detach().cpu().tolist() if (y_q05 is not None and torch.is_tensor(y_q05)) else ([None] * L if y_q05 is None else [float(y_q05)] * L))
-        y_pred_q95_all.extend(y_q95.detach().cpu().tolist() if (y_q95 is not None and torch.is_tensor(y_q95)) else ([None] * L if y_q95 is None else [float(y_q95)] * L))
-        # truths
-        y_true_all.extend(y_vol_true.detach().cpu().tolist() if (y_vol_true is not None and torch.is_tensor(y_vol_true)) else ([None] * L if y_vol_true is None else [float(y_vol_true)] * L))
-        y_dir_true_all.extend(y_dir_true.detach().cpu().tolist() if (y_dir_true is not None and torch.is_tensor(y_dir_true)) else ([None] * L if y_dir_true is None else [float(y_dir_true)] * L))
-        # direction prob
-        y_dirprob_all.extend(y_dir_prob.detach().cpu().tolist() if (y_dir_prob is not None and torch.is_tensor(y_dir_prob)) else ([None] * L if y_dir_prob is None else [float(y_dir_prob)] * L))
+        t_all.extend(t.detach().cpu().tolist() if isinstance(t, torch.Tensor) else [None] * L)
+        # store q05, q50, q95
+        if y_q05 is not None:
+            y_pred_q05_all.extend(y_q05.detach().cpu().tolist())
+        else:
+            y_pred_q05_all.extend([None] * L)
+        y_pred_q50_all.extend(y_q50.detach().cpu().tolist())
+        if y_q95 is not None:
+            y_pred_q95_all.extend(y_q95.detach().cpu().tolist())
+        else:
+            y_pred_q95_all.extend([None] * L)
+        if y_vol_true is not None:
+            y_true_all.extend(y_vol_true.detach().cpu().tolist())
+        else:
+            y_true_all.extend([None] * L)
+        if y_dir_prob is not None:
+            y_dirprob_all.extend(y_dir_prob.detach().cpu().tolist())
+        else:
+            y_dirprob_all.extend([None] * L)
 
-    # Build dataframe
     df = pd.DataFrame({
         "asset": assets_all,
         "time_idx": t_all,
-        "y_vol": y_true_all,                  # true realised vol (if available)
-        "y_dir": y_dir_true_all,              # true direction (if available)
-        "y_vol_pred": y_pred_q50_all,         # point forecast = q50
+        "y_vol": y_true_all,
+        "y_vol_pred": y_pred_q50_all,    # point forecast = q50
         "y_vol_pred_q05": y_pred_q05_all,
         "y_vol_pred_q50": y_pred_q50_all,
         "y_vol_pred_q95": y_pred_q95_all,
@@ -699,6 +694,8 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, cal
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_path, index=False)
     print(f"✓ Wrote {split.upper()} predictions → {out_path}")
+
+    
 
 
 # -----------------------------------------------------------------------
@@ -799,79 +796,6 @@ def calibrate_vol_predictions(y_true_dec: torch.Tensor, y_pred_dec: torch.Tensor
 
     return p.view_as(y_pred_dec)
 
-@torch.no_grad()
-def fit_piecewise_calibrator_from_validation(
-    y_true_dec: torch.Tensor,
-    y_pred_dec: torch.Tensor,
-    low_q: float = 0.33,
-    high_q: float = 0.66,
-    clip: tuple[float, float] = (0.5, 2.0),
-) -> dict:
-    """
-    Learn a simple piecewise multiplicative calibrator on VALIDATION by
-    matching mean(y) to mean(pred) in the lower and upper *predicted* terciles.
-    Returns a dict with thresholds and scales that can be applied to TEST.
-    """
-    y = y_true_dec.reshape(-1)
-    p = y_pred_dec.reshape(-1)
-    if y.numel() == 0 or p.numel() == 0:
-        return {"type": "piecewise_tercile_on_pred", "p33": float("nan"), "p66": float("nan"),
-                "s_low": 1.0, "s_high": 1.0, "clip": [clip[0], clip[1]]}
-
-    # thresholds on the *predicted* distribution so we can reuse on TEST
-    p33 = torch.quantile(p, torch.tensor(low_q, device=p.device))
-    p66 = torch.quantile(p, torch.tensor(high_q, device=p.device))
-
-    mask_low = p <= p33
-    mask_high = p >= p66
-
-    def _scale(mask: torch.Tensor) -> float:
-        if mask is None or mask.sum() == 0:
-            return 1.0
-        yp = p[mask].mean()
-        yt = y[mask].mean()
-        if not torch.isfinite(yp) or float(torch.abs(yp)) < 1e-12:
-            return 1.0
-        s = float((yt / yp).item())
-        lo, hi = clip
-        return float(min(max(s, lo), hi))
-
-    s_low = _scale(mask_low)
-    s_high = _scale(mask_high)
-
-    return {
-        "type": "piecewise_tercile_on_pred",
-        "p33": float(p33.item()),
-        "p66": float(p66.item()),
-        "s_low": float(s_low),
-        "s_high": float(s_high),
-        "clip": [clip[0], clip[1]],
-    }
-
-@torch.no_grad()
-def apply_piecewise_calibrator_on_preds(y_pred_dec: torch.Tensor, calib: dict | None) -> torch.Tensor:
-    """Apply piecewise (low/mid/high) multiplicative calibration based on predicted terciles."""
-    if calib is None or not isinstance(calib, dict):
-        return y_pred_dec
-    x = y_pred_dec.clone()
-    try:
-        p33 = float(calib.get("p33", float("nan")))
-        p66 = float(calib.get("p66", float("nan")))
-        s_low = float(calib.get("s_low", 1.0))
-        s_high = float(calib.get("s_high", 1.0))
-    except Exception:
-        return x
-    if not torch.is_tensor(x):
-        return x
-    mask_low = x <= p33
-    mask_high = x >= p66
-    # middle stays as 1.0
-    x[mask_low] = x[mask_low] * s_low
-    x[mask_high] = x[mask_high] * s_high
-    return x
-
-
-
 if not hasattr(GroupNormalizer, "decode"):
     def _gn_decode(self, y, group_ids=None, **kwargs):
         """
@@ -905,7 +829,67 @@ if not hasattr(GroupNormalizer, "decode"):
 
     GroupNormalizer.decode = _gn_decode
 
+# ---- Validation calibrator (persist + apply on TEST) ----
 
+def _calibrator_json_path() -> Path:
+    try:
+        return LOCAL_RUN_DIR / f"tft_val_calibrator_e{MAX_EPOCHS}_{RUN_SUFFIX}.json"
+    except Exception:
+        return LOCAL_RUN_DIR / "tft_val_calibrator.json"
+
+@torch.no_grad()
+def fit_piecewise_calibrator_from_val(y_true_dec: torch.Tensor, y_pred_dec: torch.Tensor) -> dict:
+    """
+    3-bucket multiplicative calibrator using **predicted** value terciles
+    so we can route at TEST time without y_true.
+    Returns thresholds (t1,t2) on preds and per-bucket scales.
+    """
+    y = y_true_dec.reshape(-1).float().detach()
+    p = y_pred_dec.reshape(-1).float().detach()
+    if y.numel() == 0 or p.numel() == 0:
+        return {}
+    t1, t2 = torch.quantile(p, torch.tensor([0.33, 0.66], device=p.device))
+
+    def _scale(mask: torch.Tensor) -> float:
+        if mask is None or mask.sum() == 0:
+            return 1.0
+        yp = p[mask].mean()
+        yt = y[mask].mean()
+        if torch.isfinite(yp) and torch.isfinite(yt) and float(torch.abs(yp)) > 1e-12:
+            return float((yt / yp).clamp(0.25, 4.0).item())
+        return 1.0
+
+    calib = {
+        "version": 1,
+        "t1": float(t1.item()),
+        "t2": float(t2.item()),
+        "s_low":  _scale(p <= t1),
+        "s_mid":  _scale((p > t1) & (p < t2)),
+        "s_high": _scale(p >= t2),
+    }
+    return calib
+
+@torch.no_grad()
+def apply_piecewise_calibrator_on_preds(y_pred_dec: torch.Tensor, calibrator: dict) -> torch.Tensor:
+    """Apply saved piecewise calibrator to a decoded prediction tensor."""
+    if not isinstance(calibrator, dict) or y_pred_dec is None or not torch.is_tensor(y_pred_dec):
+        return y_pred_dec
+    t1 = float(calibrator.get("t1", float("nan")))
+    t2 = float(calibrator.get("t2", float("nan")))
+    s_low  = float(calibrator.get("s_low", 1.0))
+    s_mid  = float(calibrator.get("s_mid", 1.0))
+    s_high = float(calibrator.get("s_high", 1.0))
+    y = y_pred_dec.clone()
+    try:
+        m_low  = y <= t1
+        m_high = y >= t2
+        m_mid  = (~m_low) & (~m_high)
+        y[m_low]  = y[m_low]  * s_low
+        y[m_mid]  = y[m_mid]  * s_mid
+        y[m_high] = y[m_high] * s_high
+        return y
+    except Exception:
+        return y_pred_dec
 
 from pytorch_forecasting.metrics import QuantileLoss, MultiLoss
 
@@ -1257,8 +1241,8 @@ class PerAssetMetrics(pl.Callback):
             print("DEBUG mean after decode:", float(yv_dec.mean().item()))
             ratio_dbg = float((yv_dec.mean() / (pv_dec.mean() + 1e-12)).item())
             print("DEBUG: mean(yv_dec)=", float(yv_dec.mean().item()),
-                "mean(pv_dec)=", float(pv_dec.mean().item()),
-                "ratio=", ratio_dbg)
+                  "mean(pv_dec)=", float(pv_dec.mean().item()),
+                  "ratio=", ratio_dbg)
         except Exception:
             pass
 
@@ -1300,7 +1284,7 @@ class PerAssetMetrics(pl.Callback):
             overall_qlike_cal = float((ratio_cal - torch.log(ratio_cal) - 1.0).mean().item())
             trainer.callback_metrics["val_qlike_cal"] = torch.tensor(overall_qlike_cal)
         except Exception as _e:
-            overall_qlike_cal = None
+            pass
 
         # --- Optional direction metrics (overall) ---
         acc = None
@@ -1353,8 +1337,7 @@ class PerAssetMetrics(pl.Callback):
         trainer.callback_metrics["val_rmse_overall"]      = torch.tensor(overall_rmse)
         trainer.callback_metrics["val_mse_overall"]       = torch.tensor(overall_mse)
         trainer.callback_metrics["val_qlike_overall"]     = torch.tensor(overall_qlike)
-        if overall_qlike_cal is not None:
-            trainer.callback_metrics["val_qlike_cal"] = torch.tensor(overall_qlike_cal)
+        trainer.callback_metrics["val_qlike_cal"]     = torch.tensor(overall_qlike_cal)
         trainer.callback_metrics["val_N_overall"]         = torch.tensor(float(N))
 
         msg = (
@@ -1372,6 +1355,17 @@ class PerAssetMetrics(pl.Callback):
         )
         print(msg)
 
+        # --- Save validation calibrator for TEST-time use (does NOT affect VAL parquet) ---
+        try:
+            calib = fit_piecewise_calibrator_from_val(y_cpu, p_cpu)
+            if isinstance(calib, dict) and calib:
+                self._calibrator = calib
+                _cal_path = _calibrator_json_path()
+                with open(_cal_path, "w") as f:
+                    json.dump(calib, f, indent=2)
+                print(f"✓ Saved validation calibrator → {_cal_path}")
+        except Exception as e:
+            print(f"[WARN] Could not save validation calibrator: {e}")
         # --- Per-asset metrics table (so on_fit_end can print it) ---
         self._last_rows = []
         try:
@@ -1412,7 +1406,7 @@ class PerAssetMetrics(pl.Callback):
                 acc_a = None
                 if "yd" in gdf.columns and "pd" in gdf.columns:
                     acc_a = float(((torch.tensor(gdf["pd"].values) >= 0.5).int() ==
-                                torch.tensor(gdf["yd"].values).int()).float().mean().item())
+                                   torch.tensor(gdf["yd"].values).int()).float().mean().item())
 
                 rows.append((a, mae_a, rmse_a, mse_a, qlike_a, acc_a, n_a))
 
@@ -1447,16 +1441,6 @@ class PerAssetMetrics(pl.Callback):
             "yd": yd_cpu,
             "pd": pdir_cpu,
         }
-
-        # ---- NEW: fit & stash a calibrator from VALIDATION (for later TEST export) ----
-        try:
-            self._calibrator = fit_piecewise_calibrator_from_validation(y_cpu, p_cpu)
-            # expose a couple of numbers for the logs
-            trainer.callback_metrics["val_calib_s_low"] = torch.tensor(float(self._calibrator.get("s_low", 1.0)))
-            trainer.callback_metrics["val_calib_s_high"] = torch.tensor(float(self._calibrator.get("s_high", 1.0)))
-        except Exception as _e:
-            self._calibrator = None
-            print(f"[WARN] Could not fit validation calibrator: {_e}")
 
     @torch.no_grad()
     def on_fit_end(self, trainer, pl_module):
@@ -2522,7 +2506,7 @@ EXTRA_CALLBACKS = [
           save_last=True,
       ),
       StochasticWeightAveraging(swa_lrs = 1e6 , annealing_epochs = 1, annealing_strategy="cos", swa_epoch_start=max(1, int(0.9 * MAX_EPOCHS))),
-      CosineLR(start_epoch=10, eta_min_ratio=0.005, hold_last_epochs=2, warmup_steps=0),
+      CosineLR(start_epoch=10, eta_min_ratio=0.05, hold_last_epochs=2, warmup_steps=0),
       ]
 
 class ValLossHistory(pl.Callback):
@@ -3633,10 +3617,7 @@ def _safe_prob(t: torch.Tensor) -> torch.Tensor:
     if not torch.is_tensor(t):
         return t
     try:
-        finite_any = bool(torch.isfinite(t).any().item())
-        minval = float(torch.min(t).item())
-        maxval = float(torch.max(t).item())
-        if finite_any and (minval < 0.0 or maxval > 1.0):
+        if torch.isfinite(t).any() and (t.min() < 0 or t.max() > 1):
             t = torch.sigmoid(t)
     except Exception:
         t = torch.sigmoid(t)
