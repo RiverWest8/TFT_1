@@ -130,6 +130,17 @@ import argparse
 
 import pytorch_forecasting as pf
 import inspect
+import path
+# Local ephemerals (good for GCE/Vertex)
+LOCAL_DATA_DIR = Path(os.environ.get("LOCAL_DATA_DIR", "/tmp/data/CleanedData"))
+LOCAL_OUTPUT_DIR = Path(os.environ.get("LOCAL_OUTPUT_DIR", "/tmp/feature_ablation"))
+LOCAL_RUN_DIR = Path(os.environ.get("LOCAL_RUN_DIR", "/tmp/tft_run"))
+LOCAL_LOG_DIR = LOCAL_RUN_DIR / "lightning_logs"
+LOCAL_CKPT_DIR = LOCAL_RUN_DIR / "checkpoints"
+for p in [LOCAL_DATA_DIR, LOCAL_OUTPUT_DIR, LOCAL_CKPT_DIR, LOCAL_LOG_DIR]:
+    p.mkdir(parents=True, exist_ok=True)
+
+
 
 VOL_QUANTILES = [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95] #The quantiles which yielded our best so far
 #Q50_IDX = VOL_QUANTILES.index(0.50)  
