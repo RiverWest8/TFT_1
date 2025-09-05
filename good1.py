@@ -58,7 +58,7 @@ import lightning.pytorch as pl
 
 BATCH_SIZE   = 128
 MAX_EPOCHS   = 35
-EARLY_STOP_PATIENCE = 20
+EARLY_STOP_PATIENCE = 15
 PERM_BLOCK_SIZE = 288
 
 # Extra belt-and-braces: swallow BrokenPipe errors on stdout.flush() if any other lib calls it.
@@ -413,60 +413,55 @@ def _extract_vol_quantiles(pred):
     return None
 
 @torch.no_grad()
-def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, use_best: bool = False):
+def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     """
-    Robust export helper.
-
-    Defaults to using the CURRENT in-memory model (i.e., last epoch) to write Parquet.
-    Set `use_best=True` to load and export from the best checkpoint instead.
-
-    Fixes:
-      • Works with PF variants where predict(..., return_x=True) returns 2 or 3 items.
-      • Decodes using the TRAIN normalizer when available, with safe floors + NaN guards.
-      • Writes a harmonised Parquet with columns:
-          asset, time_idx, y_vol, y_vol_pred, y_vol_pred_q05, y_vol_pred_q50, y_vol_pred_q95, y_dir_prob
+    Minimal, self-contained export that is robust to various PF/Lightning return layouts:
+      • Loads the best checkpoint
+      • Predicts in raw mode and iterates per-batch
+      • Extracts groups/time/targets from each batch dict
+      • Decodes realised_vol using the TRAIN normalizer
+      • Writes a harmonised parquet with columns: asset, time_idx, y_vol, y_vol_pred, y_dir_prob (optional)
     """
-    import os
+    # 1) Find best checkpoint
+    best_ckpt = None
+    for cb in getattr(trainer, "callbacks", []):
+        if isinstance(cb, pl.callbacks.ModelCheckpoint):
+            if getattr(cb, "best_model_path", None):
+                if cb.best_model_path and os.path.exists(cb.best_model_path):
+                    best_ckpt = cb.best_model_path
+                    break
+    if best_ckpt is None:
+        try:
+            cks = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if cks:
+                best_ckpt = str(cks[0])
+        except Exception:
+            pass
+    if best_ckpt is None:
+        raise RuntimeError("Best checkpoint not found for export.")
 
-    # ---- 1) Choose model: last-epoch by default; best checkpoint if requested ----
+    # 2) Recreate model from best ckpt on current device
     LM = type(trainer.lightning_module)
-    model = None
+    best_model = LM.load_from_checkpoint(best_ckpt)
+    best_model.eval().to(trainer.lightning_module.device)
 
-    if use_best:
-        best_ckpt = None
-        for cb in getattr(trainer, "callbacks", []):
-            if isinstance(cb, pl.callbacks.ModelCheckpoint):
-                if getattr(cb, "best_model_path", None):
-                    if cb.best_model_path and os.path.exists(cb.best_model_path):
-                        best_ckpt = cb.best_model_path
-                        break
-        if best_ckpt is None:
-            try:
-                cks = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
-                if cks:
-                    best_ckpt = str(cks[0])
-            except Exception:
-                pass
-        model = LM.load_from_checkpoint(best_ckpt) if best_ckpt else trainer.lightning_module
-    else:
-        model = trainer.lightning_module
-
-    model.eval().to(trainer.lightning_module.device)
-
-    # ---- 2) id->name map from PerAssetMetrics if available ----
-    id_to_name = {}
+    # 3) id->name map from PerAssetMetrics if available
+    metrics_cb = None
     for cb in getattr(trainer, "callbacks", []):
         if isinstance(cb, PerAssetMetrics):
-            try:
-                id_to_name = {int(k): str(v) for k, v in getattr(cb, "id_to_name", {}).items()}
-            except Exception:
-                id_to_name = {}
+            metrics_cb = cb
             break
+    id_to_name = None
+    if metrics_cb is not None:
+        id_to_name = {int(k): str(v) for k, v in metrics_cb.id_to_name.items()}
+    else:
+        # fallback: identity mapping added later if needed
+        id_to_name = {}
 
-    # ---- 3) Resolve TRAIN normalizer for decoding realised_vol ----
+    # 4) Resolve TRAIN normalizer for decoding realised_vol
     vol_norm = None
     try:
-        vol_norm = _extract_norm_from_dataset(getattr(model, "dataset", None))
+        vol_norm = _extract_norm_from_dataset(getattr(best_model, "dataset", None))
     except Exception:
         vol_norm = None
     if vol_norm is None:
@@ -475,17 +470,8 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, use
         except Exception:
             vol_norm = None
 
-    # ---- 4) Predict in raw mode; handle 2- or 3-item returns robustly ----
-    res = model.predict(dataloader, mode="raw", return_x=True)
-    if isinstance(res, (list, tuple)):
-        if len(res) == 2:
-            raw_preds, raw_x = res
-        elif len(res) == 3:
-            raw_preds, _, raw_x = res[0], res[1], res[-1]
-        else:
-            raw_preds, raw_x = res[0], res[-1]
-    else:
-        raw_preds, raw_x = res, None
+    # 5) Predict in raw mode; handle multiple return layouts
+    raw_preds, raw_x = best_model.predict(dataloader, mode="raw", return_x=True)
 
     # Normalise to per-batch lists for easier zipping
     def _to_list(obj):
@@ -494,16 +480,17 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, use
         return [obj]
 
     preds_list = _to_list(raw_preds)
-    x_list = _to_list(raw_x) if raw_x is not None else [None] * len(preds_list)
-    # If a single big tensor was returned for preds but x is list, replicate once per batch length
+    x_list = _to_list(raw_x)
+
+    # If a single big tensor dict was returned for preds but x is list, replicate once per batch length
     if len(preds_list) == 1 and isinstance(preds_list[0], (dict, torch.Tensor)) and len(x_list) > 1:
         preds_list = preds_list * len(x_list)
 
-    # ---- 5) Accumulators ----
+    # Accumulators
     assets_all, t_all = [], []
     y_true_all, y_dirprob_all = [], []
     y_pred_q05_all, y_pred_q50_all, y_pred_q95_all = [], [], []
-
+    # Helper: extract x dict from a batch container
     def _get_x(b):
         if isinstance(b, dict):
             return b
@@ -511,9 +498,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, use
             return b[0]
         return None
 
-    floor_val = float(globals().get("EVAL_VOL_FLOOR", 1e-6))
-
-    # ---- 6) Iterate batches ----
+    # Iterate batches
     for pred_b, xb in zip(preds_list, x_list):
         x = _get_x(xb)
         if x is None:
@@ -530,7 +515,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, use
         # Groups (asset ids)
         g = None
         for k in ("groups", "group_ids", "group_id"):
-            if isinstance(x, dict) and (k in x) and (x[k] is not None):
+            if k in x and x[k] is not None:
                 g = x[k]
                 break
         if g is None:
@@ -558,34 +543,44 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, use
             continue
         p_vol_enc = p_vol_enc.reshape(-1)[:L]
 
-        # Also extract all vol quantiles if present
+        # Decode q50 and q95 (uncertainty bars)
         vol_q = _extract_vol_quantiles(pred_t)
-        q05_enc = q95_enc = None
+        q50_enc, q95_enc = None, None
+        if torch.is_tensor(vol_q) and vol_q.ndim == 2 and vol_q.size(1) >= (max(Q50_IDX, Q95_IDX) + 1):
+            vol_q = torch.cummax(vol_q, dim=-1).values
+            q50_enc = vol_q[:, Q50_IDX].reshape(-1)[:L]
+            q95_enc = vol_q[:, Q95_IDX].reshape(-1)[:L]
+        else:
+            # fallback: use the median we already parsed
+            q50_enc = p_vol_enc.reshape(-1)[:L]
+
+        # Decode median (q50) for the point forecast
+        floor_val = float(globals().get("EVAL_VOL_FLOOR", 1e-8))
+        if vol_norm is not None:
+            y_q50 = safe_decode_vol(p_vol_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+            y_q50 = torch.clamp(y_q50, min=floor_val)
+        else:
+            y_q50 = p_vol_enc
+
+        # Also extract q05 and q95 for uncertainty bars
+        vol_q = _extract_vol_quantiles(pred_t)
+        q05_enc, q95_enc = None, None
         if torch.is_tensor(vol_q) and vol_q.ndim == 2 and vol_q.size(1) >= (max(Q05_IDX, Q95_IDX) + 1):
             vol_q = torch.cummax(vol_q, dim=-1).values
             q05_enc = vol_q[:, Q05_IDX].reshape(-1)[:L]
             q95_enc = vol_q[:, Q95_IDX].reshape(-1)[:L]
 
-        # Decode median (q50) for the point forecast
-        if vol_norm is not None:
-            y_q50 = safe_decode_vol(p_vol_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
-            y_q50 = torch.clamp(y_q50, min=floor_val)
-            y_q50 = torch.nan_to_num(y_q50, nan=floor_val, posinf=floor_val, neginf=floor_val)
-        else:
-            y_q50 = p_vol_enc
-
         # Decode q05/q95 if present
-        y_q05 = y_q95 = None
+        y_q05, y_q95 = None, None
         if q05_enc is not None and vol_norm is not None:
             y_q05 = safe_decode_vol(q05_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
             y_q05 = torch.clamp(y_q05, min=floor_val)
-            y_q05 = torch.nan_to_num(y_q05, nan=floor_val, posinf=floor_val, neginf=floor_val)
         elif q05_enc is not None:
             y_q05 = q05_enc
+
         if q95_enc is not None and vol_norm is not None:
             y_q95 = safe_decode_vol(q95_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
             y_q95 = torch.clamp(y_q95, min=floor_val)
-            y_q95 = torch.nan_to_num(y_q95, nan=floor_val, posinf=floor_val, neginf=floor_val)
         elif q95_enc is not None:
             y_q95 = q95_enc
 
@@ -600,8 +595,6 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, use
                 yt = yt[:, 0]
             if vol_norm is not None:
                 y_vol_true = safe_decode_vol(yt.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
-                y_vol_true = torch.clamp(y_vol_true, min=floor_val)
-                y_vol_true = torch.nan_to_num(y_vol_true, nan=floor_val, posinf=floor_val, neginf=floor_val)
             else:
                 y_vol_true = yt
 
@@ -2388,7 +2381,7 @@ VOL_LOSS = AsymmetricQuantileLoss(
 EXTRA_CALLBACKS = [
       BiasWarmupCallback(
           vol_loss=VOL_LOSS,
-          target_under=1.115,
+          target_under=1.09,
           target_mean_bias=0.04,
           warmup_epochs=6,
           qlike_target_weight=0.08,   # keep out of the loss; diagnostics only
@@ -2420,7 +2413,7 @@ EXTRA_CALLBACKS = [
           save_last=True,
       ),
       StochasticWeightAveraging(swa_lrs = 1e6 , annealing_epochs = 1, annealing_strategy="cos", swa_epoch_start=max(1, int(0.9 * MAX_EPOCHS))),
-      CosineLR(start_epoch=10, eta_min_ratio=0.005, hold_last_epochs=2, warmup_steps=0),
+      CosineLR(start_epoch=10, eta_min_ratio=0.05, hold_last_epochs=2, warmup_steps=0),
       ]
 
 class ValLossHistory(pl.Callback):
