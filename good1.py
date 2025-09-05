@@ -614,12 +614,15 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, cal
             else:
                 y_vol_true = yt
 
-        # Direction → probability in [0,1]
+        # Direction → probability in [0,1] (scalar-safe checks to avoid tensor-boolean errors)
         y_dir_prob = None
         if p_dir is not None and torch.is_tensor(p_dir):
             y_dir_prob = p_dir.reshape(-1)[:L]
             try:
-                if torch.isfinite(y_dir_prob).any() and (y_dir_prob.min() < 0 or y_dir_prob.max() > 1):
+                finite_any = bool(torch.isfinite(y_dir_prob).any().item())
+                minval = float(torch.min(y_dir_prob).item())
+                maxval = float(torch.max(y_dir_prob).item())
+                if finite_any and (minval < 0.0 or maxval > 1.0):
                     y_dir_prob = torch.sigmoid(y_dir_prob)
             except Exception:
                 y_dir_prob = torch.sigmoid(y_dir_prob)
@@ -3634,7 +3637,10 @@ def _safe_prob(t: torch.Tensor) -> torch.Tensor:
     if not torch.is_tensor(t):
         return t
     try:
-        if torch.isfinite(t).any() and (t.min() < 0 or t.max() > 1):
+        finite_any = bool(torch.isfinite(t).any().item())
+        minval = float(torch.min(t).item())
+        maxval = float(torch.max(t).item())
+        if finite_any and (minval < 0.0 or maxval > 1.0):
             t = torch.sigmoid(t)
     except Exception:
         t = torch.sigmoid(t)
