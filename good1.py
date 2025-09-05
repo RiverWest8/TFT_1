@@ -473,7 +473,21 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, cal
             vol_norm = None
 
     # 5) Predict in raw mode; handle multiple return layouts
-    raw_preds, raw_x = best_model.predict(dataloader, mode="raw", return_x=True)
+    _pred_out = best_model.predict(dataloader, mode="raw", return_x=True)
+    raw_preds, raw_x = None, None
+    # Accept (preds, x), (preds, x, index), dict-like, or single object
+    if isinstance(_pred_out, (list, tuple)):
+        raw_preds = _pred_out[0] if len(_pred_out) >= 1 else None
+        raw_x     = _pred_out[1] if len(_pred_out) >= 2 else None
+        # ignore any extras like index
+    elif isinstance(_pred_out, dict):
+        raw_preds = _pred_out.get("prediction", _pred_out.get("predictions", _pred_out))
+        raw_x     = _pred_out.get("x", None)
+    else:
+        raw_preds = _pred_out
+
+    if raw_preds is None:
+        raise RuntimeError("predict() returned no predictions")
 
     # Normalise to per-batch lists for easier zipping
     def _to_list(obj):
