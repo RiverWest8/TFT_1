@@ -1232,7 +1232,6 @@ class PerAssetMetrics(pl.Callback):
                 self._pd_dev.append(p_flat[:L2])
 
     
-
     @torch.no_grad()
     def on_validation_epoch_end(self, trainer, pl_module):
         # If nothing collected, exit quietly
@@ -1390,7 +1389,7 @@ class PerAssetMetrics(pl.Callback):
         trainer.callback_metrics["val_rmse_overall"]      = torch.tensor(overall_rmse)
         trainer.callback_metrics["val_mse_overall"]       = torch.tensor(overall_mse)
         trainer.callback_metrics["val_qlike_overall"]     = torch.tensor(overall_qlike)
-        trainer.callback_metrics["val_qlike_cal"]     = torch.tensor(overall_qlike_cal)
+        trainer.callback_metrics["val_qlike_cal"]         = torch.tensor(overall_qlike_cal)
         trainer.callback_metrics["val_N_overall"]         = torch.tensor(float(N))
 
         msg = (
@@ -1400,7 +1399,7 @@ class PerAssetMetrics(pl.Callback):
             f"MSE={overall_mse:.6f} "
             f"QLIKE={overall_qlike:.6f} "
             f"CompLoss = {val_comp:.6f}"
-            + (f"QLIKE_CAL={overall_qlike_cal:.6f} " if overall_qlike_cal is not None else "")
+            + (f"QLIKE_CAL={overall_qlike_cal:.6f} " if 'overall_qlike_cal' in locals() else "")
             + (f" | ACC={acc:.3f}"   if acc   is not None else "")
             + (f" | Brier={brier:.4f}" if brier is not None else "")
             + (f" | AUROC={auroc:.3f}" if auroc is not None else "")
@@ -1484,6 +1483,61 @@ class PerAssetMetrics(pl.Callback):
             "pd": pdir_cpu,
         }
 
+        # ---------- NEW: build a cached dataframe for parquet fallback ----------
+        try:
+            # decode q05/q95 if collected
+            q05_dec = q95_dec = None
+            if self._pq05_dev:
+                pq05_cpu = torch.cat(self._pq05_dev).detach().cpu()
+                q05_dec = safe_decode_vol(pq05_cpu.unsqueeze(-1), self.vol_norm, g_cpu.unsqueeze(-1)).squeeze(-1)
+            if self._pq95_dev:
+                pq95_cpu = torch.cat(self._pq95_dev).detach().cpu()
+                q95_dec = safe_decode_vol(pq95_cpu.unsqueeze(-1), self.vol_norm, g_cpu.unsqueeze(-1)).squeeze(-1)
+
+            # apply same calibration used in diagnostics
+            pv_cal = calibrate_vol_predictions(y_cpu, p_cpu)
+
+            # time index if we collected it
+            t_cpu = torch.cat(self._t_dev).detach().cpu() if self._t_dev else None
+
+            # map group id -> name
+            assets = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
+
+            df_cache = pd.DataFrame({
+                "asset": assets,
+                "time_idx": t_cpu.numpy().tolist() if t_cpu is not None else [None] * len(assets),
+                "y_vol": y_cpu.numpy().tolist(),
+                "y_vol_pred": pv_cal.numpy().tolist(),
+            })
+            df_cache["y_vol_pred_q50"] = df_cache["y_vol_pred"]
+            df_cache["y_vol_pred_q05"] = q05_dec.numpy().tolist() if q05_dec is not None else [None] * len(df_cache)
+            df_cache["y_vol_pred_q95"] = q95_dec.numpy().tolist() if q95_dec is not None else [None] * len(df_cache)
+
+            # direction columns (fill if available; do not shrink)
+            if yd_cpu is not None and pdir_cpu is not None and yd_cpu.numel() > 0 and pdir_cpu.numel() > 0:
+                pdp = pdir_cpu
+                try:
+                    if torch.isfinite(pdp).any() and (pdp.min() < 0 or pdp.max() > 1):
+                        pdp = torch.sigmoid(pdp)
+                except Exception:
+                    pdp = torch.sigmoid(pdp)
+                pdp = torch.clamp(pdp, 0.0, 1.0)
+                df_cache["y_dir"] = [None] * len(df_cache)
+                df_cache["y_dir_prob"] = [None] * len(df_cache)
+                Lm = min(len(df_cache), yd_cpu.numel(), pdp.numel())
+                if Lm > 0:
+                    df_cache.loc[df_cache.index[:Lm], "y_dir"] = yd_cpu[:Lm].numpy().tolist()
+                    df_cache.loc[df_cache.index[:Lm], "y_dir_prob"] = pdp[:Lm].numpy().tolist()
+            else:
+                df_cache["y_dir"] = [None] * len(df_cache)
+                df_cache["y_dir_prob"] = [None] * len(df_cache)
+
+            self._parquet_val_cache = df_cache
+            print(f"[VAL CACHE] cached {len(df_cache)} rows for parquet fallback")
+        except Exception as e:
+            print(f"[WARN] Could not build validation parquet cache: {e}")
+        # ---------- END NEW ----------
+
     @torch.no_grad()
     def on_fit_end(self, trainer, pl_module):
         if self._last_rows is None or self._last_overall is None:
@@ -1549,9 +1603,15 @@ class PerAssetMetrics(pl.Callback):
         except Exception as e:
             print(f"[WARN] Could not save final per-asset metrics: {e}")
 
-        # Optionally save per-sample predictions for plotting
+        # -------- Parquet saving (robust + fallback to cached DF) --------
         try:
-            import pandas as pd  # ensure pd is bound locally and not shadowed
+            import pandas as pd
+
+            # Log accumulator sizes up front
+            print("[DEBUG parquet] acc sizes:",
+                "g:", 0 if not self._g_dev else sum(int(t.numel()) for t in self._g_dev),
+                "yv:", 0 if not self._yv_dev else sum(int(t.numel()) for t in self._yv_dev),
+                "pv:", 0 if not self._pv_dev else sum(int(t.numel()) for t in self._pv_dev))
 
             # Recompute decoded tensors from the stored device buffers
             g_cpu = torch.cat(self._g_dev).detach().cpu() if self._g_dev else None
@@ -1559,16 +1619,17 @@ class PerAssetMetrics(pl.Callback):
             pv_cpu = torch.cat(self._pv_dev).detach().cpu() if self._pv_dev else None
             yd_cpu = torch.cat(self._yd_dev).detach().cpu() if self._yd_dev else None
             pdir_cpu = torch.cat(self._pd_dev).detach().cpu() if self._pd_dev else None
+            t_cpu   = torch.cat(self._t_dev).detach().cpu() if self._t_dev else None
 
             df_out = None
 
-            # decode vol back to physical scale and build dataframe
-            if g_cpu is not None and yv_cpu is not None and pv_cpu is not None:
-                # robust decode
+            # Normal path (rebuild DF from accumulators)
+            if g_cpu is not None and yv_cpu is not None and pv_cpu is not None and g_cpu.numel() > 0:
                 yv_dec = safe_decode_vol(yv_cpu.unsqueeze(-1), self.vol_norm, g_cpu.unsqueeze(-1)).squeeze(-1)
                 pv_dec = safe_decode_vol(pv_cpu.unsqueeze(-1), self.vol_norm, g_cpu.unsqueeze(-1)).squeeze(-1)
+                pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
 
-                # Optional: decode q05/q95 if collected
+                # Optional: q05/q95
                 q05_dec = q95_dec = None
                 if self._pq05_dev:
                     pq05_cpu = torch.cat(self._pq05_dev).detach().cpu()
@@ -1577,35 +1638,18 @@ class PerAssetMetrics(pl.Callback):
                     pq95_cpu = torch.cat(self._pq95_dev).detach().cpu()
                     q95_dec = safe_decode_vol(pq95_cpu.unsqueeze(-1), self.vol_norm, g_cpu.unsqueeze(-1)).squeeze(-1)
 
-                # Apply the same calibration used in metrics to the median so parquet matches plots
-                pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
-
-                # map group id -> name
                 assets = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
-                # time index (may be missing)
-                t_cpu = torch.cat(self._t_dev).detach().cpu() if self._t_dev else None
-
-                # Build dataframe including 90% interval (q05, q95)
                 df_out = pd.DataFrame({
                     "asset": assets,
                     "time_idx": t_cpu.numpy().tolist() if t_cpu is not None else [None] * len(assets),
                     "y_vol": yv_dec.numpy().tolist(),
-                    "y_vol_pred": pv_dec.numpy().tolist(),          # point forecast ~ q50 (calibrated)
+                    "y_vol_pred": pv_dec.numpy().tolist(),
                 })
-
-                # Attach quantile columns if available (decoded)
-                if q05_dec is not None:
-                    df_out["y_vol_pred_q05"] = q05_dec.numpy().tolist()
-                else:
-                    df_out["y_vol_pred_q05"] = [None] * len(df_out)
-                # q50 column mirrors the (calibrated) point forecast for convenience
                 df_out["y_vol_pred_q50"] = df_out["y_vol_pred"]
-                if q95_dec is not None:
-                    df_out["y_vol_pred_q95"] = q95_dec.numpy().tolist()
-                else:
-                    df_out["y_vol_pred_q95"] = [None] * len(df_out)
+                df_out["y_vol_pred_q05"] = q05_dec.numpy().tolist() if q05_dec is not None else [None] * len(df_out)
+                df_out["y_vol_pred_q95"] = q95_dec.numpy().tolist() if q95_dec is not None else [None] * len(df_out)
 
-                # --- Direction columns: NEVER shrink df_out; fill what's available ---
+                # Direction columns: never shrink
                 if yd_cpu is not None and pdir_cpu is not None and yd_cpu.numel() > 0 and pdir_cpu.numel() > 0:
                     pdp = pdir_cpu
                     try:
@@ -1614,78 +1658,69 @@ class PerAssetMetrics(pl.Callback):
                     except Exception:
                         pdp = torch.sigmoid(pdp)
                     pdp = torch.clamp(pdp, 0.0, 1.0)
-
-                    # Pre-create with None (so we never drop rows)
                     df_out["y_dir"] = [None] * len(df_out)
                     df_out["y_dir_prob"] = [None] * len(df_out)
-
                     Lm = min(len(df_out), yd_cpu.numel(), pdp.numel())
                     if Lm > 0:
                         df_out.loc[df_out.index[:Lm], "y_dir"] = yd_cpu[:Lm].numpy().tolist()
                         df_out.loc[df_out.index[:Lm], "y_dir_prob"] = pdp[:Lm].numpy().tolist()
                 else:
-                    # ensure columns exist
-                    if "y_dir" not in df_out.columns:
-                        df_out["y_dir"] = [None] * len(df_out)
-                    if "y_dir_prob" not in df_out.columns:
-                        df_out["y_dir_prob"] = [None] * len(df_out)
-            else:
-                print("[WARN] No validation tensors to save; skipping parquet.")
+                    df_out["y_dir"] = [None] * len(df_out)
+                    df_out["y_dir_prob"] = [None] * len(df_out)
 
-            # --- Write validation predictions parquet once (with robust Time merge) ---
-            if df_out is not None:
-                pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+                print(f"[DEBUG parquet] rebuilt df_out rows: {len(df_out)}")
 
-                # Prefer the **actual** dataset behind the validation dataloader; fallback to val_df/global
+            # Fallback to cache (from on_validation_epoch_end)
+            if df_out is None or len(df_out) == 0:
+                cache = getattr(self, "_parquet_val_cache", None)
+                if isinstance(cache, pd.DataFrame) and len(cache) > 0:
+                    df_out = cache.copy()
+                    print(f"[DEBUG parquet] using cached df_out rows: {len(df_out)}")
+                else:
+                    print("[WARN] No accumulators AND no cache — skipping parquet write.")
+                    return
+
+            # Merge Time (robust; won’t drop rows)
+            try:
+                src = None
+                # Prefer the dataset behind the val dataloader
                 try:
+                    val_loaders = getattr(trainer, "val_dataloaders", None)
+                    if val_loaders:
+                        ds = val_loaders[0].dataset
+                        df_src = getattr(ds, "data", None)
+                        if isinstance(df_src, pd.DataFrame) and {"asset","time_idx","Time"}.issubset(df_src.columns):
+                            src = df_src[["asset","time_idx","Time"]].copy()
+                except Exception:
                     src = None
-                    # Primary: trainer's first validation dataloader dataset
+
+                if src is None and "val_df" in globals() and isinstance(val_df, pd.DataFrame) and {"asset","time_idx","Time"}.issubset(val_df.columns):
+                    src = val_df[["asset","time_idx","Time"]].copy()
+
+                if src is not None:
+                    src["asset"] = src["asset"].astype(str)
+                    src["time_idx"] = pd.to_numeric(src["time_idx"], errors="coerce")
+                    df_out["asset"] = df_out["asset"].astype(str)
+                    df_out["time_idx"] = pd.to_numeric(df_out["time_idx"], errors="coerce")
+                    # leave as nullable to avoid failing on NA; do NOT cast to int64 before merge
+                    df_out = df_out.merge(src, on=["asset","time_idx"], how="left", validate="m:1")
+                    df_out["Time"] = pd.to_datetime(df_out["Time"], errors="coerce")
                     try:
-                        val_loaders = getattr(trainer, "val_dataloaders", None)
-                        if val_loaders:
-                            ds = val_loaders[0].dataset
-                            df_src = getattr(ds, "data", None)
-                            if isinstance(df_src, pd.DataFrame) and {"asset","time_idx","Time"}.issubset(df_src.columns):
-                                src = df_src[["asset","time_idx","Time"]].copy()
+                        df_out["Time"] = df_out["Time"].dt.tz_localize(None)
                     except Exception:
-                        src = None
+                        pass
+                else:
+                    print("[WARN] No usable source for val Time; saving without Time column.")
+            except Exception as e:
+                print(f"[WARN] Time merge skipped: {e}")
 
-                    # Fallback: global val_df
-                    if src is None and "val_df" in globals() and isinstance(val_df, pd.DataFrame) and {"asset","time_idx","Time"}.issubset(val_df.columns):
-                        src = val_df[["asset","time_idx","Time"]].copy()
-
-                    if src is not None:
-                        # harmonise dtypes before merge
-                        src["asset"] = src["asset"].astype(str)
-                        src["time_idx"] = pd.to_numeric(src["time_idx"], errors="coerce").astype("Int64").astype("int64")
-                        df_out["asset"] = df_out["asset"].astype(str)
-                        df_out["time_idx"] = pd.to_numeric(df_out["time_idx"], errors="coerce").astype("Int64").astype("int64")
-
-                        df_out = df_out.merge(src, on=["asset","time_idx"], how="left", validate="m:1")
-
-                        # normalise Time dtype (tz-naive)
-                        df_out["Time"] = pd.to_datetime(df_out["Time"], errors="coerce")
-                        try:
-                            df_out["Time"] = df_out["Time"].dt.tz_localize(None)
-                        except Exception:
-                            pass
-                    else:
-                        print("[WARN] No usable source for val Time; saving without Time column.")
-                except Exception as e:
-                    print(f"[WARN] Time merge skipped: {e}")
-                
-                print("[DEBUG parquet] g_cpu:", None if g_cpu is None else len(g_cpu))
-                print("[DEBUG parquet] yv_cpu:", None if yv_cpu is None else len(yv_cpu))
-                print("[DEBUG parquet] pv_cpu:", None if pv_cpu is None else len(pv_cpu))
-                print("[DEBUG parquet] df_out rows before Time merge:", None if df_out is None else len(df_out))
-
-                # Save once, then upload once
-                df_out.to_parquet(pred_path, index=False)
-                print(f"✓ Saved validation predictions (Parquet) → {pred_path}")
-                try:
-                    upload_file_to_gcs(str(pred_path), f"{GCS_OUTPUT_PREFIX}/{pred_path.name}")
-                except Exception as e:
-                    print(f"[WARN] Could not upload validation predictions: {e}")
+            pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+            df_out.to_parquet(pred_path, index=False)
+            print(f"✓ Saved validation predictions (Parquet) → {pred_path}")
+            try:
+                upload_file_to_gcs(str(pred_path), f"{GCS_OUTPUT_PREFIX}/{pred_path.name}")
+            except Exception as e:
+                print(f"[WARN] Could not upload validation predictions: {e}")
 
         except Exception as e:
             print(f"[WARN] Could not save validation predictions: {e}")
