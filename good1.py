@@ -2541,8 +2541,8 @@ EXTRA_CALLBACKS = [
       ),
       ModelCheckpoint(
           dirpath=str(LOCAL_CKPT_DIR),
-          filename="tft-{epoch:02d}-{val_mae_overall:.4f}",
-          monitor="val_comp_overall",
+          filename="tft-{epoch:02d}-{val_comp_overall:.4f}",
+          monitor="val_composite_overall",
           mode="min",
           save_top_k=2,
           save_last=True,
@@ -3353,7 +3353,7 @@ if __name__ == "__main__":
     print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.00091}")
     
     es_cb = EarlyStopping(
-    monitor="val_qlike_overall",
+    monitor="val_composite_overall",
     patience=EARLY_STOP_PATIENCE,
     mode="min",
     min_delta = 1e-4
