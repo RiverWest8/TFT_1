@@ -3253,7 +3253,7 @@ if __name__ == "__main__":
     monitor="val_qlike_overall",
     patience= 20,
     mode="min",
-    min_delta = 1e-4
+    min_delta = 1e-4,
     verbose = True,
     )
 
