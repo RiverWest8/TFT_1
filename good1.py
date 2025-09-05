@@ -1605,8 +1605,8 @@ class PerAssetMetrics(pl.Callback):
                 else:
                     df_out["y_vol_pred_q95"] = [None] * len(df_out)
 
+                # --- Direction columns: NEVER shrink df_out; fill what's available ---
                 if yd_cpu is not None and pdir_cpu is not None and yd_cpu.numel() > 0 and pdir_cpu.numel() > 0:
-                    # ensure pdir is probability
                     pdp = pdir_cpu
                     try:
                         if torch.isfinite(pdp).any() and (pdp.min() < 0 or pdp.max() > 1):
@@ -1614,10 +1614,21 @@ class PerAssetMetrics(pl.Callback):
                     except Exception:
                         pdp = torch.sigmoid(pdp)
                     pdp = torch.clamp(pdp, 0.0, 1.0)
+
+                    # Pre-create with None (so we never drop rows)
+                    df_out["y_dir"] = [None] * len(df_out)
+                    df_out["y_dir_prob"] = [None] * len(df_out)
+
                     Lm = min(len(df_out), yd_cpu.numel(), pdp.numel())
-                    df_out = df_out.iloc[:Lm].copy()
-                    df_out["y_dir"] = yd_cpu[:Lm].numpy().tolist()
-                    df_out["y_dir_prob"] = pdp[:Lm].numpy().tolist()
+                    if Lm > 0:
+                        df_out.loc[df_out.index[:Lm], "y_dir"] = yd_cpu[:Lm].numpy().tolist()
+                        df_out.loc[df_out.index[:Lm], "y_dir_prob"] = pdp[:Lm].numpy().tolist()
+                else:
+                    # ensure columns exist
+                    if "y_dir" not in df_out.columns:
+                        df_out["y_dir"] = [None] * len(df_out)
+                    if "y_dir_prob" not in df_out.columns:
+                        df_out["y_dir_prob"] = [None] * len(df_out)
             else:
                 print("[WARN] No validation tensors to save; skipping parquet.")
 
@@ -1678,6 +1689,7 @@ class PerAssetMetrics(pl.Callback):
 
         except Exception as e:
             print(f"[WARN] Could not save validation predictions: {e}")
+
 
 class BiasWarmupCallback(pl.Callback):
     """
