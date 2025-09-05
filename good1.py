@@ -610,38 +610,15 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
         elif q95_enc is not None:
             y_q95 = q95_enc
 
-        def _apply_piecewise_by_asset(y_tensor: torch.Tensor, aset_names: list[str], calib: dict) -> torch.Tensor:
-            """Apply piecewise calibrator per asset. Falls back to global if per-asset not found."""
-            if y_tensor is None or not torch.is_tensor(y_tensor):
-                return y_tensor
-            if not isinstance(calib, dict):
-                return apply_piecewise_calibrator_on_preds(y_tensor, calib)
-            by_asset = calib.get("by_asset")
-            global_c = calib.get("global", {})
-            if not isinstance(by_asset, dict):
-                return apply_piecewise_calibrator_on_preds(y_tensor, global_c) if isinstance(global_c, dict) else y_tensor
-            y = y_tensor.clone()
-            uniq = list(dict.fromkeys(aset_names))  # preserve order
-            for a in uniq:
-                c = by_asset.get(str(a), global_c)
-                if not isinstance(c, dict) or not c:
-                    continue
-                mask = torch.tensor([name == a for name in aset_names], device=y.device, dtype=torch.bool)
-                if mask.any():
-                    y[mask] = apply_piecewise_calibrator_on_preds(y[mask], c)
-            return y
-
-        # TEST-only: apply piecewise validation calibrator to decoded predictions (per-asset)
+        # TEST-only: apply piecewise validation calibrator to decoded predictions
         try:
             if calibrator is not None and str(split).lower() == "test":
-                # Per-batch asset names for masking
-                aset_names = [id_to_name.get(int(i), str(int(i))) for i in g.detach().cpu().tolist()]
                 if y_q50 is not None:
-                    y_q50 = _apply_piecewise_by_asset(y_q50, aset_names, calibrator)
+                    y_q50 = apply_piecewise_calibrator_on_preds(y_q50, calibrator)
                 if y_q05 is not None:
-                    y_q05 = _apply_piecewise_by_asset(y_q05, aset_names, calibrator)
+                    y_q05 = apply_piecewise_calibrator_on_preds(y_q05, calibrator)
                 if y_q95 is not None:
-                    y_q95 = _apply_piecewise_by_asset(y_q95, aset_names, calibrator)
+                    y_q95 = apply_piecewise_calibrator_on_preds(y_q95, calibrator)
         except Exception as _e:
             print(f"[WARN] test calibration skipped: {_e}")
 
@@ -1510,39 +1487,17 @@ class PerAssetMetrics(pl.Callback):
         )
         print(msg)
 
-        # --- Save validation calibrator for TEST-time use (per-asset; parquet unaffected) ---
+        # --- Save validation calibrator for TEST-time use (does NOT affect VAL parquet) ---
         try:
-            # Global calibrator (same method)
-            calib_global = fit_piecewise_calibrator_from_val(y_cpu, p_cpu)
-
-            # Per-asset calibrators (same method), keyed by asset name
-            by_asset = {}
-            try:
-                asset_names = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
-                df_cal = pd.DataFrame({
-                    "asset": asset_names,
-                    "y": y_cpu.numpy(),
-                    "p": p_cpu.numpy(),
-                })
-                for a, gdf in df_cal.groupby("asset", sort=False):
-                    y_a = torch.tensor(gdf["y"].values)
-                    p_a = torch.tensor(gdf["p"].values)
-                    c_a = fit_piecewise_calibrator_from_val(y_a, p_a)
-                    if isinstance(c_a, dict) and c_a:
-                        by_asset[str(a)] = c_a
-            except Exception as _e:
-                print(f"[WARN] per-asset calibrator fitting failed: {_e}")
-
-            calib = {"version": 2, "global": calib_global, "by_asset": by_asset}
-            self._calibrator = calib
-            _cal_path = _calibrator_json_path()
-            with open(_cal_path, "w") as f:
-                json.dump(calib, f, indent=2)
-            print(f"✓ Saved validation calibrator (per-asset) → {_cal_path}")
+            calib = fit_piecewise_calibrator_from_val(y_cpu, p_cpu)
+            if isinstance(calib, dict) and calib:
+                self._calibrator = calib
+                _cal_path = _calibrator_json_path()
+                with open(_cal_path, "w") as f:
+                    json.dump(calib, f, indent=2)
+                print(f"✓ Saved validation calibrator → {_cal_path}")
         except Exception as e:
             print(f"[WARN] Could not save validation calibrator: {e}")
-
-
         # --- Per-asset metrics table (so on_fit_end can print it) ---
         self._last_rows = []
         try:
@@ -3927,13 +3882,3 @@ except Exception as e:
     print(f"[WARN] Export failed: {e}")
 
 
-# --- Unified TEST export to match validation schema ---
-try:
-    test_pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
-    _export_split_from_best(trainer, test_dataloader, "test", test_pred_path)
-    try:
-        upload_file_to_gcs(str(test_pred_path), f"{GCS_OUTPUT_PREFIX}/{test_pred_path.name}")
-    except Exception as e:
-        print(f"[WARN] Could not upload TEST parquet: {e}")
-except Exception as e:
-    print(f"[WARN] Export failed: {e}")
