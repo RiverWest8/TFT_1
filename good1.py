@@ -413,13 +413,14 @@ def _extract_vol_quantiles(pred):
     return None
 
 @torch.no_grad()
-def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
+def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, calibrator: dict | None = None):
     """
     Minimal, self-contained export that is robust to various PF/Lightning return layouts:
       • Loads the best checkpoint
       • Predicts in raw mode and iterates per-batch
       • Extracts groups/time/targets from each batch dict
       • Decodes realised_vol using the TRAIN normalizer
+      • (TEST only) applies piecewise validation calibrator to y_vol_pred and quantile bands
       • Writes a harmonised parquet with columns: asset, time_idx, y_vol, y_vol_pred, y_dir_prob (optional)
     """
     # 1) Find best checkpoint
@@ -445,18 +446,19 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     best_model = LM.load_from_checkpoint(best_ckpt)
     best_model.eval().to(trainer.lightning_module.device)
 
-    # 3) id->name map from PerAssetMetrics if available
+    # 3) id->name map (and default calibrator) from PerAssetMetrics if available
     metrics_cb = None
     for cb in getattr(trainer, "callbacks", []):
         if isinstance(cb, PerAssetMetrics):
             metrics_cb = cb
             break
-    id_to_name = None
-    if metrics_cb is not None:
-        id_to_name = {int(k): str(v) for k, v in metrics_cb.id_to_name.items()}
-    else:
-        # fallback: identity mapping added later if needed
-        id_to_name = {}
+    id_to_name = {int(k): str(v) for k, v in getattr(metrics_cb, "id_to_name", {}).items()} if metrics_cb else {}
+    # If caller didn't pass a calibrator, try to pull one learned on validation
+    if calibrator is None and metrics_cb is not None and str(split).lower() == "test":
+        try:
+            calibrator = getattr(metrics_cb, "_calibrator", None)
+        except Exception:
+            calibrator = None
 
     # 4) Resolve TRAIN normalizer for decoding realised_vol
     vol_norm = None
@@ -490,6 +492,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     assets_all, t_all = [], []
     y_true_all, y_dirprob_all = [], []
     y_pred_q05_all, y_pred_q50_all, y_pred_q95_all = [], [], []
+
     # Helper: extract x dict from a batch container
     def _get_x(b):
         if isinstance(b, dict):
@@ -551,7 +554,6 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             q50_enc = vol_q[:, Q50_IDX].reshape(-1)[:L]
             q95_enc = vol_q[:, Q95_IDX].reshape(-1)[:L]
         else:
-            # fallback: use the median we already parsed
             q50_enc = p_vol_enc.reshape(-1)[:L]
 
         # Decode median (q50) for the point forecast
@@ -609,6 +611,17 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
                 y_dir_prob = torch.sigmoid(y_dir_prob)
             y_dir_prob = torch.clamp(y_dir_prob, 0.0, 1.0)
 
+        # --- TEST-ONLY: apply validation calibrator to decoded predictions ---
+        try:
+            if calibrator is not None and isinstance(calibrator, dict) and str(split).lower() == "test":
+                y_q50 = apply_piecewise_calibrator_on_preds(y_q50, calibrator)
+                if y_q05 is not None:
+                    y_q05 = apply_piecewise_calibrator_on_preds(y_q05, calibrator)
+                if y_q95 is not None:
+                    y_q95 = apply_piecewise_calibrator_on_preds(y_q95, calibrator)
+        except Exception as _e:
+            print(f"[WARN] test calibration skipped: {_e}")
+
         # Map asset ids → names
         aset = [id_to_name.get(int(i), str(int(i))) for i in g.detach().cpu().tolist()]
 
@@ -638,7 +651,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
         "asset": assets_all,
         "time_idx": t_all,
         "y_vol": y_true_all,
-        "y_vol_pred": y_pred_q50_all,    # point forecast = q50
+        "y_vol_pred": y_pred_q50_all,    # point forecast = q50 (calibrated on TEST if calibrator provided)
         "y_vol_pred_q05": y_pred_q05_all,
         "y_vol_pred_q50": y_pred_q50_all,
         "y_vol_pred_q95": y_pred_q95_all,
@@ -672,7 +685,6 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_path, index=False)
     print(f"✓ Wrote {split.upper()} predictions → {out_path}")
-
     
 
 
@@ -773,6 +785,79 @@ def calibrate_vol_predictions(y_true_dec: torch.Tensor, y_pred_dec: torch.Tensor
     _apply(high_mask)
 
     return p.view_as(y_pred_dec)
+
+@torch.no_grad()
+def fit_piecewise_calibrator_from_validation(
+    y_true_dec: torch.Tensor,
+    y_pred_dec: torch.Tensor,
+    low_q: float = 0.33,
+    high_q: float = 0.66,
+    clip: tuple[float, float] = (0.5, 2.0),
+) -> dict:
+    """
+    Learn a simple piecewise multiplicative calibrator on VALIDATION by
+    matching mean(y) to mean(pred) in the lower and upper *predicted* terciles.
+    Returns a dict with thresholds and scales that can be applied to TEST.
+    """
+    y = y_true_dec.reshape(-1)
+    p = y_pred_dec.reshape(-1)
+    if y.numel() == 0 or p.numel() == 0:
+        return {"type": "piecewise_tercile_on_pred", "p33": float("nan"), "p66": float("nan"),
+                "s_low": 1.0, "s_high": 1.0, "clip": [clip[0], clip[1]]}
+
+    # thresholds on the *predicted* distribution so we can reuse on TEST
+    p33 = torch.quantile(p, torch.tensor(low_q, device=p.device))
+    p66 = torch.quantile(p, torch.tensor(high_q, device=p.device))
+
+    mask_low = p <= p33
+    mask_high = p >= p66
+
+    def _scale(mask: torch.Tensor) -> float:
+        if mask is None or mask.sum() == 0:
+            return 1.0
+        yp = p[mask].mean()
+        yt = y[mask].mean()
+        if not torch.isfinite(yp) or float(torch.abs(yp)) < 1e-12:
+            return 1.0
+        s = float((yt / yp).item())
+        lo, hi = clip
+        return float(min(max(s, lo), hi))
+
+    s_low = _scale(mask_low)
+    s_high = _scale(mask_high)
+
+    return {
+        "type": "piecewise_tercile_on_pred",
+        "p33": float(p33.item()),
+        "p66": float(p66.item()),
+        "s_low": float(s_low),
+        "s_high": float(s_high),
+        "clip": [clip[0], clip[1]],
+    }
+
+@torch.no_grad()
+def apply_piecewise_calibrator_on_preds(y_pred_dec: torch.Tensor, calib: dict | None) -> torch.Tensor:
+    """Apply piecewise (low/mid/high) multiplicative calibration based on predicted terciles."""
+    if calib is None or not isinstance(calib, dict):
+        return y_pred_dec
+    x = y_pred_dec.clone()
+    try:
+        p33 = float(calib.get("p33", float("nan")))
+        p66 = float(calib.get("p66", float("nan")))
+        s_low = float(calib.get("s_low", 1.0))
+        s_high = float(calib.get("s_high", 1.0))
+    except Exception:
+        return x
+    if not torch.is_tensor(x):
+        return x
+    mask_low = x <= p33
+    mask_high = x >= p66
+    # middle stays as 1.0
+    x[mask_low] = x[mask_low] * s_low
+    x[mask_high] = x[mask_high] * s_high
+    return x
+
+
 
 if not hasattr(GroupNormalizer, "decode"):
     def _gn_decode(self, y, group_ids=None, **kwargs):
@@ -1159,8 +1244,8 @@ class PerAssetMetrics(pl.Callback):
             print("DEBUG mean after decode:", float(yv_dec.mean().item()))
             ratio_dbg = float((yv_dec.mean() / (pv_dec.mean() + 1e-12)).item())
             print("DEBUG: mean(yv_dec)=", float(yv_dec.mean().item()),
-                  "mean(pv_dec)=", float(pv_dec.mean().item()),
-                  "ratio=", ratio_dbg)
+                "mean(pv_dec)=", float(pv_dec.mean().item()),
+                "ratio=", ratio_dbg)
         except Exception:
             pass
 
@@ -1202,7 +1287,7 @@ class PerAssetMetrics(pl.Callback):
             overall_qlike_cal = float((ratio_cal - torch.log(ratio_cal) - 1.0).mean().item())
             trainer.callback_metrics["val_qlike_cal"] = torch.tensor(overall_qlike_cal)
         except Exception as _e:
-            pass
+            overall_qlike_cal = None
 
         # --- Optional direction metrics (overall) ---
         acc = None
@@ -1255,7 +1340,8 @@ class PerAssetMetrics(pl.Callback):
         trainer.callback_metrics["val_rmse_overall"]      = torch.tensor(overall_rmse)
         trainer.callback_metrics["val_mse_overall"]       = torch.tensor(overall_mse)
         trainer.callback_metrics["val_qlike_overall"]     = torch.tensor(overall_qlike)
-        trainer.callback_metrics["val_qlike_cal"]     = torch.tensor(overall_qlike_cal)
+        if overall_qlike_cal is not None:
+            trainer.callback_metrics["val_qlike_cal"] = torch.tensor(overall_qlike_cal)
         trainer.callback_metrics["val_N_overall"]         = torch.tensor(float(N))
 
         msg = (
@@ -1313,7 +1399,7 @@ class PerAssetMetrics(pl.Callback):
                 acc_a = None
                 if "yd" in gdf.columns and "pd" in gdf.columns:
                     acc_a = float(((torch.tensor(gdf["pd"].values) >= 0.5).int() ==
-                                   torch.tensor(gdf["yd"].values).int()).float().mean().item())
+                                torch.tensor(gdf["yd"].values).int()).float().mean().item())
 
                 rows.append((a, mae_a, rmse_a, mse_a, qlike_a, acc_a, n_a))
 
@@ -1348,6 +1434,16 @@ class PerAssetMetrics(pl.Callback):
             "yd": yd_cpu,
             "pd": pdir_cpu,
         }
+
+        # ---- NEW: fit & stash a calibrator from VALIDATION (for later TEST export) ----
+        try:
+            self._calibrator = fit_piecewise_calibrator_from_validation(y_cpu, p_cpu)
+            # expose a couple of numbers for the logs
+            trainer.callback_metrics["val_calib_s_low"] = torch.tensor(float(self._calibrator.get("s_low", 1.0)))
+            trainer.callback_metrics["val_calib_s_high"] = torch.tensor(float(self._calibrator.get("s_high", 1.0)))
+        except Exception as _e:
+            self._calibrator = None
+            print(f"[WARN] Could not fit validation calibrator: {_e}")
 
     @torch.no_grad()
     def on_fit_end(self, trainer, pl_module):
@@ -2413,7 +2509,7 @@ EXTRA_CALLBACKS = [
           save_last=True,
       ),
       StochasticWeightAveraging(swa_lrs = 1e6 , annealing_epochs = 1, annealing_strategy="cos", swa_epoch_start=max(1, int(0.9 * MAX_EPOCHS))),
-      CosineLR(start_epoch=10, eta_min_ratio=0.05, hold_last_epochs=2, warmup_steps=0),
+      CosineLR(start_epoch=10, eta_min_ratio=0.005, hold_last_epochs=2, warmup_steps=0),
       ]
 
 class ValLossHistory(pl.Callback):
