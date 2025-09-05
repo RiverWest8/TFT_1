@@ -568,15 +568,23 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             continue
         p_vol_enc = p_vol_enc.reshape(-1)[:L]
 
-        # Decode q50 and q95 (uncertainty bars)
+        # --- Extract quantile encodings from a single vol_q (consistent source) ---
         vol_q = _extract_vol_quantiles(pred_t)
-        q50_enc, q95_enc = None, None
-        if torch.is_tensor(vol_q) and vol_q.ndim == 2 and vol_q.size(1) >= (max(Q50_IDX, Q95_IDX) + 1):
-            vol_q = torch.cummax(vol_q, dim=-1).values
-            q50_enc = vol_q[:, Q50_IDX].reshape(-1)[:L]
-            q95_enc = vol_q[:, Q95_IDX].reshape(-1)[:L]
-        else:
-            # fallback: use the median we already parsed
+        q05_enc = q50_enc = q95_enc = None
+        if torch.is_tensor(vol_q):
+            # Normalize shapes to [B, K]
+            if vol_q.ndim == 3 and vol_q.size(1) == 1:
+                vol_q = vol_q.squeeze(1)  # [B, K]
+            if vol_q.ndim == 3 and vol_q.size(-1) == 1 and vol_q.size(1) == len(VOL_QUANTILES):
+                vol_q = vol_q.squeeze(-1)  # [B, K]
+            if vol_q.ndim >= 2 and vol_q.size(-1) >= (max(Q95_IDX, Q50_IDX, Q05_IDX) + 1):
+                # enforce non-decreasing quantiles, then slice
+                vol_q = torch.cummax(vol_q, dim=-1).values
+                q05_enc = vol_q[:, Q05_IDX].reshape(-1)[:L]
+                q50_enc = vol_q[:, Q50_IDX].reshape(-1)[:L]
+                q95_enc = vol_q[:, Q95_IDX].reshape(-1)[:L]
+        # Fallback for cases where quantile tensor wasn't provided
+        if q50_enc is None:
             q50_enc = p_vol_enc.reshape(-1)[:L]
 
         # Decode median (q50) for the point forecast **from the quantile tensor** for consistency
@@ -587,14 +595,6 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             y_q50 = torch.clamp(y_q50, min=floor_val)
         else:
             y_q50 = median_enc
-
-        # Also extract q05 and q95 for uncertainty bars
-        vol_q = _extract_vol_quantiles(pred_t)
-        q05_enc, q95_enc = None, None
-        if torch.is_tensor(vol_q) and vol_q.ndim == 2 and vol_q.size(1) >= (max(Q05_IDX, Q95_IDX) + 1):
-            vol_q = torch.cummax(vol_q, dim=-1).values
-            q05_enc = vol_q[:, Q05_IDX].reshape(-1)[:L]
-            q95_enc = vol_q[:, Q95_IDX].reshape(-1)[:L]
 
         # Decode q05/q95 if present
         y_q05, y_q95 = None, None
