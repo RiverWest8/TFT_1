@@ -779,6 +779,38 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     except Exception as e:
         print(f"[WARN] Could not attach Time column: {e}")
 
+    # TEST: backfill true realised_vol and direction from test_df if batches lacked labels
+    try:
+        if str(split).lower() == "test":
+            need_y = ("y_vol" not in df.columns) or df["y_vol"].isna().all()
+            need_d = ("y_dir" not in df.columns) or df["y_dir"].isna().all()
+            src = globals().get("test_df", None)
+            if isinstance(src, pd.DataFrame) and {"asset","time_idx"}.issubset(src.columns):
+                cols = []
+                if need_y and "realised_vol" in src.columns:
+                    cols.append("realised_vol")
+                if need_d and "direction" in src.columns:
+                    cols.append("direction")
+                if cols:
+                    join = src[["asset","time_idx"] + cols].copy()
+                    join["asset"] = join["asset"].astype(str)
+                    join["time_idx"] = pd.to_numeric(join["time_idx"], errors="coerce").astype("Int64").astype("int64")
+                    df = df.merge(join, on=["asset","time_idx"], how="left", validate="m:1", suffixes=("","_src"))
+                    if "realised_vol" in df.columns and need_y:
+                        if "y_vol" in df.columns:
+                            df["y_vol"] = df["y_vol"].fillna(df["realised_vol"])
+                        else:
+                            df["y_vol"] = df["realised_vol"]
+                        df.drop(columns=["realised_vol"], inplace=True, errors="ignore")
+                    if "direction" in df.columns:
+                        if "y_dir" in df.columns:
+                            df["y_dir"] = df["y_dir"].fillna(df["direction"])
+                        else:
+                            df["y_dir"] = df["direction"]
+                        df.drop(columns=["direction"], inplace=True, errors="ignore")
+    except Exception as e:
+        print(f"[WARN] Could not backfill y/dir from test_df: {e}")
+
     # For TEST only, reorder columns to match validation parquet
     try:
         if str(split).lower() == "test":
@@ -3850,57 +3882,13 @@ except Exception as e:
     print(f"[WARN] Export failed: {e}")
 
 
-
-# Build dataframe of predictions and compute TEST metrics on decoded scale
+# --- Unified TEST export to match validation schema ---
 try:
-    df_test_preds = _collect_test_predictions(
-        best_model, test_dataloader, id_to_name=metrics_cb.id_to_name, vol_norm=metrics_cb.vol_norm
-    )
-
-    # Print decoded test metrics
-    _y = torch.tensor([v for v in df_test_preds["realised_vol"].tolist() if v is not None], dtype=torch.float32)
-    _p = torch.tensor(df_test_preds["pred_realised_vol"].tolist(), dtype=torch.float32)[: _y.numel()]
-    eps = 1e-8
-    mae  = torch.mean(torch.abs(_p - _y)).item()
-    mse  = torch.mean((_p - _y) ** 2).item()
-    rmse = mse ** 0.5
-    sigma2_p = torch.clamp(torch.abs(_p), min=eps) ** 2
-    sigma2_y = torch.clamp(torch.abs(_y), min=eps) ** 2
-    ratio = sigma2_y / sigma2_p
-    qlike = torch.mean(ratio - torch.log(ratio) - 1.0).item()
-
-    # Direction metrics if available
-    auroc_val, brier_val, acc_val = None, None, None
-    if "direction" in df_test_preds.columns and "pred_direction" in df_test_preds.columns:
-        pairs = [(a, b) for a, b in zip(df_test_preds["direction"], df_test_preds["pred_direction"]) if a is not None and b is not None]
-        if pairs:
-            yd_t = torch.tensor([a for a, _ in pairs], dtype=torch.float32)
-            pd_t = torch.tensor([b for _, b in pairs], dtype=torch.float32)
-            pd_t = _safe_prob(pd_t)
-            acc_val   = float(((pd_t >= 0.5).int() == yd_t.int()).float().mean().item())
-            brier_val = float(torch.mean((pd_t - yd_t) ** 2).item())
-            try:
-                from torchmetrics.classification import BinaryAUROC
-                auroc_val = float(BinaryAUROC()(pd_t, yd_t).item())
-            except Exception as e:
-                print(f"[WARN] AUROC (test) failed: {e}")
-
-    print(
-        f"[TEST] (decoded) MAE={mae:.6f} RMSE={rmse:.6f} MSE={mse:.6f} QLIKE={qlike:.6f}"
-        + (f" | ACC={acc_val:.3f}" if acc_val is not None else "")
-        + (f" | Brier={brier_val:.4f}" if brier_val is not None else "")
-        + (f" | AUROC={auroc_val:.3f}" if auroc_val is not None else "")
-    )
-
-    # Save parquet & upload
-    pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
-    df_test_preds.to_parquet(pred_path, index=False)
-    print(f"✓ Saved TEST predictions → {pred_path}")
+    test_pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+    _export_split_from_best(trainer, test_dataloader, "test", test_pred_path)
     try:
-        upload_file_to_gcs(str(pred_path), f"{GCS_OUTPUT_PREFIX}/{pred_path.name}")
+        upload_file_to_gcs(str(test_pred_path), f"{GCS_OUTPUT_PREFIX}/{test_pred_path.name}")
     except Exception as e:
-        print(f"[WARN] Could not upload test predictions: {e}")
-
+        print(f"[WARN] Could not upload TEST parquet: {e}")
 except Exception as e:
-    print(f"[WARN] Failed to save test predictions: {e}")
-    
+    print(f"[WARN] Export failed: {e}")
