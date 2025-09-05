@@ -545,8 +545,10 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, cal
             continue
         L = g.shape[0]
 
-        # Time index (optional)
-        t = x.get("decoder_time_idx") or x.get("decoder_relative_idx")
+        # Time index (optional) — avoid boolean evaluation of tensors
+        t = x.get("decoder_time_idx", None)
+        if t is None:
+            t = x.get("decoder_relative_idx", None)
         if torch.is_tensor(t):
             while t.ndim > 1 and t.size(-1) == 1:
                 t = t.squeeze(-1)
