@@ -578,13 +578,14 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             # fallback: use the median we already parsed
             q50_enc = p_vol_enc.reshape(-1)[:L]
 
-        # Decode median (q50) for the point forecast
+        # Decode median (q50) for the point forecast **from the quantile tensor** for consistency
         floor_val = float(globals().get("EVAL_VOL_FLOOR", 1e-8))
+        median_enc = q50_enc if q50_enc is not None else p_vol_enc
         if vol_norm is not None:
-            y_q50 = safe_decode_vol(p_vol_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+            y_q50 = safe_decode_vol(median_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
             y_q50 = torch.clamp(y_q50, min=floor_val)
         else:
-            y_q50 = p_vol_enc
+            y_q50 = median_enc
 
         # Also extract q05 and q95 for uncertainty bars
         vol_q = _extract_vol_quantiles(pred_t)
@@ -683,7 +684,13 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
 
     # Try to attach actual 'Time' if a compatible source df is cached
     try:
-        cand_names = ["val_df", "test_df", "raw_df", "full_df", "df"]
+        split_l = str(split).lower()
+        if split_l == "val":
+            cand_names = ["val_df", "raw_df", "full_df", "df"]
+        elif split_l == "test":
+            cand_names = ["test_df", "raw_df", "full_df", "df"]
+        else:
+            cand_names = ["raw_df", "full_df", "df"]
         src = None
         for nm in cand_names:
             obj = globals().get(nm)
