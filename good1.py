@@ -481,7 +481,19 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             vol_norm = None
 
     # 5) Predict in raw mode; handle multiple return layouts
-    raw_preds, raw_x = best_model.predict(dataloader, mode="raw", return_x=True)
+    _pred_out = best_model.predict(dataloader, mode="raw", return_x=True)
+    # Robustly unpack (preds, x[, ...]) across PF versions
+    if isinstance(_pred_out, (list, tuple)):
+        raw_preds = _pred_out[0] if len(_pred_out) >= 1 else None
+        raw_x     = _pred_out[1] if len(_pred_out) >= 2 else None
+    elif isinstance(_pred_out, dict):
+        raw_preds = _pred_out.get("prediction", _pred_out.get("predictions", _pred_out))
+        raw_x     = _pred_out.get("x", None)
+    else:
+        raw_preds = _pred_out
+        raw_x     = None
+    if raw_preds is None:
+        raise RuntimeError("predict() returned no predictions")
 
     # Normalise to per-batch lists for easier zipping
     def _to_list(obj):
@@ -539,7 +551,9 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
         L = g.shape[0]
 
         # Time index (optional)
-        t = x.get("decoder_time_idx") or x.get("decoder_relative_idx")
+        t = x.get("decoder_time_idx", None)
+        if t is None:
+            t = x.get("decoder_relative_idx", None)
         if torch.is_tensor(t):
             while t.ndim > 1 and t.size(-1) == 1:
                 t = t.squeeze(-1)
@@ -1550,13 +1564,11 @@ class PerAssetMetrics(pl.Callback):
                     "y_vol_pred": pv_dec.numpy().tolist(),          # point forecast ~ q50 (calibrated)
                 })
 
-                # Attach quantile columns if available (decoded)
+                # Attach quantile columns if available (decoded). Do NOT duplicate q50; y_vol_pred already holds q50.
                 if q05_dec is not None:
                     df_out["y_vol_pred_q05"] = q05_dec.numpy().tolist()
                 else:
                     df_out["y_vol_pred_q05"] = [None] * len(df_out)
-                # q50 column mirrors the (calibrated) point forecast for convenience
-                df_out["y_vol_pred_q50"] = df_out["y_vol_pred"]
                 if q95_dec is not None:
                     df_out["y_vol_pred_q95"] = q95_dec.numpy().tolist()
                 else:
