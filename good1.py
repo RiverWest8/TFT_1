@@ -528,6 +528,15 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             return b[0]
         return None
 
+    # --- NEW: load calibration produced on VAL (memory first, then disk) ---
+    calib_params = getattr(best_model, "calib_params", None)
+    if calib_params is None:
+        try:
+            calib_params = _load_val_calibration()
+        except Exception:
+            calib_params = None
+    # --- END NEW ---
+
     for pred_b, xb, yb in zip(preds_list, x_list, y_list):
         x = _get_x(xb)
         if x is None:
@@ -590,6 +599,33 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
                 y95p = torch.clamp(y95p, min=floor_val)
         else:
             y50p, y05p, y95p = p_vol_med, q05_enc, q95_enc
+
+        # --- NEW: apply 2-regime VAL calibration to decoded TEST preds (y50p & quantiles) ---
+        try:
+            calib = calib_params
+            if isinstance(calib, dict) and all(k in calib for k in ("q33","q66","s_low","s_high")):
+                q33_v   = float(calib["q33"])
+                q66_v   = float(calib["q66"])
+                s_low   = float(calib["s_low"])
+                s_high  = float(calib["s_high"])
+                floor_v = float(calib.get("floor", floor_val))
+
+                # Bucket by *predicted* level and scale
+                mask_low  = y50p <= q33_v
+                mask_high = y50p >= q66_v
+
+                if mask_low.any():
+                    y50p[mask_low] = torch.clamp(y50p[mask_low] * s_low,  min=floor_v)
+                    if y05p is not None: y05p[mask_low] = torch.clamp(y05p[mask_low] * s_low,  min=floor_v)
+                    if y95p is not None: y95p[mask_low] = torch.clamp(y95p[mask_low] * s_low,  min=floor_v)
+                if mask_high.any():
+                    y50p[mask_high] = torch.clamp(y50p[mask_high] * s_high, min=floor_v)
+                    if y05p is not None: y05p[mask_high] = torch.clamp(y05p[mask_high] * s_high, min=floor_v)
+                    if y95p is not None: y95p[mask_high] = torch.clamp(y95p[mask_high] * s_high, min=floor_v)
+                # middle tercile unchanged
+        except Exception as e:
+            print(f"[WARN] Test calibration skipped: {e}")
+        # --- END NEW ---
 
         # TRUE labels (if present)
         y_vol_true = None
@@ -710,7 +746,6 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_path, index=False)
     print(f"✓ Wrote {split.upper()} predictions → {out_path}")
-    
 
 
 # -----------------------------------------------------------------------
@@ -777,6 +812,35 @@ def safe_decode_vol(y: torch.Tensor, normalizer, group_ids: torch.Tensor | None)
             pass
     return manual_inverse_transform_groupnorm(normalizer, y, group_ids)
 
+
+# --- 2-regime calibration I/O (VAL → TEST) ---
+def _save_val_calibration(params: dict):
+    """Persist val-based 2-regime calibration for reuse on test export."""
+    try:
+        path = (LOCAL_RUN_DIR if 'LOCAL_RUN_DIR' in globals() else LOCAL_OUTPUT_DIR) / f"val_calibration_e{MAX_EPOCHS}_{RUN_SUFFIX}.json"
+        with open(path, "w") as f:
+            json.dump(params, f, indent=2)
+        print(f"✓ Saved validation calibration → {path}")
+    except Exception as e:
+        print(f"[WARN] Could not save validation calibration: {e}")
+
+def _load_val_calibration():
+    """Load latest saved calibration; returns dict or None."""
+    try:
+        root = (LOCAL_RUN_DIR if 'LOCAL_RUN_DIR' in globals() else LOCAL_OUTPUT_DIR)
+        # First, exact match for this run
+        p = root / f"val_calibration_e{MAX_EPOCHS}_{RUN_SUFFIX}.json"
+        if p.exists():
+            with open(p, "r") as f:
+                return json.load(f)
+        # Otherwise, fall back to most recent val_calibration*.json
+        cands = sorted(root.glob("val_calibration_*.json"), key=lambda pp: pp.stat().st_mtime, reverse=True)
+        if cands:
+            with open(cands[0], "r") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"[WARN] Could not load validation calibration: {e}")
+    return None
 
 # ---------------- Regime-dependent calibration helper ----------------
 @torch.no_grad()
@@ -1167,162 +1231,120 @@ class PerAssetMetrics(pl.Callback):
                 self._yd_dev.append(y_flat[:L2])
                 self._pd_dev.append(p_flat[:L2])
 
-    @torch.no_grad()
-    def on_validation_epoch_end(self, trainer, pl_module):
-        # If nothing collected, exit quietly
-        if not self._g_dev:
-            return
+    
 
-        # Gather device tensors accumulated during validation
-        device = self._g_dev[0].device
-        g  = torch.cat(self._g_dev).to(device)            # [N]
-        yv = torch.cat(self._yv_dev).to(device)           # realised_vol (encoded)  [N]
-        pv = torch.cat(self._pv_dev).to(device)           # realised_vol pred (enc) [N]
-        yd = torch.cat(self._yd_dev).to(device) if self._yd_dev else None  # direction labels
-        pdir = torch.cat(self._pd_dev).to(device) if self._pd_dev else None  # direction logits/probs
+        @torch.no_grad()
+        def on_validation_epoch_end(self, trainer, pl_module):
+            # If nothing collected, exit quietly
+            if not self._g_dev:
+                return
 
-        # --- Decode realised_vol to physical scale (robust to PF version)
-        yv_dec = safe_decode_vol(yv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
-        pv_dec = safe_decode_vol(pv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
+            # Gather device tensors accumulated during validation
+            device = self._g_dev[0].device
+            g  = torch.cat(self._g_dev).to(device)            # [N]
+            yv = torch.cat(self._yv_dev).to(device)           # realised_vol (encoded)  [N]
+            pv = torch.cat(self._pv_dev).to(device)           # realised_vol pred (enc) [N]
+            yd = torch.cat(self._yd_dev).to(device) if self._yd_dev else None  # direction labels
+            pdir = torch.cat(self._pd_dev).to(device) if self._pd_dev else None  # direction logits/probs
 
-        # Guard against near-zero decoded vols (use global floor if defined)
-        floor_val = float(globals().get("EVAL_VOL_FLOOR", 1e-8))
-        yv_dec = torch.clamp(yv_dec, min=floor_val)
-        pv_dec = torch.clamp(pv_dec, min=floor_val)
+            # --- Decode realised_vol to physical scale (robust to PF version)
+            yv_dec = safe_decode_vol(yv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
+            pv_dec = safe_decode_vol(pv.unsqueeze(-1), self.vol_norm, g.unsqueeze(-1)).squeeze(-1)
 
-        # Debug prints (helpful sanity checks)
-        try:
-            print("DEBUG transformation:", getattr(self.vol_norm, "transformation", None))
-            print("DEBUG mean after decode:", float(yv_dec.mean().item()))
-            ratio_dbg = float((yv_dec.mean() / (pv_dec.mean() + 1e-12)).item())
-            print("DEBUG: mean(yv_dec)=", float(yv_dec.mean().item()),
-                  "mean(pv_dec)=", float(pv_dec.mean().item()),
-                  "ratio=", ratio_dbg)
-        except Exception:
-            pass
+            # Guard against near-zero decoded vols (use global floor if defined)
+            floor_val = float(globals().get("EVAL_VOL_FLOOR", 1e-8))
+            yv_dec = torch.clamp(yv_dec, min=floor_val)
+            pv_dec = torch.clamp(pv_dec, min=floor_val)
 
-        # Move to CPU for metric computation
-        y_cpu  = yv_dec.detach().cpu()
-        p_cpu  = pv_dec.detach().cpu()
-        g_cpu  = g.detach().cpu()
-        yd_cpu = yd.detach().cpu() if yd is not None else None
-        pdir_cpu = pdir.detach().cpu() if pdir is not None else None
-
-        # Calibration diagnostic (not used in loss)
-        try:
-            mean_scale = float((y_cpu.mean() / (p_cpu.mean() + 1e-12)).item())
-        except Exception:
-            mean_scale = float("nan")
-        print(f"[CAL DEBUG] mean(y)/mean(p)={mean_scale:.4f} (1==perfect)")
-        try:
-            trainer.callback_metrics["val_mean_scale"] = torch.tensor(mean_scale)
-        except Exception:
-            pass
-
-        # --- Decoded regression metrics (overall) ---
-        eps = 1e-8
-        diff = (p_cpu - y_cpu)
-        overall_mae  = float(diff.abs().mean().item())
-        overall_mse  = float((diff ** 2).mean().item())
-        overall_rmse = float(overall_mse ** 0.5)
-
-        sigma2_p = torch.clamp(p_cpu.abs(), min=eps) ** 2
-        sigma2_y = torch.clamp(y_cpu.abs(), min=eps) ** 2
-        ratio    = sigma2_y / sigma2_p
-        overall_qlike = float((ratio - torch.log(ratio) - 1.0).mean().item())
-
-        # Calibrated QLIKE (diagnostic only; not used for scheduling)
-        try:
-            p_cal = calibrate_vol_predictions(y_cpu, p_cpu)
-            sigma2_pc = torch.clamp(p_cal.abs(), min=eps) ** 2
-            ratio_cal = sigma2_y / sigma2_pc
-            overall_qlike_cal = float((ratio_cal - torch.log(ratio_cal) - 1.0).mean().item())
-            trainer.callback_metrics["val_qlike_cal"] = torch.tensor(overall_qlike_cal)
-        except Exception as _e:
-            pass
-
-        # --- Optional direction metrics (overall) ---
-        acc = None
-        brier = None
-        auroc = None
-        if yd_cpu is not None and pdir_cpu is not None and yd_cpu.numel() > 0 and pdir_cpu.numel() > 0:
-            # Convert logits→probs if needed
-            probs = pdir_cpu
+            # Debug prints (helpful sanity checks)
             try:
-                if torch.isfinite(probs).any() and (probs.min() < 0 or probs.max() > 1):
-                    probs = torch.sigmoid(probs)
-            except Exception:
-                probs = torch.sigmoid(probs)
-            probs = torch.clamp(probs, 0.0, 1.0)
-
-            acc = float(((probs >= 0.5).int() == yd_cpu.int()).float().mean().item())
-            brier = float(((probs - yd_cpu.float()) ** 2).mean().item())
-            try:
-                au = BinaryAUROC()
-                auroc = float(au(probs, yd_cpu).item())
-            except Exception as e:
-                print(f"[WARN] AUROC failed: {e}")
-
-            # stash for later printing/saving
-            try:
-                trainer.callback_metrics["val_brier_overall"] = torch.tensor(brier)
-                trainer.callback_metrics["val_auroc_overall"] = torch.tensor(auroc) if auroc is not None else None
-                trainer.callback_metrics["val_acc_overall"]   = torch.tensor(acc)
+                print("DEBUG transformation:", getattr(self.vol_norm, "transformation", None))
+                print("DEBUG mean after decode:", float(yv_dec.mean().item()))
+                ratio_dbg = float((yv_dec.mean() / (pv_dec.mean() + 1e-12)).item())
+                print("DEBUG: mean(yv_dec)=", float(yv_dec.mean().item()),
+                    "mean(pv_dec)=", float(pv_dec.mean().item()),
+                    "ratio=", ratio_dbg)
             except Exception:
                 pass
 
-        # --- Epoch summary / val loss ---
-        N = int(y_cpu.numel())
-        try:
-            epoch_num = int(getattr(trainer, "current_epoch", -1)) + 1
-        except Exception:
-            epoch_num = None
+            # Move to CPU for metric computation
+            y_cpu  = yv_dec.detach().cpu()
+            p_cpu  = pv_dec.detach().cpu()
+            g_cpu  = g.detach().cpu()
+            yd_cpu = yd.detach().cpu() if yd is not None else None
+            pdir_cpu = pdir.detach().cpu() if pdir is not None else None
 
-        # Composite loss (absolute form for validation)
-        val_comp = float(composite_score(overall_mae, overall_rmse, overall_qlike))
-        # Preferred monitor key
-        trainer.callback_metrics["val_comp_overall"]      = torch.tensor(val_comp)
-        # Backward-compat alias (some monitors used this)
-        trainer.callback_metrics["val_composite_overall"] = torch.tensor(val_comp)
-        trainer.callback_metrics["val_loss_source"]       = "composite(MAE,RMSE,QLIKE)"
-        # Lightning's default early-stopping key
-        trainer.callback_metrics["val_loss"]              = torch.tensor(val_comp)
-        trainer.callback_metrics["val_loss_decoded"]      = torch.tensor(val_comp)
-        trainer.callback_metrics["val_mae_overall"]       = torch.tensor(overall_mae)
-        trainer.callback_metrics["val_rmse_overall"]      = torch.tensor(overall_rmse)
-        trainer.callback_metrics["val_mse_overall"]       = torch.tensor(overall_mse)
-        trainer.callback_metrics["val_qlike_overall"]     = torch.tensor(overall_qlike)
-        trainer.callback_metrics["val_qlike_cal"]     = torch.tensor(overall_qlike_cal)
-        trainer.callback_metrics["val_N_overall"]         = torch.tensor(float(N))
+            # Calibration diagnostic (not used in loss)
+            try:
+                mean_scale = float((y_cpu.mean() / (p_cpu.mean() + 1e-12)).item())
+            except Exception:
+                mean_scale = float("nan")
+            print(f"[CAL DEBUG] mean(y)/mean(p)={mean_scale:.4f} (1==perfect)")
+            try:
+                trainer.callback_metrics["val_mean_scale"] = torch.tensor(mean_scale)
+            except Exception:
+                pass
 
-        msg = (
-            f"[VAL EPOCH {epoch_num}] "
-            f"(decoded) MAE={overall_mae:.6f} "
-            f"RMSE={overall_rmse:.6f} "
-            f"MSE={overall_mse:.6f} "
-            f"QLIKE={overall_qlike:.6f} "
-            f"CompLoss = {val_comp:.6f}"
-            + (f"QLIKE_CAL={overall_qlike_cal:.6f} " if overall_qlike_cal is not None else "")
-            + (f" | ACC={acc:.3f}"   if acc   is not None else "")
-            + (f" | Brier={brier:.4f}" if brier is not None else "")
-            + (f" | AUROC={auroc:.3f}" if auroc is not None else "")
-            + f" | N={N}"
-        )
-        print(msg)
+            # --- NEW: persist simple 2-regime calibration learned on validation ---
+            try:
+                y_t = torch.tensor(y_cpu.numpy())
+                p_t = torch.tensor(p_cpu.numpy())
+                q33, q66 = torch.quantile(y_t, torch.tensor([0.33, 0.66]))
+                def _ratio(mask):
+                    if mask.sum() == 0:
+                        return torch.tensor(1.0)
+                    y_m = y_t[mask].mean()
+                    p_m = p_t[mask].mean()
+                    if not torch.isfinite(y_m) or not torch.isfinite(p_m) or float(abs(p_m)) < 1e-12:
+                        return torch.tensor(1.0)
+                    return torch.clamp(y_m / p_m, 0.5, 2.0)
+                s_low  = _ratio(y_t <= q33)
+                s_high = _ratio(y_t >= q66)
+                calib = {
+                    "q33":   float(q33.item()),
+                    "q66":   float(q66.item()),
+                    "s_low": float(s_low.item()),
+                    "s_high":float(s_high.item()),
+                    "floor": float(floor_val),
+                }
+                # keep in-memory for this Trainer run and save to disk for TEST reuse
+                try:
+                    setattr(trainer.lightning_module, "calib_params", calib)
+                except Exception:
+                    pass
+                _save_val_calibration(calib)
+            except Exception as e:
+                print(f"[WARN] Could not compute/save val calibration: {e}")
+            # --- END NEW ---
 
-        # --- Per-asset metrics table (so on_fit_end can print it) ---
-        self._last_rows = []
-        try:
-            # map group id -> human name
-            asset_names = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
-            # compute per-asset aggregates
-            dfm = pd.DataFrame({
-                "asset": asset_names,
-                "y": y_cpu.numpy(),
-                "p": p_cpu.numpy(),
-            })
+            # --- Decoded regression metrics (overall) ---
+            eps = 1e-8
+            diff = (p_cpu - y_cpu)
+            overall_mae  = float(diff.abs().mean().item())
+            overall_mse  = float((diff ** 2).mean().item())
+            overall_rmse = float(overall_mse ** 0.5)
+
+            sigma2_p = torch.clamp(p_cpu.abs(), min=eps) ** 2
+            sigma2_y = torch.clamp(y_cpu.abs(), min=eps) ** 2
+            ratio    = sigma2_y / sigma2_p
+            overall_qlike = float((ratio - torch.log(ratio) - 1.0).mean().item())
+
+            # Calibrated QLIKE (diagnostic only; not used for scheduling)
+            try:
+                p_cal = calibrate_vol_predictions(y_cpu, p_cpu)
+                sigma2_pc = torch.clamp(p_cal.abs(), min=eps) ** 2
+                ratio_cal = sigma2_y / sigma2_pc
+                overall_qlike_cal = float((ratio_cal - torch.log(ratio_cal) - 1.0).mean().item())
+                trainer.callback_metrics["val_qlike_cal"] = torch.tensor(overall_qlike_cal)
+            except Exception as _e:
+                pass
+
+            # --- Optional direction metrics (overall) ---
+            acc = None
+            brier = None
+            auroc = None
             if yd_cpu is not None and pdir_cpu is not None and yd_cpu.numel() > 0 and pdir_cpu.numel() > 0:
-                # ensure probs in [0,1]
+                # Convert logits→probs if needed
                 probs = pdir_cpu
                 try:
                     if torch.isfinite(probs).any() and (probs.min() < 0 or probs.max() > 1):
@@ -1330,61 +1352,137 @@ class PerAssetMetrics(pl.Callback):
                 except Exception:
                     probs = torch.sigmoid(probs)
                 probs = torch.clamp(probs, 0.0, 1.0)
-                dfm["yd"] = yd_cpu.numpy()
-                dfm["pd"] = probs.numpy()
 
-            rows = []
-            for a, gdf in dfm.groupby("asset", sort=False):
-                y_a = torch.tensor(gdf["y"].values)
-                p_a = torch.tensor(gdf["p"].values)
-                n_a = int(len(gdf))
-                mae_a = float((p_a - y_a).abs().mean().item())
-                mse_a = float(((p_a - y_a) ** 2).mean().item())
-                rmse_a = float(mse_a ** 0.5)
+                acc = float(((probs >= 0.5).int() == yd_cpu.int()).float().mean().item())
+                brier = float(((probs - yd_cpu.float()) ** 2).mean().item())
+                try:
+                    au = BinaryAUROC()
+                    auroc = float(au(probs, yd_cpu).item())
+                except Exception as e:
+                    print(f"[WARN] AUROC failed: {e}")
 
-                s2p = torch.clamp(torch.tensor(np.abs(gdf["p"].values)), min=eps) ** 2
-                s2y = torch.clamp(torch.tensor(np.abs(gdf["y"].values)), min=eps) ** 2
-                ratio_a = s2y / s2p
-                qlike_a = float((ratio_a - torch.log(ratio_a) - 1.0).mean().item())
+                # stash for later printing/saving
+                try:
+                    trainer.callback_metrics["val_brier_overall"] = torch.tensor(brier)
+                    trainer.callback_metrics["val_auroc_overall"] = torch.tensor(auroc) if auroc is not None else None
+                    trainer.callback_metrics["val_acc_overall"]   = torch.tensor(acc)
+                except Exception:
+                    pass
 
-                acc_a = None
-                if "yd" in gdf.columns and "pd" in gdf.columns:
-                    acc_a = float(((torch.tensor(gdf["pd"].values) >= 0.5).int() ==
-                                   torch.tensor(gdf["yd"].values).int()).float().mean().item())
-
-                rows.append((a, mae_a, rmse_a, mse_a, qlike_a, acc_a, n_a))
-
-            # sort by sample count (desc) so “top by samples” prints nicely
-            rows.sort(key=lambda r: r[6], reverse=True)
-            self._last_rows = rows
-
-            # --- Per-epoch per-asset snapshot (top by samples) ---
+            # --- Epoch summary / val loss ---
+            N = int(y_cpu.numel())
             try:
-                k = min(5, getattr(self, "max_print", 5))
-                if rows:
-                    print("Per-asset (epoch snapshot, top by samples):")
-                    print("asset | MAE | RMSE | MSE | QLIKE | ACC | N")
-                    for r in rows[:k]:
-                        acc_str = "-" if r[5] is None else f"{r[5]:.3f}"
-                        print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {acc_str} | {r[6]}")
-            except Exception as _e:
-                print(f"[WARN] per-epoch per-asset print failed: {_e}")
+                epoch_num = int(getattr(trainer, "current_epoch", -1)) + 1
+            except Exception:
+                epoch_num = None
 
-        except Exception as e:
-            print(f"[WARN] per-asset aggregation failed: {e}")
+            # Composite loss (absolute form for validation)
+            val_comp = float(composite_score(overall_mae, overall_rmse, overall_qlike))
+            # Preferred monitor key
+            trainer.callback_metrics["val_comp_overall"]      = torch.tensor(val_comp)
+            # Backward-compat alias (some monitors used this)
+            trainer.callback_metrics["val_composite_overall"] = torch.tensor(val_comp)
+            trainer.callback_metrics["val_loss_source"]       = "composite(MAE,RMSE,QLIKE)"
+            # Lightning's default early-stopping key
+            trainer.callback_metrics["val_loss"]              = torch.tensor(val_comp)
+            trainer.callback_metrics["val_loss_decoded"]      = torch.tensor(val_comp)
+            trainer.callback_metrics["val_mae_overall"]       = torch.tensor(overall_mae)
+            trainer.callback_metrics["val_rmse_overall"]      = torch.tensor(overall_rmse)
+            trainer.callback_metrics["val_mse_overall"]       = torch.tensor(overall_mse)
+            trainer.callback_metrics["val_qlike_overall"]     = torch.tensor(overall_qlike)
+            trainer.callback_metrics["val_qlike_cal"]     = torch.tensor(overall_qlike_cal)
+            trainer.callback_metrics["val_N_overall"]         = torch.tensor(float(N))
+
+            msg = (
+                f"[VAL EPOCH {epoch_num}] "
+                f"(decoded) MAE={overall_mae:.6f} "
+                f"RMSE={overall_rmse:.6f} "
+                f"MSE={overall_mse:.6f} "
+                f"QLIKE={overall_qlike:.6f} "
+                f"CompLoss = {val_comp:.6f}"
+                + (f"QLIKE_CAL={overall_qlike_cal:.6f} " if overall_qlike_cal is not None else "")
+                + (f" | ACC={acc:.3f}"   if acc   is not None else "")
+                + (f" | Brier={brier:.4f}" if brier is not None else "")
+                + (f" | AUROC={auroc:.3f}" if auroc is not None else "")
+                + f" | N={N}"
+            )
+            print(msg)
+
+            # --- Per-asset metrics table (so on_fit_end can print it) ---
             self._last_rows = []
+            try:
+                # map group id -> human name
+                asset_names = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
+                # compute per-asset aggregates
+                dfm = pd.DataFrame({
+                    "asset": asset_names,
+                    "y": y_cpu.numpy(),
+                    "p": p_cpu.numpy(),
+                })
+                if yd_cpu is not None and pdir_cpu is not None and yd_cpu.numel() > 0 and pdir_cpu.numel() > 0:
+                    # ensure probs in [0,1]
+                    probs = pdir_cpu
+                    try:
+                        if torch.isfinite(probs).any() and (probs.min() < 0 or probs.max() > 1):
+                            probs = torch.sigmoid(probs)
+                    except Exception:
+                        probs = torch.sigmoid(probs)
+                    probs = torch.clamp(probs, 0.0, 1.0)
+                    dfm["yd"] = yd_cpu.numpy()
+                    dfm["pd"] = probs.numpy()
 
-        # stash overall for on_fit_end
-        self._last_overall = {
-            "mae": overall_mae,
-            "rmse": overall_rmse,
-            "mse": overall_mse,
-            "qlike": overall_qlike,
-            "val_loss": val_comp,
-            "dir_bce": brier,   # (kept for backwards compatibility with your saver)
-            "yd": yd_cpu,
-            "pd": pdir_cpu,
-        }
+                rows = []
+                for a, gdf in dfm.groupby("asset", sort=False):
+                    y_a = torch.tensor(gdf["y"].values)
+                    p_a = torch.tensor(gdf["p"].values)
+                    n_a = int(len(gdf))
+                    mae_a = float((p_a - y_a).abs().mean().item())
+                    mse_a = float(((p_a - y_a) ** 2).mean().item())
+                    rmse_a = float(mse_a ** 0.5)
+
+                    s2p = torch.clamp(torch.tensor(np.abs(gdf["p"].values)), min=eps) ** 2
+                    s2y = torch.clamp(torch.tensor(np.abs(gdf["y"].values)), min=eps) ** 2
+                    ratio_a = s2y / s2p
+                    qlike_a = float((ratio_a - torch.log(ratio_a) - 1.0).mean().item())
+
+                    acc_a = None
+                    if "yd" in gdf.columns and "pd" in gdf.columns:
+                        acc_a = float(((torch.tensor(gdf["pd"].values) >= 0.5).int() ==
+                                    torch.tensor(gdf["yd"].values).int()).float().mean().item())
+
+                    rows.append((a, mae_a, rmse_a, mse_a, qlike_a, acc_a, n_a))
+
+                # sort by sample count (desc) so “top by samples” prints nicely
+                rows.sort(key=lambda r: r[6], reverse=True)
+                self._last_rows = rows
+
+                # --- Per-epoch per-asset snapshot (top by samples) ---
+                try:
+                    k = min(5, getattr(self, "max_print", 5))
+                    if rows:
+                        print("Per-asset (epoch snapshot, top by samples):")
+                        print("asset | MAE | RMSE | MSE | QLIKE | ACC | N")
+                        for r in rows[:k]:
+                            acc_str = "-" if r[5] is None else f"{r[5]:.3f}"
+                            print(f"{r[0]} | {r[1]:.6f} | {r[2]:.6f} | {r[3]:.6f} | {r[4]:.6f} | {acc_str} | {r[6]}")
+                except Exception as _e:
+                    print(f"[WARN] per-epoch per-asset print failed: {_e}")
+
+            except Exception as e:
+                print(f"[WARN] per-asset aggregation failed: {e}")
+                self._last_rows = []
+
+            # stash overall for on_fit_end
+            self._last_overall = {
+                "mae": overall_mae,
+                "rmse": overall_rmse,
+                "mse": overall_mse,
+                "qlike": overall_qlike,
+                "val_loss": val_comp,
+                "dir_bce": brier,   # (kept for backwards compatibility with your saver)
+                "yd": yd_cpu,
+                "pd": pdir_cpu,
+            }
 
     @torch.no_grad()
     def on_fit_end(self, trainer, pl_module):
