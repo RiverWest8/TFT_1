@@ -622,6 +622,27 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
         except Exception as _e:
             print(f"[WARN] test calibration skipped: {_e}")
 
+        # Enforce monotone separation so q95 is not identical to the median
+        # (handles rare degenerate cases when the quantile head collapses)
+        try:
+            if (y_q50 is not None) and (y_q95 is not None) and torch.is_tensor(y_q50) and torch.is_tensor(y_q95):
+                # base epsilon: a tiny absolute bump
+                eps_abs = torch.full_like(y_q50, 1e-8)
+                # add a small fraction of the lower spread if available
+                if y_q05 is not None and torch.is_tensor(y_q05):
+                    spread = torch.clamp(y_q50 - y_q05, min=0.0)
+                    eps_spread = 0.02 * spread  # 2% of lower spread
+                else:
+                    eps_spread = torch.zeros_like(y_q50)
+                eps = torch.maximum(eps_abs, eps_spread)
+                # ensure upper >= median + eps, preserving monotonicity
+                y_q95 = torch.maximum(y_q95, y_q50 + eps)
+                # also ensure lower <= median - tiny epsilon (optional, symmetric guard)
+                if y_q05 is not None and torch.is_tensor(y_q05):
+                    y_q05 = torch.minimum(y_q05, y_q50 - eps_abs)
+        except Exception:
+            pass
+
         # True targets (optional; robust across PF layouts)
         y_vol_true = None
         y_dir_true = None
