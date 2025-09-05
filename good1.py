@@ -1564,17 +1564,18 @@ class PerAssetMetrics(pl.Callback):
 
             # decode vol back to physical scale and build dataframe
             if g_cpu is not None and yv_cpu is not None and pv_cpu is not None:
-                yv_dec = self.vol_norm.decode(yv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
-                pv_dec = self.vol_norm.decode(pv_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
+                # robust decode
+                yv_dec = safe_decode_vol(yv_cpu.unsqueeze(-1), self.vol_norm, g_cpu.unsqueeze(-1)).squeeze(-1)
+                pv_dec = safe_decode_vol(pv_cpu.unsqueeze(-1), self.vol_norm, g_cpu.unsqueeze(-1)).squeeze(-1)
 
                 # Optional: decode q05/q95 if collected
                 q05_dec = q95_dec = None
                 if self._pq05_dev:
                     pq05_cpu = torch.cat(self._pq05_dev).detach().cpu()
-                    q05_dec = self.vol_norm.decode(pq05_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
+                    q05_dec = safe_decode_vol(pq05_cpu.unsqueeze(-1), self.vol_norm, g_cpu.unsqueeze(-1)).squeeze(-1)
                 if self._pq95_dev:
                     pq95_cpu = torch.cat(self._pq95_dev).detach().cpu()
-                    q95_dec = self.vol_norm.decode(pq95_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
+                    q95_dec = safe_decode_vol(pq95_cpu.unsqueeze(-1), self.vol_norm, g_cpu.unsqueeze(-1)).squeeze(-1)
 
                 # Apply the same calibration used in metrics to the median so parquet matches plots
                 pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
@@ -1620,14 +1621,29 @@ class PerAssetMetrics(pl.Callback):
             else:
                 print("[WARN] No validation tensors to save; skipping parquet.")
 
-            # --- Write validation predictions parquet once (with optional Time merge) ---
+            # --- Write validation predictions parquet once (with robust Time merge) ---
             if df_out is not None:
                 pred_path = LOCAL_OUTPUT_DIR / f"tft_val_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
 
-                # Optional: merge real timestamps from val_df if available
+                # Prefer the **actual** dataset behind the validation dataloader; fallback to val_df/global
                 try:
-                    if "val_df" in globals() and isinstance(val_df, pd.DataFrame) and {"asset","time_idx","Time"}.issubset(val_df.columns):
+                    src = None
+                    # Primary: trainer's first validation dataloader dataset
+                    try:
+                        val_loaders = getattr(trainer, "val_dataloaders", None)
+                        if val_loaders:
+                            ds = val_loaders[0].dataset
+                            df_src = getattr(ds, "data", None)
+                            if isinstance(df_src, pd.DataFrame) and {"asset","time_idx","Time"}.issubset(df_src.columns):
+                                src = df_src[["asset","time_idx","Time"]].copy()
+                    except Exception:
+                        src = None
+
+                    # Fallback: global val_df
+                    if src is None and "val_df" in globals() and isinstance(val_df, pd.DataFrame) and {"asset","time_idx","Time"}.issubset(val_df.columns):
                         src = val_df[["asset","time_idx","Time"]].copy()
+
+                    if src is not None:
                         # harmonise dtypes before merge
                         src["asset"] = src["asset"].astype(str)
                         src["time_idx"] = pd.to_numeric(src["time_idx"], errors="coerce").astype("Int64").astype("int64")
@@ -1643,7 +1659,7 @@ class PerAssetMetrics(pl.Callback):
                         except Exception:
                             pass
                     else:
-                        print("[WARN] No usable val_df with ['asset','time_idx','Time']; saving without Time column.")
+                        print("[WARN] No usable source for val Time; saving without Time column.")
                 except Exception as e:
                     print(f"[WARN] Time merge skipped: {e}")
 
@@ -1657,7 +1673,6 @@ class PerAssetMetrics(pl.Callback):
 
         except Exception as e:
             print(f"[WARN] Could not save validation predictions: {e}")
-
 
 class BiasWarmupCallback(pl.Callback):
     """
