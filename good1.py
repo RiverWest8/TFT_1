@@ -511,6 +511,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     # Accumulators
     assets_all, t_all = [], []
     y_true_all, y_dirprob_all = [], []
+    y_dir_true_all = []
     y_pred_q05_all, y_pred_q50_all, y_pred_q95_all = [], [], []
     # Helper: extract x dict from a batch container
     def _get_x(b):
@@ -621,19 +622,52 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
         except Exception as _e:
             print(f"[WARN] test calibration skipped: {_e}")
 
-        # True targets (optional)
+        # True targets (optional; robust across PF layouts)
         y_vol_true = None
-        dec_t = x.get("decoder_target")
+        y_dir_true = None
+        dec_t = _first_not_none(x, ["decoder_target", "target", "targets", "y", "decoder_y"])  # may be None on TEST
         if torch.is_tensor(dec_t):
-            yt = dec_t
-            if yt.ndim == 3 and yt.size(-1) >= 1:
-                yt = yt[:, 0, 0]
-            elif yt.ndim == 2:
-                yt = yt[:, 0]
-            if vol_norm is not None:
-                y_vol_true = safe_decode_vol(yt.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
-            else:
-                y_vol_true = yt
+            ytmp = dec_t
+            # common shapes: [B, pred_len, n_t], [B, 1, n_t], [B, n_t], [B]
+            if ytmp.ndim == 3 and ytmp.size(1) == 1:
+                ytmp = ytmp[:, 0, :]        # → [B, n_t]
+            if ytmp.ndim == 3 and ytmp.size(-1) == 1:
+                ytmp = ytmp[..., 0]         # → [B, pred_len]
+            if ytmp.ndim == 2 and ytmp.size(1) >= 1:
+                yv_enc = ytmp[:, 0]
+                if vol_norm is not None:
+                    y_vol_true = safe_decode_vol(yv_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+                    y_vol_true = torch.clamp(y_vol_true, min=floor_val)
+                else:
+                    y_vol_true = yv_enc
+                if ytmp.size(1) > 1:
+                    y_dir_true = ytmp[:, 1]
+            elif ytmp.ndim == 1:
+                yv_enc = ytmp
+                if vol_norm is not None:
+                    y_vol_true = safe_decode_vol(yv_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+                    y_vol_true = torch.clamp(y_vol_true, min=floor_val)
+                else:
+                    y_vol_true = yv_enc
+        elif isinstance(dec_t, (list, tuple)) and len(dec_t) >= 1:
+            # Some PF versions return a tuple/list of targets
+            yv_enc = dec_t[0]
+            if torch.is_tensor(yv_enc):
+                if yv_enc.ndim == 3 and yv_enc.size(-1) == 1:
+                    yv_enc = yv_enc[..., 0]
+                if yv_enc.ndim == 2 and yv_enc.size(-1) == 1:
+                    yv_enc = yv_enc[:, 0]
+                if vol_norm is not None:
+                    y_vol_true = safe_decode_vol(yv_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+                    y_vol_true = torch.clamp(y_vol_true, min=floor_val)
+                else:
+                    y_vol_true = yv_enc
+            if len(dec_t) > 1 and torch.is_tensor(dec_t[1]):
+                y_dir_true = dec_t[1]
+                if y_dir_true.ndim == 3 and y_dir_true.size(-1) == 1:
+                    y_dir_true = y_dir_true[..., 0]
+                if y_dir_true.ndim == 2 and y_dir_true.size(-1) == 1:
+                    y_dir_true = y_dir_true[:, 0]
 
         # Direction → probability in [0,1]
         y_dir_prob = None
@@ -666,6 +700,11 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             y_true_all.extend(y_vol_true.detach().cpu().tolist())
         else:
             y_true_all.extend([None] * L)
+        # Add direction true values
+        if y_dir_true is not None:
+            y_dir_true_all.extend(y_dir_true.detach().cpu().tolist())
+        else:
+            y_dir_true_all.extend([None] * L)
         if y_dir_prob is not None:
             y_dirprob_all.extend(y_dir_prob.detach().cpu().tolist())
         else:
@@ -679,8 +718,16 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
         "y_vol_pred_q05": y_pred_q05_all,
         "y_vol_pred_q50": y_pred_q50_all,
         "y_vol_pred_q95": y_pred_q95_all,
+        "y_dir": y_dir_true_all,
         "y_dir_prob": y_dirprob_all,
     })
+
+    # Drop duplicate q50 column on TEST; validation parquet keeps its own schema via callback
+    try:
+        if str(split).lower() == "test" and "y_vol_pred_q50" in df.columns:
+            df.drop(columns=["y_vol_pred_q50"], inplace=True)
+    except Exception:
+        pass
 
     # Try to attach actual 'Time' if a compatible source df is cached
     try:
@@ -710,6 +757,17 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
                 pass
     except Exception as e:
         print(f"[WARN] Could not attach Time column: {e}")
+
+    # For TEST only, reorder columns to match validation parquet
+    try:
+        if str(split).lower() == "test":
+            want = ["asset","time_idx","y_vol","y_vol_pred","y_vol_pred_q05","y_vol_pred_q95","y_dir","y_dir_prob","Time"]
+            have = [c for c in want if c in df.columns]
+            # add any extras at the end to avoid dropping debug cols inadvertently
+            extras = [c for c in df.columns if c not in have]
+            df = df[have + extras]
+    except Exception:
+        pass
 
     # Save parquet
     out_path.parent.mkdir(parents=True, exist_ok=True)
