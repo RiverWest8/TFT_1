@@ -60,7 +60,6 @@ BATCH_SIZE   = 128
 MAX_EPOCHS   = 35
 EARLY_STOP_PATIENCE = 30
 PERM_BLOCK_SIZE = 288
-APPLY_TEST_CAL = True
 
 # Extra belt-and-braces: swallow BrokenPipe errors on stdout.flush() if any other lib calls it.
 try:
@@ -446,60 +445,39 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
       • Decodes realised_vol using the TRAIN normalizer
       • Writes a harmonised parquet with columns: asset, time_idx, y_vol, y_vol_pred, y_dir_prob (optional)
     """
-    # 1) Find best checkpoint
-    best_ckpt = None
-    for cb in getattr(trainer, "callbacks", []):
-        if isinstance(cb, pl.callbacks.ModelCheckpoint):
-            if getattr(cb, "best_model_path", None):
-                if cb.best_model_path and os.path.exists(cb.best_model_path):
-                    best_ckpt = cb.best_model_path
-                    break
-    if best_ckpt is None:
-        try:
-            cks = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
+    # 1) Select checkpoint for export: prefer last.ckpt, else most recent .ckpt
+    ckpt_path = None
+    try:
+        last_ckpt = LOCAL_CKPT_DIR / "last.ckpt"
+        if os.path.exists(last_ckpt):
+            ckpt_path = str(last_ckpt)
+        else:
+            cks = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"),
+                         key=lambda p: p.stat().st_mtime,
+                         reverse=True)
             if cks:
-                best_ckpt = str(cks[0])
-        except Exception:
-            pass
-    if best_ckpt is None:
-        raise RuntimeError("Best checkpoint not found for export.")
+                ckpt_path = str(cks[0])
+    except Exception:
+        ckpt_path = None
+    if ckpt_path is None:
+        raise RuntimeError("No checkpoint found for export (looked for last.ckpt or any .ckpt).")
 
-    # 2) Recreate model from best ckpt on current device
+    # 2) Recreate model from chosen checkpoint on current device
     LM = type(trainer.lightning_module)
-    best_model = LM.load_from_checkpoint(best_ckpt)
-    best_model.eval().to(trainer.lightning_module.device) 
+    best_model = LM.load_from_checkpoint(ckpt_path)
+    best_model.eval().to(trainer.lightning_module.device)
 
-    # 3) id->name map from PerAssetMetrics if available
     # 3) id->name map from PerAssetMetrics if available; else from dataset encoder
     metrics_cb = None
     for cb in getattr(trainer, "callbacks", []):
         if isinstance(cb, PerAssetMetrics):
             metrics_cb = cb
             break
-
     if metrics_cb is not None and getattr(metrics_cb, "id_to_name", None):
         id_to_name = {int(k): str(v) for k, v in metrics_cb.id_to_name.items()}
     else:
         # fallback: read from dataloader.dataset encoder
         id_to_name = _id_to_name_from_dataset(getattr(dataloader, "dataset", None))
-    # NEW: always pick last.ckpt instead of best
-    last_ckpt_path = LOCAL_CKPT_DIR / "last.ckpt"
-    if os.path.exists(last_ckpt_path):
-        best_ckpt = str(last_ckpt_path)   # 👈 force use last
-    else:
-        # fallback: still try to pick the most recent .ckpt
-        try:
-            cks = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
-            if cks:
-                best_ckpt = str(cks[0])
-        except Exception:
-            best_ckpt = None
-    id_to_name = None
-    if metrics_cb is not None:
-        id_to_name = {int(k): str(v) for k, v in metrics_cb.id_to_name.items()}
-    else:
-        # fallback: identity mapping added later if needed
-        id_to_name = {}
 
     # Try to load calibrator saved from validation (optional)
     calibrator = None
