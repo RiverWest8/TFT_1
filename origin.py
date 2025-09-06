@@ -3048,6 +3048,60 @@ def _train_single_fold(train_df: pd.DataFrame, val_df: pd.DataFrame, fold_id: in
         "val_comp": float(trainer.callback_metrics.get("val_comp_overall", float("nan"))),
     }
 
+# --- Helper: ensure/derive binary 'direction' target when absent -----------------
+def _derive_direction_inplace(df: "pd.DataFrame", group_col: str) -> "pd.DataFrame":
+    """
+    If 'direction' is missing, try to derive it from common columns:
+      1) If y_dir / target_dir exists → use it (numeric coercion)
+      2) If a return column exists → direction = (return > 0)
+      3) Else compute per-asset diff of a price/log-price column → direction = (diff > 0)
+    Fills NaNs with 0.0. Returns the same dataframe (mutated) for convenience.
+    """
+    import numpy as np
+    import pandas as pd
+
+    if "direction" in df.columns:
+        return df
+
+    # 1) direct alternatives
+    for cand in ("y_dir", "target_dir", "Direction", "dir", "DIR"):
+        if cand in df.columns:
+            df["direction"] = pd.to_numeric(df[cand], errors="coerce")
+            df["direction"] = df["direction"].astype(float)
+            df["direction"] = df["direction"].fillna(0.0)
+            return df
+
+    # 2) from returns
+    for rname in ("Log_Return", "log_return", "Return", "RET", "ret1", "RET1"):
+        if rname in df.columns:
+            try:
+                df["direction"] = (pd.to_numeric(df[rname], errors="coerce") > 0).astype("float32")
+                df["direction"] = df["direction"].fillna(0.0)
+                return df
+            except Exception:
+                pass
+
+    # 3) from price / log-price differences
+    price_candidates = ("Log_Close", "log_close", "Close", "close", "Adj_Close", "adj_close", "Price", "price")
+    for pname in price_candidates:
+        if pname in df.columns:
+            try:
+                # Ensure canonical time & sort before diff
+                if TIME_COL in df.columns and group_col in df.columns:
+                    df = df.sort_values([group_col, TIME_COL])
+                if pname.lower().startswith("log"):
+                    ret = df.groupby(group_col, observed=True, sort=False)[pname].diff()
+                else:
+                    # use log-diff on raw price to be sign-consistent
+                    ret = df.groupby(group_col, observed=True, sort=False)[pname].transform(lambda x: np.log(x).diff())
+                df["direction"] = (ret > 0).astype("float32").fillna(0.0)
+                return df
+            except Exception:
+                continue
+
+    # If we get here, we failed to derive; leave as-is
+    return df
+
 def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df: "pd.DataFrame", uni_df: Optional["pd.DataFrame"]):
     """
     Keep the final 10% chronologically as the held-out test.
@@ -3085,9 +3139,14 @@ def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df
     except Exception as _e_tz:
         print(f"[WARN] Could not normalise timezone info (universal): {_e_tz}")
 
-    for tcol in ("realised_vol", "direction"):
-        if tcol not in base.columns:
-            raise ValueError(f"Required target column '{tcol}' missing from universal_data.parquet")
+    # Ensure targets exist; derive 'direction' if missing
+    if "realised_vol" not in base.columns:
+        raise ValueError("Required target column 'realised_vol' missing from universal_data.parquet")
+
+    if "direction" not in base.columns:
+        base = _derive_direction_inplace(base, GROUP_ID[0])
+        if "direction" not in base.columns:
+            raise ValueError("Required target column 'direction' missing from universal_data.parquet and could not be derived from returns/prices")
 
     # Coerce targets to numeric (direction to {0,1})
     try:
@@ -3095,13 +3154,13 @@ def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df
     except Exception:
         pass
     try:
-        if not pd.api.types.is_numeric_dtype(base["direction"]):
-            base["direction"] = base["direction"].map({"up":1, "down":0, True:1, False:0}).astype("Int64").astype("float32")
-        else:
-            base["direction"] = pd.to_numeric(base["direction"], errors="coerce")
+        if not pd.api.types.is_numeric_dtype(_df["direction"]):
+            _df["direction"] = _df["direction"].map({"up":1, "down":0, True:1, False:0})
+        _df["direction"] = pd.to_numeric(_df["direction"], errors="coerce").fillna(0.0)
+        _df["direction"] = (_df["direction"] > 0.5).astype("float32")
     except Exception:
-        base["direction"] = pd.to_numeric(base["direction"], errors="coerce")
-
+        _df["direction"] = pd.to_numeric(_df["direction"], errors="coerce").fillna(0.0)
+        _df["direction"] = (_df["direction"] > 0.5).astype("float32")
     # Determine per-asset cut time for last 10% (fixed TEST)
     test_cut_times = {}
     for asset, g in base.groupby(GROUP_ID[0], observed=True, sort=False):
