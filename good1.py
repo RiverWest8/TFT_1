@@ -60,6 +60,7 @@ BATCH_SIZE   = 128
 MAX_EPOCHS   = 35
 EARLY_STOP_PATIENCE = 30
 PERM_BLOCK_SIZE = 288
+APPLY_TEST_CAL = True
 
 # Extra belt-and-braces: swallow BrokenPipe errors on stdout.flush() if any other lib calls it.
 try:
@@ -110,6 +111,29 @@ def _permute_series_inplace(df: pd.DataFrame, col: str, block: int, group_col: s
             np.random.shuffle(vals)
             df.loc[idx, col] = vals
 
+def _id_to_name_from_dataset(ds):
+    """
+    Robustly recover asset label -> name mapping from a TimeSeriesDataSet.
+    Works across PF versions (NaNLabelEncoder with classes_ or mapping).
+    """
+    try:
+        if ds is None:
+            return {}
+        # group_ids may be ['asset'] or a single string
+        gid = ds.group_ids[0] if isinstance(ds.group_ids, (list, tuple)) else ds.group_ids
+        enc = ds.categorical_encoders.get(gid, None)
+        if enc is None:
+            return {}
+        # PF NaNLabelEncoder variants
+        if hasattr(enc, "classes_") and enc.classes_ is not None:
+            return {int(i): str(name) for i, name in enumerate(list(enc.classes_))}
+        # Older mapping dict: name -> int (make inverse)
+        if hasattr(enc, "mapping") and isinstance(enc.mapping, dict):
+            inv = {int(v): str(k) for k, v in enc.mapping.items()}
+            return inv
+    except Exception:
+        pass
+    return {}
 
 # helper (put once near the top of the file, or inline if you prefer)
 def _first_not_none(d, keys):
@@ -446,7 +470,18 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     best_model.eval().to(trainer.lightning_module.device) 
 
     # 3) id->name map from PerAssetMetrics if available
+    # 3) id->name map from PerAssetMetrics if available; else from dataset encoder
     metrics_cb = None
+    for cb in getattr(trainer, "callbacks", []):
+        if isinstance(cb, PerAssetMetrics):
+            metrics_cb = cb
+            break
+
+    if metrics_cb is not None and getattr(metrics_cb, "id_to_name", None):
+        id_to_name = {int(k): str(v) for k, v in metrics_cb.id_to_name.items()}
+    else:
+        # fallback: read from dataloader.dataset encoder
+        id_to_name = _id_to_name_from_dataset(getattr(dataloader, "dataset", None))
     # NEW: always pick last.ckpt instead of best
     last_ckpt_path = LOCAL_CKPT_DIR / "last.ckpt"
     if os.path.exists(last_ckpt_path):
@@ -783,22 +818,30 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     except Exception:
         pass
 
-    # Try to attach actual 'Time' if a compatible source df is cached
+    # Try to attach actual 'Time' using (a) global df if present, else (b) dataset.data
     try:
+        # (a) prefer existing globals if available
         split_l = str(split).lower()
-        if split_l == "val":
-            cand_names = ["val_df", "raw_df", "full_df", "df"]
-        elif split_l == "test":
-            cand_names = ["test_df", "raw_df", "full_df", "df"]
-        else:
-            cand_names = ["raw_df", "full_df", "df"]
         src = None
-        for nm in cand_names:
-            obj = globals().get(nm)
-            if isinstance(obj, pd.DataFrame) and {"asset","time_idx","Time"}.issubset(obj.columns):
-                src = obj[["asset","time_idx","Time"]].copy()
-                break
+        if split_l == "val" and "val_df" in globals() and isinstance(val_df, pd.DataFrame):
+            cand = val_df
+        elif split_l == "test" and "test_df" in globals() and isinstance(test_df, pd.DataFrame):
+            cand = test_df
+        else:
+            cand = None
+
+        if cand is not None and {"asset","time_idx","Time"}.issubset(cand.columns):
+            src = cand[["asset","time_idx","Time"]].copy()
+        else:
+            # (b) fall back to the dataset’s internal dataframe
+            ds = getattr(dataloader, "dataset", None)
+            if ds is not None:
+                df_raw = getattr(ds, "data", None) or getattr(ds, "dataframe", None)
+                if isinstance(df_raw, pd.DataFrame) and {"asset","time_idx","Time"}.issubset(df_raw.columns):
+                    src = df_raw[["asset","time_idx","Time"]].drop_duplicates().copy()
+
         if src is not None:
+            # harmonise dtypes and merge
             src["asset"] = src["asset"].astype(str)
             src["time_idx"] = pd.to_numeric(src["time_idx"], errors="coerce").astype("Int64").astype("int64")
             df["asset"] = df["asset"].astype(str)
@@ -809,6 +852,8 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
                 df["Time"] = df["Time"].dt.tz_localize(None)
             except Exception:
                 pass
+        else:
+            print("[WARN] No source with ['asset','time_idx','Time'] found; saving without Time column.")
     except Exception as e:
         print(f"[WARN] Could not attach Time column: {e}")
 
@@ -1092,6 +1137,8 @@ def _apply_rolling_piecewise_calibration(df: pd.DataFrame,
     Columns expected: asset, time_idx or Time, y_vol, y_vol_pred, (optional) y_vol_pred_q05/q95.
     Returns a copy with y_vol_pred, q05, q95 scaled by a past-window piecewise calibrator.
     """
+    print(f"[ROLLING CAL] Applying t-1 calibration with window={window}, min_points={min_points}, ramp_up={ramp_up}")
+    
     if not {"asset", "y_vol", "y_vol_pred"}.issubset(df.columns):
         return df
 
