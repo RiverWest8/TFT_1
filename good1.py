@@ -2608,7 +2608,7 @@ VOL_LOSS = AsymmetricQuantileLoss(
     tail_q=0.85,
     tail_weight=1.0,              # will be ramped by TailWeightRamp
     qlike_weight=0.0,
-    weight_power = 0.75             # QLIKE weight is ramped safely in BiasWarmupCallback
+    weight_power = 0.75,             # QLIKE weight is ramped safely in BiasWarmupCallback
     reduction="mean",
 )
 # ---------------- Callback bundle (bias warm-up, tail ramp, LR control) ----------------
