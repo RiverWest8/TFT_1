@@ -2111,9 +2111,9 @@ def gcs_exists(path: str) -> bool:
     except Exception:
         return False
 
-TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train.parquet"
-VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val.parquet"
-TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test.parquet"
+TRAIN_URI = f"{GCS_DATA_PREFIX}/universal_train_trunc.parquet"
+VAL_URI   = f"{GCS_DATA_PREFIX}/universal_val_trunc.parquet"
+TEST_URI  = f"{GCS_DATA_PREFIX}/universal_test_trunc.parquet"
 
 # Resolve data paths: prefer explicit --data_dir, then GCS if available, else local default
 def _local_cleaned_dir():
@@ -2121,9 +2121,9 @@ def _local_cleaned_dir():
         return Path(ARGS.data_dir).expanduser().resolve()
     return Path("/Users/riverwest-gomila/Desktop/Data/CleanedData")
 
-LOCAL_TRAIN = _local_cleaned_dir() / "universal_train.parquet"
-LOCAL_VAL   = _local_cleaned_dir() / "universal_val.parquet"
-LOCAL_TEST  = _local_cleaned_dir() / "universal_test.parquet"
+LOCAL_TRAIN = _local_cleaned_dir() / "universal_train_trunc.parquet"
+LOCAL_VAL   = _local_cleaned_dir() / "universal_val_trunc.parquet"
+LOCAL_TEST  = _local_cleaned_dir() / "universal_test_trunc.parquet"
 
 def _all_exists_local(paths):
     try:
@@ -3881,14 +3881,3 @@ try:
 except Exception as e:
     print(f"[WARN] Export failed: {e}")
 
-
-# --- Unified TEST export to match validation schema ---
-try:
-    test_pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
-    _export_split_from_best(trainer, test_dataloader, "test", test_pred_path)
-    try:
-        upload_file_to_gcs(str(test_pred_path), f"{GCS_OUTPUT_PREFIX}/{test_pred_path.name}")
-    except Exception as e:
-        print(f"[WARN] Could not upload TEST parquet: {e}")
-except Exception as e:
-    print(f"[WARN] Export failed: {e}")
