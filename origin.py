@@ -1,3 +1,5 @@
+from __future__ import annotations
+from typing import List, Tuple, Optional
 
 
 """
@@ -49,8 +51,7 @@ import json
 import numpy as np
 import pandas as pd
 import math
-import pandas as _pd
-pd = _pd  # Ensure pd always refers to pandas module
+from typing import List, Tuple, Optional
 import lightning.pytorch as pl
 
 
@@ -92,7 +93,7 @@ from torchmetrics.classification import BinaryAUROC
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-def _permute_series_inplace(df: pd.DataFrame, col: str, block: int, group_col: str = "asset") -> None:
+def _permute_series_inplace(df: "pd.DataFrame", col: str, block: int, group_col: str = "asset") -> None:
     if col not in df.columns:
         return
     if group_col not in df.columns:
@@ -683,7 +684,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, cal
 
 # ----------------------- Small dataloader helper for exports -----------------------
 # ---- Helper: robust numeric feature selector (ignores categoricals/datetimes) ----
-def _numeric_feature_columns(df: pd.DataFrame, exclude: set[str]):
+def _numeric_feature_columns(df: "pd.DataFrame", exclude: set[str]):
     from pandas.api.types import is_numeric_dtype
     cols = []
     for c in df.columns:
@@ -698,8 +699,9 @@ def _numeric_feature_columns(df: pd.DataFrame, exclude: set[str]):
     return cols
 
 @torch.no_grad()
-def _make_ds_and_loader(df: pd.DataFrame, max_encoder_length: int, max_prediction_length: int,
+def _make_ds_and_loader(df: "pd.DataFrame", max_encoder_length: int, max_prediction_length: int,
                         batch_size: int, shuffle: bool = False):
+
     """Build a minimal TimeSeriesDataSet & DataLoader for a given split dataframe."""
     # Ensure time_idx exists and is sorted per asset
     if "time_idx" not in df.columns:
@@ -2091,7 +2093,7 @@ def get_resume_ckpt_path(args=None):
         pass
 
     # ---- helpers for GCS pulling ----
-    def _pull_gcs_to_local(gcs_uri: str, local_name: str = "last.ckpt") -> str | None:
+    def _pull_gcs_to_local(gcs_uri: str, local_name: str = "last.ckpt") -> Optional[str]:
         """Copy a single ckpt from GCS to LOCAL_CKPT_DIR/local_name and return its path."""
         try:
             import fsspec, shutil
@@ -2106,7 +2108,7 @@ def get_resume_ckpt_path(args=None):
         except Exception:
             return None
 
-    def _list_gcs_ckpts(prefix: str) -> list[tuple[str, float]]:
+    def _list_gcs_ckpts(prefix: str) -> List[Tuple[str, float]]:
         """
         List *.ckpt under a GCS prefix. Returns list of (uri, mtime) sorted by mtime desc.
         """
@@ -2636,14 +2638,16 @@ RESUME_ENABLED = bool(getattr(ARGS, "resume", True))
 RESUME_CKPT = get_resume_ckpt_path() if RESUME_ENABLED else None
 
 # ----------------------- Rolling-origin helpers -----------------------
-def generate_rolling_folds(df: pd.DataFrame,
-                           time_col: str = "Time",
-                           start_date: str | None = None,
-                           min_train_days: int = 365,
-                           val_days: int = 90,
-                           step_days: int = 90,
-                           max_folds: int = 8,
-                           hard_val_end: pd.Timestamp | None = None):
+def generate_rolling_folds(
+    df: "pd.DataFrame",
+    time_col: str = "Time",
+    start_date: Optional[str] = None,
+    min_train_days: int = 365,
+    val_days: int = 90,
+    step_days: int = 90,
+    max_folds: int = 8,
+    hard_val_end: Optional["pd.Timestamp"] = None,
+):
     """
     Yields fold dicts with boolean masks for train/val on `df` while keeping any
     future portion (e.g., the held-out test 10%) untouched. If `hard_val_end` is
@@ -2730,14 +2734,14 @@ def generate_rolling_folds(df: pd.DataFrame,
             break
         origin = origin + pd.Timedelta(days=int(step_days))
 
-def _ensure_time_idx(df: pd.DataFrame) -> pd.DataFrame:
+def _ensure_time_idx(df: "pd.DataFrame") -> "pd.DataFrame":
     return add_time_idx(df) if "time_idx" not in df.columns else df
 # -----------------------------------------------------------------------
 # Utility functions
 # -----------------------------------------------------------------------
 
 
-def load_split(path: str) -> pd.DataFrame:
+def load_split(path: str) -> "pd.DataFrame":
     """
     Load a parquet split and guarantee we have usable `id` and timestamp columns.
 
@@ -2786,7 +2790,7 @@ def load_split(path: str) -> pd.DataFrame:
     return df
 
 
-def add_time_idx(df: pd.DataFrame) -> pd.DataFrame:
+def add_time_idx(df: "pd.DataFrame") -> "pd.DataFrame":
     """Add monotonically increasing integer time index per asset."""
     df = df.sort_values(GROUP_ID + [TIME_COL])
     df["time_idx"] = (
@@ -2799,7 +2803,7 @@ def add_time_idx(df: pd.DataFrame) -> pd.DataFrame:
 # -----------------------------------------------------------------------
 # Split sanity: enforce chronological, non-overlapping 80/10/10 per asset
 # -----------------------------------------------------------------------
-def _chronological_resplit(df: pd.DataFrame, train_frac: float = 0.8, val_frac: float = 0.1):
+def _chronological_resplit(df: "pd.DataFrame", train_frac: float = 0.8, val_frac: float = 0.1):
     """
     Deterministically re-split a combined dataframe into train/val/test by time,
     per asset, using the provided fractions (train, val, test = rest).
@@ -2827,7 +2831,7 @@ def _chronological_resplit(df: pd.DataFrame, train_frac: float = 0.8, val_frac: 
     return train_df, val_df, test_df
 
 
-def assert_and_fix_splits(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame):
+def assert_and_fix_splits(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df: "pd.DataFrame"):
     """
     Ensure each split is chronologically sorted per asset and there is no time overlap:
       max(train) < min(val) and max(val) < min(test), per asset.
@@ -2878,7 +2882,7 @@ def assert_and_fix_splits(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df:
     return train_df, val_df, test_df
 
 
-def _build_datasets_for_split(train_df: pd.DataFrame, val_df: pd.DataFrame,
+def _build_datasets_for_split(train_df: "pd.DataFrame", val_df: "pd.DataFrame",
                               max_encoder_length: int, max_prediction_length: int):
     train_df = _ensure_time_idx(train_df.sort_values(GROUP_ID + [TIME_COL]).copy())
     val_df   = _ensure_time_idx(val_df.sort_values(GROUP_ID + [TIME_COL]).copy())
@@ -3022,16 +3026,46 @@ def _train_single_fold(train_df: pd.DataFrame, val_df: pd.DataFrame, fold_id: in
         "val_comp": float(trainer.callback_metrics.get("val_comp_overall", float("nan"))),
     }
 
-def run_rolling_origin(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd.DataFrame, uni_df: pd.DataFrame | None):
+def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df: "pd.DataFrame", uni_df: Optional["pd.DataFrame"]):
     """
     Keep the final 10% chronologically as the held-out test.
-    Perform walk-forward inside the remaining 90% using folds generated on the combined (train+val)
-    or the universal dataset when available.
+    Perform walk-forward inside the remaining 90% using folds generated from the universal dataset.
     """
-    base = uni_df.copy() if (uni_df is not None and not uni_df.empty) else pd.concat([train_df.copy(), val_df.copy()], axis=0, ignore_index=True)
+    # --- Always use canonical universal dataset for rolling ---
+    if uni_df is None or uni_df.empty:
+        raise ValueError("Rolling-origin requires universal_data.parquet; uni_df is empty or None.")
+    base = uni_df.copy()
     base = base.sort_values([GROUP_ID[0], TIME_COL])
 
-    # Determine per-asset cut time for last 10%
+    # Timezone-normalise and enforce target presence/dtypes
+    try:
+        if TIME_COL in base.columns:
+            base[TIME_COL] = pd.to_datetime(base[TIME_COL], errors="coerce")
+            try:
+                base[TIME_COL] = base[TIME_COL].dt.tz_localize(None)
+            except Exception:
+                pass
+    except Exception as _e_tz:
+        print(f"[WARN] Could not normalise timezone info (universal): {_e_tz}")
+
+    for tcol in ("realised_vol", "direction"):
+        if tcol not in base.columns:
+            raise ValueError(f"Required target column '{tcol}' missing from universal_data.parquet")
+
+    # Coerce targets to numeric (direction to {0,1})
+    try:
+        base["realised_vol"] = pd.to_numeric(base["realised_vol"], errors="coerce")
+    except Exception:
+        pass
+    try:
+        if not pd.api.types.is_numeric_dtype(base["direction"]):
+            base["direction"] = base["direction"].map({"up":1, "down":0, True:1, False:0}).astype("Int64").astype("float32")
+        else:
+            base["direction"] = pd.to_numeric(base["direction"], errors="coerce")
+    except Exception:
+        base["direction"] = pd.to_numeric(base["direction"], errors="coerce")
+
+    # Determine per-asset cut time for last 10% (fixed TEST)
     test_cut_times = {}
     for asset, g in base.groupby(GROUP_ID[0], observed=True, sort=False):
         if len(g) < 10:
@@ -3048,9 +3082,24 @@ def run_rolling_origin(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd
     pre_df = pd.concat(pre_list, axis=0, ignore_index=True)
     fixed_test_df = pd.concat(test_list, axis=0, ignore_index=True)
 
-    # Prefer explicit TEST split if present
-    if test_df is not None and not test_df.empty:
-        fixed_test_df = test_df.sort_values([GROUP_ID[0], TIME_COL]).copy()
+    # Safety: ensure targets present & numeric in both pre_df and fixed_test_df
+    for _df in (pre_df, fixed_test_df):
+        for tcol in ("realised_vol", "direction"):
+            if tcol not in _df.columns:
+                _df[tcol] = np.nan
+        try:
+            _df["realised_vol"] = pd.to_numeric(_df["realised_vol"], errors="coerce")
+        except Exception:
+            pass
+        try:
+            if not pd.api.types.is_numeric_dtype(_df["direction"]):
+                _df["direction"] = _df["direction"].map({"up":1, "down":0, True:1, False:0})
+            _df["direction"] = pd.to_numeric(_df["direction"], errors="coerce")
+        except Exception:
+            _df["direction"] = pd.to_numeric(_df["direction"], errors="coerce")
+
+    # Generate folds within pre-test region only
+    hard_end = pre_df[TIME_COL].max()
 
     # Generate folds within pre-test region only
     hard_end = pre_df[TIME_COL].max()
@@ -3497,23 +3546,44 @@ def _resolve_best_model(trainer, fallback):
     return fallback
 
 def load_all_splits_for_training():
-    """Load train, val, test, and universal splits from GCS/local parquet files."""
+    """Load train, val, test, and universal datasets. If universal_data.parquet exists,
+    return it as uni_df so rolling-origin can operate from a single canonical table.
+    """
     import pandas as pd
+    import os
 
-    # Resolve data prefix
-    data_prefix = ARGS.gcs_data_prefix or ARGS.data_dir
+    data_prefix = ARGS.gcs_data_prefix or getattr(ARGS, "data_dir", None)
     if data_prefix is None:
         raise ValueError("Must specify --gcs_data_prefix or --data_dir")
 
-    def _read(name):
-        path = os.path.join(data_prefix, f"{name}.parquet")
+    def _read(rel):
+        path = os.path.join(data_prefix, rel)
         print(f"Loading {path} ...")
         return pd.read_parquet(path)
 
-    train_df = _read("universal_train")
-    val_df   = _read("universal_val")
-    test_df  = _read("universal_test")
-    uni_df   = None  # unless you have a universal parquet
+    # Try to load the canonical universal file; tolerate absence
+    uni_df = None
+    try:
+        uni_df = _read("universal_data.parquet")
+    except Exception as _e_universal:
+        print(f"[WARN] universal_data.parquet not found or unreadable: {_e_universal}")
+
+    # Load legacy split files too (kept for backward-compatibility / other modes)
+    train_df = None
+    val_df = None
+    test_df = None
+    try:
+        train_df = _read("universal_train.parquet")
+    except Exception:
+        pass
+    try:
+        val_df = _read("universal_val.parquet")
+    except Exception:
+        pass
+    try:
+        test_df = _read("universal_test.parquet")
+    except Exception:
+        pass
 
     return train_df, val_df, test_df, uni_df
 
@@ -3677,7 +3747,7 @@ if __name__ == "__main__":
 
     time_varying_unknown_reals = [
         c for c in all_numeric
-        if c not in (calendar_cols + ["Is_Weekend"]) and c not in drop_features
+        if c not in (calendar_cols + ["Is_Weekend"] + required_targets) and c not in drop_features
     ]
 
 
