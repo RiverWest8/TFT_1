@@ -58,7 +58,7 @@ import lightning.pytorch as pl
 
 BATCH_SIZE   = 128
 MAX_EPOCHS   = 35
-EARLY_STOP_PATIENCE = 15
+EARLY_STOP_PATIENCE = 30
 PERM_BLOCK_SIZE = 288
 
 # Extra belt-and-braces: swallow BrokenPipe errors on stdout.flush() if any other lib calls it.
@@ -443,7 +443,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     # 2) Recreate model from best ckpt on current device
     LM = type(trainer.lightning_module)
     best_model = LM.load_from_checkpoint(best_ckpt)
-    best_model.eval().to(trainer.lightning_module.device)
+    best_model.eval().to(trainer.lightning_module.device) 
 
     # 3) id->name map from PerAssetMetrics if available
     metrics_cb = None
@@ -2713,7 +2713,7 @@ EMBEDDING_CARDINALITY = {}
 
 BATCH_SIZE   = 128
 MAX_EPOCHS   = 35
-EARLY_STOP_PATIENCE = 15
+EARLY_STOP_PATIENCE = 30
 PERM_BLOCK_SIZE = 288
 
 # Artifacts are written locally then uploaded to GCS
