@@ -3394,6 +3394,26 @@ def _resolve_best_model(trainer, fallback):
             print(f"[WARN] load_from_checkpoint failed: {e}")
     return fallback
 
+def load_all_splits_for_training():
+    """Load train, val, test, and universal splits from GCS/local parquet files."""
+    import pandas as pd
+
+    # Resolve data prefix
+    data_prefix = ARGS.gcs_data_prefix or ARGS.data_dir
+    if data_prefix is None:
+        raise ValueError("Must specify --gcs_data_prefix or --data_dir")
+
+    def _read(name):
+        path = os.path.join(data_prefix, f"{name}.parquet")
+        print(f"Loading {path} ...")
+        return pd.read_parquet(path)
+
+    train_df = _read("universal_train_trunc")
+    val_df   = _read("universal_val")
+    test_df  = _read("universal_test")
+    uni_df   = None  # unless you have a universal parquet
+
+    return train_df, val_df, test_df, uni_df
 # -----------------------------------------------------------------------
 if __name__ == "__main__":
 
