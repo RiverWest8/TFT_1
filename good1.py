@@ -167,11 +167,7 @@ Q95_IDX = VOL_QUANTILES.index(0.95)
 EVAL_VOL_FLOOR = 1e-8
 
 # Composite metric weights (override via --metric_weights "w_mae,w_rmse,w_qlike")
-
 COMP_WEIGHTS = (1.0, 1.0, 0.004)  # default: slightly emphasise QLIKE for RV focus
-
-# Toggle applying validation calibrator on TEST parquet export (default: OFF)
-APPLY_TEST_CAL = False
 
 def composite_score(mae, rmse, qlike,
                     b_mae=None, b_rmse=None, b_qlike=None,
@@ -420,60 +416,65 @@ def _extract_vol_quantiles(pred):
 def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     """
     Minimal, self-contained export that is robust to various PF/Lightning return layouts:
-      • Loads the last checkpoint (last.ckpt) if available
+      • Loads the best checkpoint
       • Predicts in raw mode and iterates per-batch
       • Extracts groups/time/targets from each batch dict
       • Decodes realised_vol using the TRAIN normalizer
       • Writes a harmonised parquet with columns: asset, time_idx, y_vol, y_vol_pred, y_dir_prob (optional)
     """
-    # 1) Choose checkpoint: prefer last.ckpt, else most-recent .ckpt
-    ckpt_path = None
-    try:
-        last_ckpt_path = LOCAL_CKPT_DIR / "last.ckpt"
-    except Exception:
-        last_ckpt_path = None
-
-    if last_ckpt_path is not None and os.path.exists(last_ckpt_path):
-        ckpt_path = str(last_ckpt_path)
-    else:
+    # 1) Find best checkpoint
+    best_ckpt = None
+    for cb in getattr(trainer, "callbacks", []):
+        if isinstance(cb, pl.callbacks.ModelCheckpoint):
+            if getattr(cb, "best_model_path", None):
+                if cb.best_model_path and os.path.exists(cb.best_model_path):
+                    best_ckpt = cb.best_model_path
+                    break
+    if best_ckpt is None:
         try:
             cks = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
             if cks:
-                ckpt_path = str(cks[0])
+                best_ckpt = str(cks[0])
         except Exception:
-            ckpt_path = None
-    if ckpt_path is None:
-        raise RuntimeError("No checkpoint found for export (expected last.ckpt or any .ckpt).")
+            pass
+    if best_ckpt is None:
+        raise RuntimeError("Best checkpoint not found for export.")
 
-    # 2) Recreate model from chosen ckpt on current device
+    # 2) Recreate model from best ckpt on current device
     LM = type(trainer.lightning_module)
-    best_model = LM.load_from_checkpoint(ckpt_path)
-    best_model.eval().to(trainer.lightning_module.device)
+    best_model = LM.load_from_checkpoint(best_ckpt)
+    best_model.eval().to(trainer.lightning_module.device) 
 
     # 3) id->name map from PerAssetMetrics if available
     metrics_cb = None
-    for cb in getattr(trainer, "callbacks", []):
-        if isinstance(cb, PerAssetMetrics):
-            metrics_cb = cb
-            break
-    id_to_name = {int(k): str(v) for k, v in getattr(metrics_cb, "id_to_name", {}).items()} if metrics_cb else {}
+    # NEW: always pick last.ckpt instead of best
+    last_ckpt_path = LOCAL_CKPT_DIR / "last.ckpt"
+    if os.path.exists(last_ckpt_path):
+        best_ckpt = str(last_ckpt_path)   # 👈 force use last
+    else:
+        # fallback: still try to pick the most recent .ckpt
+        try:
+            cks = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if cks:
+                best_ckpt = str(cks[0])
+        except Exception:
+            best_ckpt = None
+    id_to_name = None
+    if metrics_cb is not None:
+        id_to_name = {int(k): str(v) for k, v in metrics_cb.id_to_name.items()}
+    else:
+        # fallback: identity mapping added later if needed
+        id_to_name = {}
 
-    
-    # Prefer TRAIN-Q2 calibrator for TEST (when enabled), else fallback to VAL
+    # Try to load calibrator saved from validation (optional)
     calibrator = None
     try:
-        if str(split).lower() == "test" and globals().get("APPLY_TEST_CAL", False):
-            _train_cal_path = _train_q2_calibrator_json_path()
-            if os.path.exists(_train_cal_path):
-                with open(_train_cal_path, "r") as f:
-                    calibrator = json.load(f)
-        if calibrator is None:
-            _cal_path = _calibrator_json_path()
-            if os.path.exists(_cal_path):
-                with open(_cal_path, "r") as f:
-                    calibrator = json.load(f)
+        _cal_path = _calibrator_json_path()
+        if os.path.exists(_cal_path):
+            with open(_cal_path, "r") as f:
+                calibrator = json.load(f)
     except Exception as e:
-        print(f"[WARN] Could not load/build calibrator: {e}")
+        print(f"[WARN] Could not load calibrator: {e}")
 
     # 4) Resolve TRAIN normalizer for decoding realised_vol
     vol_norm = None
@@ -486,34 +487,6 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             vol_norm = _extract_norm_from_dataset(getattr(dataloader, "dataset", None))
         except Exception:
             vol_norm = None
-
-    # >>> INSERT THE LAZY TRAIN-Q2 CALIBRATOR BUILD BLOCK HERE <<<
-    # If TEST+enabled and no calibrator yet, lazily build TRAIN-Q2 now and persist
-    try:
-        if calibrator is None and str(split).lower() == "test" and globals().get("APPLY_TEST_CAL", False):
-            # resolve id_to_name from PerAssetMetrics if available
-            metrics_cb = None
-            for cb in getattr(trainer, "callbacks", []):
-                if isinstance(cb, PerAssetMetrics):
-                    metrics_cb = cb
-                    break
-            id_to_name = {int(k): str(v) for k, v in getattr(metrics_cb, "id_to_name", {}).items()} if metrics_cb else {}
-            td = globals().get("train_dataloader", None)
-            if td is not None and vol_norm is not None:
-                print("[CAL] Building TRAIN-Q2 calibrator on-the-fly for TEST …")
-                calib_built = _build_train_q2_calibrator_inline(best_model, td, vol_norm, id_to_name)
-                if isinstance(calib_built, dict) and calib_built:
-                    calibrator = calib_built
-                    _train_cal_path = _train_q2_calibrator_json_path()
-                    try:
-                        with open(_train_cal_path, "w") as f:
-                            json.dump(calibrator, f, indent=2)
-                        print(f"✓ Saved TRAIN-Q2 calibrator → {_train_cal_path}")
-                    except Exception as _e:
-                        print(f"[WARN] Could not persist TRAIN-Q2 calibrator: {_e}")
-    except Exception as _e:
-        print(f"[WARN] Deferred TRAIN-Q2 calibrator build skipped: {_e}")
-
 
     # 5) Predict in raw mode; handle multiple return layouts
     _pred_out = best_model.predict(dataloader, mode="raw", return_x=True)
@@ -647,7 +620,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
 
         # TEST-only: apply piecewise validation calibrator to decoded predictions
         try:
-            if calibrator is not None and str(split).lower() == "test" and globals().get("APPLY_TEST_CAL", False):
+            if calibrator is not None and str(split).lower() == "test":
                 if y_q50 is not None:
                     y_q50 = apply_piecewise_calibrator_on_preds(y_q50, calibrator)
                 if y_q05 is not None:
@@ -1003,12 +976,6 @@ def _calibrator_json_path() -> Path:
         return LOCAL_RUN_DIR / f"tft_val_calibrator_e{MAX_EPOCHS}_{RUN_SUFFIX}.json"
     except Exception:
         return LOCAL_RUN_DIR / "tft_val_calibrator.json"
-    
-def _train_q2_calibrator_json_path() -> Path:
-    try:
-        return LOCAL_RUN_DIR / f"tft_trainQ2_calibrator_e{MAX_EPOCHS}_{RUN_SUFFIX}.json"
-    except Exception:
-        return LOCAL_RUN_DIR / "tft_trainQ2_calibrator.json"
 
 @torch.no_grad()
 def fit_piecewise_calibrator_from_val(y_true_dec: torch.Tensor, y_pred_dec: torch.Tensor) -> dict:
@@ -1064,124 +1031,6 @@ def apply_piecewise_calibrator_on_preds(y_pred_dec: torch.Tensor, calibrator: di
     except Exception:
         return y_pred_dec
 
-@torch.no_grad()
-def _build_train_q2_calibrator_inline(model, dl, vol_norm, id_to_name) -> dict | None:
-    """
-    Build a multiplicative piecewise calibrator from TRAIN Q2 (25–50%) regime, per asset.
-    Selection is done on decoded realised_vol; fitting uses the existing
-    fit_piecewise_calibrator_from_val() so the method stays identical.
-    """
-    try:
-        if dl is None or model is None or vol_norm is None:
-            return None
-
-        # Run prediction with return_x so we can get decoder_target
-        out = model.predict(dl, mode="raw", return_x=True)
-        if isinstance(out, (list, tuple)):
-            raw_preds = out[0] if len(out) >= 1 else None
-            raw_x     = out[1] if len(out) >= 2 else None
-        elif isinstance(out, dict):
-            raw_preds = out.get("prediction", out.get("predictions", out))
-            raw_x     = out.get("x", None)
-        else:
-            raw_preds = out
-            raw_x     = None
-        if raw_preds is None:
-            return None
-
-        def _to_list(obj):
-            if isinstance(obj, (list, tuple)):
-                return list(obj)
-            return [obj]
-
-        preds_list = _to_list(raw_preds)
-        x_list = _to_list(raw_x)
-        if len(preds_list) == 1 and isinstance(preds_list[0], (dict, torch.Tensor)) and len(x_list) > 1:
-            preds_list = preds_list * len(x_list)
-
-        assets_all, y_dec_all, p_dec_all = [], [], []
-        for pred_b, xb in zip(preds_list, x_list):
-            # resolve x dict
-            x = xb if isinstance(xb, dict) else (xb[0] if isinstance(xb, (list, tuple)) and xb and isinstance(xb[0], dict) else None)
-            if x is None:
-                continue
-
-            # groups (asset ids)
-            g = None
-            for k in ("groups", "group_ids", "group_id"):
-                if k in x and x[k] is not None:
-                    g = x[k]; break
-            if g is None:
-                continue
-            if isinstance(g, (list, tuple)) and len(g) > 0:
-                g = g[0]
-            while torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
-                g = g.squeeze(-1)
-            if not torch.is_tensor(g):
-                continue
-            L = g.shape[0]
-
-            # model output for this batch
-            pred_t = pred_b["prediction"] if isinstance(pred_b, dict) and "prediction" in pred_b else pred_b
-            if pred_t is None:
-                continue
-
-            # median head (encoded)
-            p_vol_enc, _ = _extract_heads(pred_t)
-            if p_vol_enc is None:
-                continue
-            p_vol_enc = p_vol_enc.reshape(-1)[:L]
-
-            # target (encoded) from decoder_target
-            dec_t = x.get("decoder_target", None)
-            yv_enc = None
-            if torch.is_tensor(dec_t):
-                ytmp = dec_t
-                if ytmp.ndim == 3 and ytmp.size(1) == 1:
-                    ytmp = ytmp[:, 0, :]
-                if ytmp.ndim == 3 and ytmp.size(-1) == 1:
-                    ytmp = ytmp[..., 0]
-                if ytmp.ndim == 2 and ytmp.size(1) >= 1:
-                    yv_enc = ytmp[:, 0]
-                elif ytmp.ndim == 1:
-                    yv_enc = ytmp
-            if yv_enc is None:
-                continue  # cannot fit calibrator without y
-
-            # decode to physical
-            y_dec = safe_decode_vol(yv_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
-            p_dec = safe_decode_vol(p_vol_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
-            floor_val = float(globals().get("EVAL_VOL_FLOOR", 1e-8))
-            y_dec = torch.clamp(y_dec, min=floor_val)
-            p_dec = torch.clamp(p_dec, min=floor_val)
-
-            # map ids → names
-            aset = [id_to_name.get(int(i), str(int(i))) for i in g.detach().cpu().tolist()]
-            assets_all.extend(aset)
-            y_dec_all.extend(y_dec.detach().cpu().tolist())
-            p_dec_all.extend(p_dec.detach().cpu().tolist())
-
-        if not assets_all:
-            return None
-
-        # Per-asset Q2 selection (25–50%) based on realised_vol (decoded)
-        df = pd.DataFrame({"asset": assets_all, "y": y_dec_all, "p": p_dec_all})
-        qtbl = df.groupby("asset", sort=False)["y"].quantile([0.25, 0.50]).unstack()
-        qtbl.columns = ["q25", "q50"]
-        df = df.merge(qtbl, on="asset", how="left")
-        mask = (df["y"] >= df["q25"]) & (df["y"] <= df["q50"])
-        sub = df.loc[mask & df["y"].notna() & df["p"].notna()]
-        if sub.empty:
-            return None
-
-        y_sel = torch.tensor(sub["y"].values, dtype=torch.float32)
-        p_sel = torch.tensor(sub["p"].values, dtype=torch.float32)
-        calib = fit_piecewise_calibrator_from_val(y_sel, p_sel)
-        return calib if isinstance(calib, dict) and calib else None
-    except Exception as e:
-        print(f"[WARN] TRAIN-Q2 calibrator build failed: {e}")
-        return None
-    
 from pytorch_forecasting.metrics import QuantileLoss, MultiLoss
 
 class LabelSmoothedBCE(nn.Module):
@@ -2766,9 +2615,9 @@ VOL_LOSS = AsymmetricQuantileLoss(
     underestimation_factor=1.00,  # managed by BiasWarmupCallback
     mean_bias_weight=0.01,        # small centering on the median for MAE
     tail_q=0.85,
-    tail_weight=1.2,              # will be ramped by TailWeightRamp
+    tail_weight=1.0,              # will be ramped by TailWeightRamp
     qlike_weight=0.0,
-    weight_power = 0.0,             # QLIKE weight is ramped safely in 
+    weight_power = 0.0,             # QLIKE weight is ramped safely in BiasWarmupCallback
     reduction="mean",
 )
 # ---------------- Callback bundle (bias warm-up, tail ramp, LR control) ----------------
@@ -2778,7 +2627,7 @@ EXTRA_CALLBACKS = [
           target_under=1.09,
           target_mean_bias=0.04,
           warmup_epochs=6,
-          qlike_target_weight=0.02,   # keep out of the loss; diagnostics only
+          qlike_target_weight=0.08,   # keep out of the loss; diagnostics only
           start_mean_bias=0.02,
           mean_bias_ramp_until=6,
           guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
@@ -2787,13 +2636,13 @@ EXTRA_CALLBACKS = [
       ),
       TailWeightRamp(
           vol_loss=VOL_LOSS,
-          start=1.2,
-          end=2,
+          start=1.0,
+          end=1.1,
           ramp_epochs=24,
           gate_by_calibration=True,
           gate_low=0.9,
           gate_high=1.1,
-          gate_patience= 1,
+          gate_patience=2,
       ),
       ReduceLROnPlateauCallback(
           monitor="val_composite_overall", factor=0.5, patience=6, min_lr=3e-5, cooldown=1, stop_after_epoch=8
