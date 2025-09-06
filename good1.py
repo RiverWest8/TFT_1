@@ -1116,6 +1116,7 @@ class AsymmetricQuantileLoss(QuantileLoss):
         self.eps = float(eps)
         self.med_clip = float(med_clip)
         self.log_ratio_clip = float(log_ratio_clip)
+        self.weight_power = float(kwargs.pop("weight_power", 0.0))  
 
         try:
             self._q50_idx = self.quantiles.index(0.5)
@@ -1150,7 +1151,16 @@ class AsymmetricQuantileLoss(QuantileLoss):
         return loss
 
     def forward(self, y_pred, target):
-        base = self.loss_per_prediction(y_pred, target).mean()
+        base_loss = self.loss_per_prediction(y_pred, target)
+
+        # ----- volatility-dependent weighting -----
+        if self.weight_power and self.weight_power > 0:
+            if isinstance(target, tuple):
+                target = target[0]
+            weights = target.abs().pow(self.weight_power).unsqueeze(-1)
+            base_loss = base_loss * weights
+
+        base = base_loss.mean()
 
         # ---- mean-bias regulariser on the median (q=0.5) ----
         if self.mean_bias_weight > 0:
@@ -2597,7 +2607,8 @@ VOL_LOSS = AsymmetricQuantileLoss(
     mean_bias_weight=0.01,        # small centering on the median for MAE
     tail_q=0.85,
     tail_weight=1.0,              # will be ramped by TailWeightRamp
-    qlike_weight=0.0,             # QLIKE weight is ramped safely in BiasWarmupCallback
+    qlike_weight=0.0,
+    weight_power = 0.75             # QLIKE weight is ramped safely in BiasWarmupCallback
     reduction="mean",
 )
 # ---------------- Callback bundle (bias warm-up, tail ramp, LR control) ----------------
