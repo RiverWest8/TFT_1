@@ -2684,6 +2684,7 @@ def generate_rolling_folds(df: pd.DataFrame,
         raise ValueError(f"'{time_col}' column required for rolling folds")
     t_min = _to_naive(df[time_col].min())
     t_max = _to_naive(df[time_col].max())
+    t = df[time_col]
     origin0 = pd.Timestamp(start_date) if start_date else t_min
     origin0 = _to_naive(origin0)   # <<< force tz-naive before comparisons
     if origin0 < t_min:
