@@ -447,10 +447,18 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
 
     # 3) id->name map from PerAssetMetrics if available
     metrics_cb = None
-    for cb in getattr(trainer, "callbacks", []):
-        if isinstance(cb, PerAssetMetrics):
-            metrics_cb = cb
-            break
+    # NEW: always pick last.ckpt instead of best
+    last_ckpt_path = LOCAL_CKPT_DIR / "last.ckpt"
+    if os.path.exists(last_ckpt_path):
+        best_ckpt = str(last_ckpt_path)   # 👈 force use last
+    else:
+        # fallback: still try to pick the most recent .ckpt
+        try:
+            cks = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if cks:
+                best_ckpt = str(cks[0])
+        except Exception:
+            best_ckpt = None
     id_to_name = None
     if metrics_cb is not None:
         id_to_name = {int(k): str(v) for k, v in metrics_cb.id_to_name.items()}
