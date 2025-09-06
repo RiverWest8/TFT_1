@@ -2634,6 +2634,32 @@ def generate_rolling_folds(df: pd.DataFrame,
     future portion (e.g., the held-out test 10%) untouched. If `hard_val_end` is
     provided, validation windows will not cross this timestamp.
     """
+    # --- TZ normalisation helpers (ensure tz-naive everywhere) ---
+    def _to_naive(ts):
+        if ts is None:
+            return None
+        try:
+            ts = pd.to_datetime(ts, errors="coerce")
+            try:
+                return ts.tz_localize(None)
+            except Exception:
+                return ts
+        except Exception:
+            return ts
+
+    # Coerce df time column and boundaries to tz-naive
+    df = df.copy()
+    if time_col in df.columns:
+        df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+        try:
+            df[time_col] = df[time_col].dt.tz_localize(None)
+        except Exception:
+            pass
+    if start_date is not None:
+        start_date = _to_naive(start_date)
+    if hard_val_end is not None:
+        hard_val_end = _to_naive(hard_val_end)
+
     # --- Normalise time column and start_date to tz-naive to prevent comparison errors ---
     df = df.copy()
     if time_col in df.columns:
@@ -2656,9 +2682,10 @@ def generate_rolling_folds(df: pd.DataFrame,
             print(f"[WARN] Could not parse/normalise start_date: {start_date} ({_e_sd})")
     if time_col not in df.columns:
         raise ValueError(f"'{time_col}' column required for rolling folds")
-    t = pd.to_datetime(df[time_col])
-    t_min, t_max = t.min(), t.max()
+    t_min = _to_naive(df[time_col].min())
+    t_max = _to_naive(df[time_col].max())
     origin0 = pd.Timestamp(start_date) if start_date else t_min
+    origin0 = _to_naive(origin0)   # <<< force tz-naive before comparisons
     if origin0 < t_min:
         origin0 = t_min
     origin = origin0 + pd.Timedelta(days=int(min_train_days))
