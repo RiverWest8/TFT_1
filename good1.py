@@ -426,49 +426,47 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
       • Decodes realised_vol using the TRAIN normalizer
       • Writes a harmonised parquet with columns: asset, time_idx, y_vol, y_vol_pred, y_dir_prob (optional)
     """
-    # 1) Find best checkpoint
-    best_ckpt = None
-    for cb in getattr(trainer, "callbacks", []):
-        if isinstance(cb, pl.callbacks.ModelCheckpoint):
-            if getattr(cb, "best_model_path", None):
-                if cb.best_model_path and os.path.exists(cb.best_model_path):
-                    best_ckpt = cb.best_model_path
-                    break
-    if best_ckpt is None:
+    # 1) Resolve checkpoint to use for EXPORT (prefer last.ckpt)
+    ckpt_for_export = None
+    try:
+        last_ckpt_path = LOCAL_CKPT_DIR / "last.ckpt"
+        if os.path.exists(last_ckpt_path):
+            ckpt_for_export = str(last_ckpt_path)
+    except Exception:
+        ckpt_for_export = None
+
+    # Fallbacks: use Lightning's best_model_path or most-recent .ckpt
+    if ckpt_for_export is None:
+        for cb in getattr(trainer, "callbacks", []):
+            if isinstance(cb, pl.callbacks.ModelCheckpoint):
+                if getattr(cb, "best_model_path", None):
+                    if cb.best_model_path and os.path.exists(cb.best_model_path):
+                        ckpt_for_export = cb.best_model_path
+                        break
+    if ckpt_for_export is None:
         try:
             cks = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
             if cks:
-                best_ckpt = str(cks[0])
+                ckpt_for_export = str(cks[0])
         except Exception:
             pass
-    if best_ckpt is None:
-        raise RuntimeError("Best checkpoint not found for export.")
+    if ckpt_for_export is None:
+        raise RuntimeError("Checkpoint not found for export.")
 
-    # 2) Recreate model from best ckpt on current device
+    print(f"Checkpoint for {split.upper()} export: {ckpt_for_export}")
+
+    # 2) Recreate model from chosen ckpt on current device
     LM = type(trainer.lightning_module)
-    best_model = LM.load_from_checkpoint(best_ckpt)
-    best_model.eval().to(trainer.lightning_module.device) 
+    best_model = LM.load_from_checkpoint(ckpt_for_export)
+    best_model.eval().to(trainer.lightning_module.device)
 
     # 3) id->name map from PerAssetMetrics if available
     metrics_cb = None
-    # NEW: always pick last.ckpt instead of best
-    last_ckpt_path = LOCAL_CKPT_DIR / "last.ckpt"
-    if os.path.exists(last_ckpt_path):
-        best_ckpt = str(last_ckpt_path)   # 👈 force use last
-    else:
-        # fallback: still try to pick the most recent .ckpt
-        try:
-            cks = sorted(LOCAL_CKPT_DIR.glob("*.ckpt"), key=lambda p: p.stat().st_mtime, reverse=True)
-            if cks:
-                best_ckpt = str(cks[0])
-        except Exception:
-            best_ckpt = None
-    id_to_name = None
-    if metrics_cb is not None:
-        id_to_name = {int(k): str(v) for k, v in metrics_cb.id_to_name.items()}
-    else:
-        # fallback: identity mapping added later if needed
-        id_to_name = {}
+    for cb in getattr(trainer, "callbacks", []):
+        if isinstance(cb, PerAssetMetrics):
+            metrics_cb = cb
+            break
+    id_to_name = {int(k): str(v) for k, v in getattr(metrics_cb, "id_to_name", {}).items()} if metrics_cb else {}
 
     
     # Prefer TRAIN-Q2 calibrator for TEST (when enabled), else fallback to VAL
@@ -1064,6 +1062,7 @@ def apply_piecewise_calibrator_on_preds(y_pred_dec: torch.Tensor, calibrator: di
     """Apply saved piecewise calibrator to a decoded prediction tensor."""
     if not isinstance(calibrator, dict) or y_pred_dec is None or not torch.is_tensor(y_pred_dec):
         return y_pred_dec
+    print("[CAL DEBUG] Applying calibrator:", calibrator)  
     t1 = float(calibrator.get("t1", float("nan")))
     t2 = float(calibrator.get("t2", float("nan")))
     s_low  = float(calibrator.get("s_low", 1.0))
@@ -1194,6 +1193,7 @@ def _build_train_q2_calibrator_inline(model, dl, vol_norm, id_to_name) -> dict |
         y_sel = torch.tensor(sub["y"].values, dtype=torch.float32)
         p_sel = torch.tensor(sub["p"].values, dtype=torch.float32)
         calib = fit_piecewise_calibrator_from_val(y_sel, p_sel)
+        print("[CAL DEBUG] Built calibrator:", calib)
         return calib if isinstance(calib, dict) and calib else None
     except Exception as e:
         print(f"[WARN] TRAIN-Q2 calibrator build failed: {e}")
