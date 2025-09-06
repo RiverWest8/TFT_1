@@ -2381,10 +2381,10 @@ VOL_LOSS = AsymmetricQuantileLoss(
 EXTRA_CALLBACKS = [
       BiasWarmupCallback(
           vol_loss=VOL_LOSS,
-          target_under=1.09,
+          target_under=1.05,
           target_mean_bias=0.04,
           warmup_epochs=6,
-          qlike_target_weight=0.08,   # keep out of the loss; diagnostics only
+          qlike_target_weight=0.05,   # keep out of the loss; diagnostics only
           start_mean_bias=0.02,
           mean_bias_ramp_until=6,
           guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
