@@ -1105,6 +1105,7 @@ class AsymmetricQuantileLoss(QuantileLoss):
         eps: float = 1e-8,
         med_clip: float = 3.0,
         log_ratio_clip: float = 12.0,
+        weight_power: float = 0.0,
         **kwargs,
     ):
         super().__init__(quantiles=quantiles, **kwargs)
@@ -1116,7 +1117,7 @@ class AsymmetricQuantileLoss(QuantileLoss):
         self.eps = float(eps)
         self.med_clip = float(med_clip)
         self.log_ratio_clip = float(log_ratio_clip)
-        self.weight_power = float(kwargs.pop("weight_power", 0.0))  
+        self.weight_power = float(weight_power) 
 
         try:
             self._q50_idx = self.quantiles.index(0.5)
