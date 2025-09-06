@@ -3881,3 +3881,14 @@ try:
 except Exception as e:
     print(f"[WARN] Export failed: {e}")
 
+
+# --- Unified TEST export to match validation schema ---
+try:
+    test_pred_path = LOCAL_OUTPUT_DIR / f"tft_test_predictions_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+    _export_split_from_best(trainer, test_dataloader, "test", test_pred_path)
+    try:
+        upload_file_to_gcs(str(test_pred_path), f"{GCS_OUTPUT_PREFIX}/{test_pred_path.name}")
+    except Exception as e:
+        print(f"[WARN] Could not upload TEST parquet: {e}")
+except Exception as e:
+    print(f"[WARN] Export failed: {e}")
