@@ -699,39 +699,61 @@ def _numeric_feature_columns(df: "pd.DataFrame", exclude: set[str]):
     return cols
 
 @torch.no_grad()
-def _make_ds_and_loader(df: "pd.DataFrame", max_encoder_length: int, max_prediction_length: int,
-                        batch_size: int, shuffle: bool = False):
-
+def _make_ds_and_loader(df: "pd.DataFrame", max_encoder_length: int, max_prediction_length: int, batch_size: int, shuffle: bool = False):
     """Build a minimal TimeSeriesDataSet & DataLoader for a given split dataframe."""
     # Ensure time_idx exists and is sorted per asset
     if "time_idx" not in df.columns:
-        df = df.sort_values(["asset", "Time"]).groupby("asset", observed=True, sort=False).apply(
+        # requires Time column – we normalised it earlier in rolling; assert present here too
+        if TIME_COL not in df.columns:
+            # attempt last-chance aliasing for safety
+            for cand in ("Time", "time", "timestamp", "Timestamp", "datetime", "Datetime", "date", "Date"):
+                if cand in df.columns:
+                    df = df.rename(columns={cand: TIME_COL})
+                    break
+        df = df.sort_values([GROUP_ID[0], TIME_COL]).groupby(GROUP_ID[0], observed=True, sort=False).apply(
             lambda g: g.assign(time_idx=np.arange(len(g), dtype=np.int64))
         ).reset_index(drop=True)
     else:
-        df = df.sort_values(["asset", "time_idx"])  # stable order
+        df = df.sort_values([GROUP_ID[0], "time_idx"])  # stable order
 
-    # choose known reals: numeric features except identifiers/targets/index
-    exclude = set(["asset", "Time", "time_idx", "realised_vol", "direction", "split"])
-    known_reals = _numeric_feature_columns(df, exclude)
+    # ---- Mirror single-run feature selection (calendar known + dropped unknowns) ----
+    from pandas.api.types import is_numeric_dtype
+    base_exclude = set(GROUP_ID + [TIME_COL, "time_idx"] + ["realised_vol", "direction", "split"])
+    all_numeric = [c for c, dt in df.dtypes.items() if (c not in base_exclude) and is_numeric_dtype(dt)]
+
+    calendar_cols = ["sin_tod", "cos_tod", "sin_dow", "cos_dow"]
+    time_varying_known_reals = calendar_cols + ["Is_Weekend"]
+
+    try:
+        _drops = set(globals().get("drop_features", []) or [])
+    except Exception:
+        _drops = set()
+    time_varying_unknown_reals = [c for c in all_numeric if c not in _drops]
 
     training = TimeSeriesDataSet(
         df,
         time_idx="time_idx",
         target=["realised_vol", "direction"],
-        group_ids=["asset"],
+        group_ids=GROUP_ID,
         max_encoder_length=max_encoder_length,
         max_prediction_length=max_prediction_length,
-        time_varying_known_reals=known_reals,
-        time_varying_unknown_reals=["realised_vol"],
-        static_categoricals=["asset"],
         target_normalizer=MultiNormalizer([
-            GroupNormalizer(groups=["asset"], transformation="log1p", center=False, scale_by_group=True),
-            TorchNormalizer(),
+            GroupNormalizer(groups=GROUP_ID, transformation="log1p", center=False, scale_by_group=True),
+            TorchNormalizer(method="identity", center=False),  # direction head
         ]),
+        static_categoricals=GROUP_ID,
+        static_reals=[],
+        time_varying_known_reals=time_varying_known_reals,
+        time_varying_unknown_reals=time_varying_unknown_reals,
+        time_varying_unknown_categoricals=[],
+        add_relative_time_idx=True,
+        add_target_scales=True,
+        add_encoder_length=True,
+        allow_missing_timesteps=True,
     )
     loader = training.to_dataloader(train=shuffle, batch_size=batch_size, num_workers=getattr(ARGS, "num_workers", 0))
     return training, loader
+    
 
 
 # -----------------------------------------------------------------------
@@ -3035,6 +3057,21 @@ def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df
     if uni_df is None or uni_df.empty:
         raise ValueError("Rolling-origin requires universal_data.parquet; uni_df is empty or None.")
     base = uni_df.copy()
+    # --- Canonicalise column names needed for rolling ---
+    # Ensure group id column exists under the canonical name
+    if GROUP_ID and GROUP_ID[0] not in base.columns:
+        for cand in ("asset", "symbol", "ticker", "instrument", "Asset"):
+            if cand in base.columns:
+                base = base.rename(columns={cand: GROUP_ID[0]})
+                break
+    # Ensure time column exists under the canonical name
+    if TIME_COL not in base.columns:
+        for cand in ("Time", "time", "timestamp", "Timestamp", "datetime", "Datetime", "date", "Date"):
+            if cand in base.columns:
+                base = base.rename(columns={cand: TIME_COL})
+                break
+    if TIME_COL not in base.columns:
+        raise KeyError(f"Required time column '{TIME_COL}' not found in universal_data.parquet; available: {list(base.columns)[:30]}")
     base = base.sort_values([GROUP_ID[0], TIME_COL])
 
     # Timezone-normalise and enforce target presence/dtypes
