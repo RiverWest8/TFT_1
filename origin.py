@@ -682,6 +682,21 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, cal
     print(f"✓ Wrote {split.upper()} predictions → {out_path}") 
 
 # ----------------------- Small dataloader helper for exports -----------------------
+# ---- Helper: robust numeric feature selector (ignores categoricals/datetimes) ----
+def _numeric_feature_columns(df: pd.DataFrame, exclude: set[str]):
+    from pandas.api.types import is_numeric_dtype
+    cols = []
+    for c in df.columns:
+        if c in exclude:
+            continue
+        try:
+            if is_numeric_dtype(df[c]):
+                cols.append(c)
+        except Exception:
+            # odd dtype → skip
+            continue
+    return cols
+
 @torch.no_grad()
 def _make_ds_and_loader(df: pd.DataFrame, max_encoder_length: int, max_prediction_length: int,
                         batch_size: int, shuffle: bool = False):
@@ -695,8 +710,8 @@ def _make_ds_and_loader(df: pd.DataFrame, max_encoder_length: int, max_predictio
         df = df.sort_values(["asset", "time_idx"])  # stable order
 
     # choose known reals: numeric features except identifiers/targets/index
-    exclude = set(["asset", "Time", "time_idx", "realised_vol", "direction"])
-    known_reals = [c for c in df.columns if c not in exclude and np.issubdtype(df[c].dtype, np.number)]
+    exclude = set(["asset", "Time", "time_idx", "realised_vol", "direction", "split"])
+    known_reals = _numeric_feature_columns(df, exclude)
 
     training = TimeSeriesDataSet(
         df,
@@ -2868,8 +2883,26 @@ def _build_datasets_for_split(train_df: pd.DataFrame, val_df: pd.DataFrame,
     train_df = _ensure_time_idx(train_df.sort_values(GROUP_ID + [TIME_COL]).copy())
     val_df   = _ensure_time_idx(val_df.sort_values(GROUP_ID + [TIME_COL]).copy())
 
-    exclude = set([GROUP_ID[0], TIME_COL, "time_idx"] + TARGETS)
-    known_reals = [c for c in train_df.columns if c not in exclude and np.issubdtype(train_df[c].dtype, np.number)]
+    # ---- Mirror single-run feature selection for rolling folds ----
+    from pandas.api.types import is_numeric_dtype
+
+    base_exclude = set(GROUP_ID + [TIME_COL, "time_idx"] + TARGETS + ["rv_scale", "split"])  # guard extras
+    all_numeric = [c for c, dt in train_df.dtypes.items() if (c not in base_exclude) and is_numeric_dtype(dt)]
+
+    # Calendar / known-at-prediction-time features
+    calendar_cols = ["sin_tod", "cos_tod", "sin_dow", "cos_dow"]
+    time_varying_known_reals = calendar_cols + ["Is_Weekend"]
+
+    # Respect global drop_features if defined (keeps rolling compute bounded)
+    try:
+        _drops = set(globals().get("drop_features", []) or [])
+    except Exception:
+        _drops = set()
+
+    time_varying_unknown_reals = [
+        c for c in all_numeric
+        if (c not in time_varying_known_reals) and (c not in _drops)
+    ]
 
     training = TimeSeriesDataSet(
         train_df,
@@ -2878,14 +2911,24 @@ def _build_datasets_for_split(train_df: pd.DataFrame, val_df: pd.DataFrame,
         group_ids=GROUP_ID,
         max_encoder_length=max_encoder_length,
         max_prediction_length=max_prediction_length,
-        time_varying_known_reals=known_reals,
-        time_varying_unknown_reals=["realised_vol"],
-        time_varying_unknown_categoricals=[],
-        static_categoricals=[GROUP_ID[0]],
         target_normalizer=MultiNormalizer([
-            GroupNormalizer(groups=GROUP_ID, transformation="log1p", center=False, scale_by_group=True),
-            TorchNormalizer(),
+            GroupNormalizer(
+                groups=GROUP_ID,
+                center=False,
+                scale_by_group=True,
+                transformation="log1p",
+            ),
+            TorchNormalizer(method="identity", center=False),  # direction
         ]),
+        static_categoricals=GROUP_ID,
+        static_reals=[],
+        time_varying_known_reals=time_varying_known_reals,
+        time_varying_unknown_reals=time_varying_unknown_reals,
+        time_varying_unknown_categoricals=[],
+        add_relative_time_idx=True,
+        add_target_scales=True,
+        add_encoder_length=True,
+        allow_missing_timesteps=True,
     )
     validation = TimeSeriesDataSet.from_dataset(training, val_df, stop_randomization=True)
     return training, validation
