@@ -633,15 +633,34 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, cal
         "y_dir_prob": y_dirprob_all,
     })
 
-    # ---- (5) Attach actual 'Time' by joining cached source df (if present)
+    # ---- (5) Attach actual 'Time' by joining cached source df (prefer dataloader.dataset) 
     try:
-        cand = ["val_df", "test_df", "raw_df", "full_df", "df"]
         src = None
-        for nm in cand:
-            obj = globals().get(nm)
-            if isinstance(obj, pd.DataFrame) and {"asset","time_idx","Time"}.issubset(obj.columns):
-                src = obj[["asset","time_idx","Time"]].copy()
-                break
+        # 1) Prefer the exact dataframe used to build this dataloader's dataset
+        try:
+            ds = getattr(dataloader, "dataset", None)
+            cand_df = None
+            if ds is not None:
+                # Most PF versions expose the underlying pandas via `.data`
+                if hasattr(ds, "data") and isinstance(ds.data, pd.DataFrame):
+                    cand_df = ds.data
+                # Some expose a helper
+                elif hasattr(ds, "to_pandas"):
+                    cand_df = ds.to_pandas()
+            if isinstance(cand_df, pd.DataFrame) and {"asset","time_idx","Time"}.issubset(cand_df.columns):
+                src = cand_df[["asset","time_idx","Time"]].copy()
+        except Exception:
+            src = None
+
+        # 2) Fallback: use globals cache if available (back-compat)
+        if src is None:
+            cand = ["val_df", "test_df", "raw_df", "full_df", "df"]
+            for nm in cand:
+                obj = globals().get(nm)
+                if isinstance(obj, pd.DataFrame) and {"asset","time_idx","Time"}.issubset(obj.columns):
+                    src = obj[["asset","time_idx","Time"]].copy()
+                    break
+
         if src is not None:
             src["asset"] = src["asset"].astype(str)
             src["time_idx"] = pd.to_numeric(src["time_idx"], errors="coerce").astype("Int64").astype("int64")
@@ -653,6 +672,8 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, cal
                 df["Time"] = df["Time"].dt.tz_localize(None)
             except Exception:
                 pass
+        else:
+            print("[WARN] Could not find a source df with ['asset','time_idx','Time']; saving without Time column.")
     except Exception as e:
         print(f"[WARN] Could not attach Time column: {e}")
 
@@ -3041,6 +3062,36 @@ def run_rolling_origin(train_df: pd.DataFrame, val_df: pd.DataFrame, test_df: pd
                 # Fit on all pre-test data ONLY (no validation dataloader passed)
                 trainer_final.fit(model, train_dataloaders=train_all_loader)
 
+                # Also export a VAL parquet from the refitted model using the last pre-TEST window
+                try:
+                    cal_days = int(getattr(ARGS, "roll_val_days", 90))
+                    cal_end = pre_df[TIME_COL].max()
+                    cal_start = cal_end - pd.Timedelta(days=cal_days)
+                    cal_df = pre_df[(pre_df[TIME_COL] >= cal_start) & (pre_df[TIME_COL] <= cal_end)].copy()
+
+                    # Build loader and export with split="val". We temporarily set globals()["val_df"]
+                    # so the exporter can attach the real Time column during its merge step.
+                    _, cal_loader = _make_ds_and_loader(
+                        cal_df,
+                        max_encoder_length=MAX_ENCODER_LENGTH,
+                        max_prediction_length=int(getattr(ARGS, "roll_pred_len", 1)),
+                        batch_size=BATCH_SIZE,
+                        shuffle=False,
+                    )
+
+                    _val_df_backup = globals().get("val_df", None)
+                    globals()["val_df"] = cal_df
+                    val_out = LOCAL_OUTPUT_DIR / f"tft_val_predictions_refit_{RUN_SUFFIX}.parquet"
+                    _export_split_from_best(trainer_final, cal_loader, split="val", out_path=val_out, calibrator=None)
+                    # restore prior global if any
+                    globals()["val_df"] = _val_df_backup
+
+                    try:
+                        upload_file_to_gcs(str(val_out), f"{GCS_OUTPUT_PREFIX}/{val_out.name}")
+                    except Exception as _e_up:
+                        print(f"[WARN] Could not upload refit VAL parquet: {_e_up}")
+                except Exception as _e_cal:
+                    print(f"[WARN] Refit VAL export skipped: {_e_cal}")
                 # Export TEST predictions (no calibration by default)
                 test_out = LOCAL_OUTPUT_DIR / f"tft_test_predictions_refit_{RUN_SUFFIX}.parquet"
                 _export_split_from_best(trainer_final, test_loader, split="test", out_path=test_out, calibrator=None)
