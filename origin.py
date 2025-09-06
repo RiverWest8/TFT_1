@@ -3102,6 +3102,29 @@ def _derive_direction_inplace(df: "pd.DataFrame", group_col: str) -> "pd.DataFra
     # If we get here, we failed to derive; leave as-is
     return df
 
+# ---- Helper: coerce targets safely without leaking loop vars into except ----
+def _coerce_targets_inplace(df: "pd.DataFrame") -> None:
+    if df is None or len(df) == 0:
+        return
+    # realised_vol numeric
+    if "realised_vol" in df.columns:
+        try:
+            df["realised_vol"] = pd.to_numeric(df["realised_vol"], errors="coerce")
+        except Exception:
+            pass
+    # direction to {0,1} float
+    if "direction" in df.columns:
+        try:
+            ser = df["direction"]
+            if not pd.api.types.is_numeric_dtype(ser):
+                ser = ser.map({"up": 1, "down": 0, True: 1, False: 0})
+            ser = pd.to_numeric(ser, errors="coerce").fillna(0.0)
+            df["direction"] = (ser > 0.5).astype("float32")
+        except Exception:
+            # last-resort coercion
+            df["direction"] = pd.to_numeric(df["direction"], errors="coerce").fillna(0.0)
+            df["direction"] = (df["direction"] > 0.5).astype("float32")
+
 def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df: "pd.DataFrame", uni_df: Optional["pd.DataFrame"]):
     """
     Keep the final 10% chronologically as the held-out test.
@@ -3178,22 +3201,9 @@ def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df
     pre_df = pd.concat(pre_list, axis=0, ignore_index=True)
     fixed_test_df = pd.concat(test_list, axis=0, ignore_index=True)
 
-    # Safety: ensure targets present & numeric in both pre_df and fixed_test_df
-    for _df in (pre_df, fixed_test_df):
-        for tcol in ("realised_vol", "direction"):
-            if tcol not in _df.columns:
-                _df[tcol] = np.nan
-        try:
-            _df["realised_vol"] = pd.to_numeric(_df["realised_vol"], errors="coerce")
-        except Exception:
-            pass
-        try:
-            if not pd.api.types.is_numeric_dtype(_df["direction"]):
-                _df["direction"] = _df["direction"].map({"up":1, "down":0, True:1, False:0})
-            _df["direction"] = pd.to_numeric(_df["direction"], errors="coerce")
-        except Exception:
-            _df["direction"] = pd.to_numeric(_df["direction"], errors="coerce")
-
+    # Safety: ensure targets present (no try/except leakage of loop vars)
+    _coerce_targets_inplace(pre_df)
+    _coerce_targets_inplace(fixed_test_df)
     # Generate folds within pre-test region only
     hard_end = pre_df[TIME_COL].max()
 
