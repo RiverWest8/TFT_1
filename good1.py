@@ -171,7 +171,7 @@ EVAL_VOL_FLOOR = 1e-8
 COMP_WEIGHTS = (1.0, 1.0, 0.004)  # default: slightly emphasise QLIKE for RV focus
 
 # Toggle applying validation calibrator on TEST parquet export (default: OFF)
-APPLY_TEST_CAL = False
+APPLY_TEST_CAL = True
 
 def composite_score(mae, rmse, qlike,
                     b_mae=None, b_rmse=None, b_qlike=None,
@@ -797,7 +797,7 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
     except Exception:
         pass
 
-    # Try to attach actual 'Time' if a compatible source df is cached
+    # Try to attach actual 'Time' (UTC) by merging from the source split dataframe
     try:
         split_l = str(split).lower()
         if split_l == "val":
@@ -806,25 +806,30 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path):
             cand_names = ["test_df", "raw_df", "full_df", "df"]
         else:
             cand_names = ["raw_df", "full_df", "df"]
+
         src = None
         for nm in cand_names:
             obj = globals().get(nm)
             if isinstance(obj, pd.DataFrame) and {"asset","time_idx","Time"}.issubset(obj.columns):
                 src = obj[["asset","time_idx","Time"]].copy()
                 break
+
         if src is not None:
+            # ensure consistent dtypes for a clean join
             src["asset"] = src["asset"].astype(str)
             src["time_idx"] = pd.to_numeric(src["time_idx"], errors="coerce").astype("Int64").astype("int64")
             df["asset"] = df["asset"].astype(str)
             df["time_idx"] = pd.to_numeric(df["time_idx"], errors="coerce").astype("Int64").astype("int64")
+
+            # keep Time as UTC tz-aware
+            src["Time"] = pd.to_datetime(src["Time"], utc=True, errors="coerce")
+
             df = df.merge(src, on=["asset","time_idx"], how="left", validate="m:1")
-            df["Time"] = pd.to_datetime(df["Time"], errors="coerce")
-            try:
-                df["Time"] = df["Time"].dt.tz_localize(None)
-            except Exception:
-                pass
+
+            # make sure it stays UTC tz-aware (do NOT tz_localize(None))
+            df["Time"] = pd.to_datetime(df["Time"], utc=True, errors="coerce")
     except Exception as e:
-        print(f"[WARN] Could not attach Time column: {e}")
+        print(f"[WARN] Could not attach UTC Time column: {e}")
 
     # TEST: backfill true realised_vol and direction from test_df if batches lacked labels
     try:
@@ -2058,7 +2063,7 @@ class BiasWarmupCallback(pl.Callback):
         # ---- HOLD STEADY IN DECAY ----
         if _in_decay:
             # lock underestimation factor to a calm late value
-            vol_loss.underestimation_factor = float(max(1.0, min(getattr(self, "target_under", 1.09), 1.09)))
+            vol_loss.underestimation_factor = float(max(1.0, min(getattr(self, "target_under", 1.2), 1.2)))
             # keep QLIKE pressure constant and mild in decay
             if hasattr(vol_loss, "qlike_weight"):
                 vol_loss.qlike_weight = 0.06
@@ -2775,7 +2780,7 @@ class ReduceLROnPlateauCallback(pl.Callback):
 
 VOL_LOSS = AsymmetricQuantileLoss(
     quantiles=VOL_QUANTILES,
-    underestimation_factor=1.00,  # managed by BiasWarmupCallback
+    underestimation_factor=1.05,  # managed by BiasWarmupCallback
     mean_bias_weight=0.01,        # small centering on the median for MAE
     tail_q=0.85,
     tail_weight=1.2,              # will be ramped by TailWeightRamp
@@ -2787,9 +2792,9 @@ VOL_LOSS = AsymmetricQuantileLoss(
 EXTRA_CALLBACKS = [
       BiasWarmupCallback(
           vol_loss=VOL_LOSS,
-          target_under=1.09,
+          target_under=1.2,
           target_mean_bias=0.04,
-          warmup_epochs=6,
+          warmup_epochs=10,
           qlike_target_weight=0.02,   # keep out of the loss; diagnostics only
           start_mean_bias=0.02,
           mean_bias_ramp_until=6,
