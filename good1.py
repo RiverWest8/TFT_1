@@ -3249,6 +3249,111 @@ if __name__ == "__main__":
     val_cal_df  = _apply_cal(val_uncal_df,  "val_cal")
     test_cal_df = _apply_cal(test_uncal_df, "test_cal")
 
+    # === [CAL ALIGNMENT] Per-asset affine alignment (mean+std), TRAIN-anchored ===
+    # Why: VAL < TRAIN/TEST volatility → pure VAL-based calibration under-scales TEST.
+    # Fix: use VAL for slope (std ratio) but anchor intercept to a TRAIN/VAL blended mean per asset.
+
+    def _per_asset_means(df, y_col="y_vol", p_col="y_vol_pred_cal", asset_col="asset"):
+        g = df[[asset_col, y_col, p_col]].replace([np.inf, -np.inf], np.nan).dropna()
+        return (g.groupby(asset_col)[y_col].mean().to_dict(),
+                g.groupby(asset_col)[p_col].mean().to_dict())
+
+    def _per_asset_stds(df, y_col="y_vol", p_col="y_vol_pred_cal", asset_col="asset"):
+        g = df[[asset_col, y_col, p_col]].replace([np.inf, -np.inf], np.nan).dropna()
+        return (g.groupby(asset_col)[y_col].std(ddof=0).to_dict(),
+                g.groupby(asset_col)[p_col].std(ddof=0).to_dict())
+
+    def _compute_affine_alignment_blended(train_df_in, val_df_in,
+                                        y_col="y_vol", p_col="y_vol_pred_cal",
+                                        asset_col="asset", slope_clip=(0.8, 1.4),
+                                        train_weight_if_uplift=0.75, uplift_thresh=1.2):
+        """
+        Per-asset affine: p' = a + b p
+        b  ← clip(std_y_VAL / std_p_VAL)
+        a  ← sets mean(p') to a TRAIN/VAL blend:
+                mu_target = w*mu_train + (1-w)*mu_val
+            with w=0.75 if mu_train/mu_val > 1.2 (train clearly higher vol), else 0.5
+        """
+        eps = 1e-12
+        mu_tr_y, mu_tr_p = _per_asset_means(train_df_in, y_col, p_col, asset_col)
+        mu_va_y, mu_va_p = _per_asset_means(val_df_in,   y_col, p_col, asset_col)
+        sd_va_y, sd_va_p = _per_asset_stds(val_df_in,    y_col, p_col, asset_col)
+        out = {}
+        assets = set(list(mu_va_y.keys()) + list(mu_tr_y.keys()))
+        for a in assets:
+            my_tr = float(mu_tr_y.get(a, np.nan))
+            mp_tr = float(mu_tr_p.get(a, np.nan))
+            my_va = float(mu_va_y.get(a, np.nan))
+            mp_va = float(mu_va_p.get(a, np.nan))
+            sy_va = float(sd_va_y.get(a, np.nan))
+            sp_va = float(sd_va_p.get(a, np.nan))
+            # slope from VAL (std ratio), clipped
+            if not np.isfinite(sp_va) or sp_va < eps or not np.isfinite(sy_va):
+                b = 1.0
+            else:
+                b = float(np.clip(sy_va / max(sp_va, eps), slope_clip[0], slope_clip[1]))
+            # blend weight toward TRAIN if uplift vs VAL is large
+            w = 0.5
+            if np.isfinite(my_tr) and np.isfinite(my_va) and my_tr > 0 and my_va > 0:
+                if (my_tr / my_va) > uplift_thresh:
+                    w = float(train_weight_if_uplift)
+            mu_target = (w * (my_tr if np.isfinite(my_tr) else my_va)) + ((1.0 - w) * (my_va if np.isfinite(my_va) else my_tr))
+            if not np.isfinite(mu_target):
+                mu_target = my_va if np.isfinite(my_va) else my_tr
+            mu_p_anchor = mp_va if np.isfinite(mp_va) else mp_tr
+            if not np.isfinite(mu_p_anchor):
+                mu_p_anchor = 0.0
+            a0 = float(mu_target) - b * float(mu_p_anchor)
+            out[str(a)] = (a0, b)
+        return out
+
+    def _apply_affine_alignment(df, params, asset_col="asset",
+                                cols=("y_vol_pred_cal","y_vol_pred_q05_cal","y_vol_pred_q95_cal")):
+        if not params:
+            return df
+        out = df.copy()
+        for a, (A, B) in params.items():
+            m = out[asset_col].astype(str) == str(a)
+            for c in cols:
+                if c in out.columns:
+                    out.loc[m, c] = A + B * out.loc[m, c].astype(float)
+        return out
+
+    # Build TRAIN stats frame. If you don't have train preds, use y_vol as proxy (neutral).
+    try:
+        train_stats_df = train_df.rename(columns={"realised_vol": "y_vol"}).copy()
+        if "y_vol_pred_cal" not in train_stats_df.columns:
+            train_stats_df["y_vol_pred_cal"] = train_stats_df["y_vol"]
+    except Exception:
+        train_stats_df = val_cal_df  # safe fallback
+
+    # Compute and apply the affine mapping (VAL→ slope, TRAIN/VAL→ intercept target)
+    aff_blend = _compute_affine_alignment_blended(train_stats_df, val_cal_df,
+                                                y_col="y_vol", p_col="y_vol_pred_cal",
+                                                asset_col="asset",
+                                                slope_clip=(0.8, 1.4),
+                                                train_weight_if_uplift=0.75,
+                                                uplift_thresh=1.2)
+    val_cal_df  = _apply_affine_alignment(val_cal_df,  aff_blend, asset_col="asset")
+    test_cal_df = _apply_affine_alignment(test_cal_df, aff_blend, asset_col="asset")
+    print("[CAL] TRAIN-anchored affine alignment:", {k:(round(a,6), round(b,3)) for k,(a,b) in aff_blend.items()})
+
+    # Diagnostics (means/stds by asset after alignment)
+    def _diag_by_asset(df, asset_col="asset", y_col="y_vol", p_col="y_vol_pred_cal", label="VAL"):
+        g = df[[asset_col, y_col, p_col]].replace([np.inf, -np.inf], np.nan).dropna()
+        rows = []
+        for a, d in g.groupby(asset_col):
+            rows.append((str(a),
+                        float(d[y_col].mean()), float(d[p_col].mean()),
+                        float(d[y_col].std(ddof=0)), float(d[p_col].std(ddof=0))))
+        if rows:
+            print(f"[CAL][{label}] asset  mean_y  mean_p  std_y  std_p")
+            for r in rows:
+                print(f"[CAL][{label}] {r[0]:>4}  {r[1]:.6g}  {r[2]:.6g}  {r[3]:.6g}  {r[4]:.6g}")
+
+    _diag_by_asset(val_cal_df,  label="VAL")
+    _diag_by_asset(test_cal_df, label="TEST")
+
     _p_cal_mean = float(val_cal_df["y_vol_pred_cal"].mean()) if "y_vol_pred_cal" in val_cal_df.columns else float("nan")
     print("VAL means:  y={:.6g}  p={:.6g}  p_cal={:.6g}".format(
         val_uncal_df["y_vol"].mean(),  val_uncal_df["y_vol_pred"].mean(), _p_cal_mean))
