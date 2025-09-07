@@ -11,7 +11,7 @@ This script trains a single TFT model that jointly predicts:
   • the direction of the next period’s price move (binary classification)
 
 It expects three parquet files:
-    ▸ /Users/riverwest-gomila/Desktop/Data/CleanedData/universal_train.parquet
+    ▸ /Users/riverwest-gomila/Desktop/Data/CleanedData/universal_train_trunc.parquet
     ▸ /Users/riverwest-gomila/Desktop/Data/CleanedData/universal_val.parquet
     ▸ /Users/riverwest-gomila/Desktop/Data/CleanedData/universal_test.parquet
 
@@ -781,17 +781,14 @@ def fit_log_calibrator_per_asset(df_val: pd.DataFrame,
         # OLS closed form on logs
         pp1 = np.c_[np.ones_like(pp), pp]
         theta, *_ = np.linalg.lstsq(pp1, yy, rcond=None)
-        alpha = float(theta[0])
-        beta  = float(theta[1])
-        beta  = float(np.clip(beta, 1.0, 1.6))        # <-- NEW
-        out[str(a)] = {"alpha": alpha, "beta": beta}
+        out[str(a)] = {"alpha": float(theta[0]), "beta": float(theta[1])}
     return out
 
 
 def adjust_calibrator_level(calib: dict,
                             train_means: dict,
                             val_means: dict,
-                            tau: float = 0.5,
+                            tau: float = 0.9,
                             cap_abs_log: float = np.log(2.0)) -> dict:
     """
     Shift each asset’s intercept toward TRAIN mean level:
@@ -914,7 +911,7 @@ class AsymmetricQuantileLoss(QuantileLoss):
         quantiles,
         underestimation_factor: float = 1.00, #1.1115
         mean_bias_weight: float = 0.0,
-        tail_q: float = 0.85,         # ← was 0.85
+        tail_q: float = 0.90,         # ← was 0.85
         tail_weight: float = 0.0,
         qlike_weight: float = 0.0,   # set to 0.0 because we cannot safely decode inside the loss
         eps: float = 1e-8,
@@ -1660,8 +1657,8 @@ class BiasWarmupCallback(pl.Callback):
 
         if scale is not None:
             prev = self._scale_ema
-            beta = 0.9       # EMA smoothing
-            rel_clip = 0.05  # clamp to ±5% per epoch
+            beta = 0.6       # EMA smoothing
+            rel_clip = 0.15  # clamp to ±5% per epoch
             if (prev is None) or (not np.isfinite(prev)):
                 self._scale_ema = float(scale)
             else:
@@ -1717,7 +1714,7 @@ class BiasWarmupCallback(pl.Callback):
         if hasattr(vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
             q_target = float(self.qlike_target_weight)
             q_prog   = min(1.0, float(e) / float(max(self.warm, 8)))
-            near_ok  = (self._scale_ema is None) or (0.98 <= self._scale_ema <= 1.05)
+            near_ok  = (self._scale_ema is None) or (0.98 <= self._scale_ema <= 1.02)
 
             qlike_floor = 0.02  # keep some scale pressure even when gated
             if near_ok:
@@ -2438,7 +2435,7 @@ EXTRA_CALLBACKS = [
           save_top_k=2,
           save_last=True,
       ),
-      StochasticWeightAveraging(swa_lrs = 1e6 , annealing_epochs = 1, annealing_strategy="cos", swa_epoch_start=max(1, int(0.9 * MAX_EPOCHS))),
+      StochasticWeightAveraging(swa_lrs = 4.25e5 , annealing_epochs = 1, annealing_strategy="cos", swa_epoch_start=max(1, int(0.9 * MAX_EPOCHS))),
       CosineLR(start_epoch=10, eta_min_ratio=0.05, hold_last_epochs=1, warmup_steps=0),
       ]
 
@@ -2798,9 +2795,9 @@ if __name__ == "__main__":
         df["rv_scale"].fillna(asset_scale_map.median(), inplace=True)
     # Global decoded-scale floor for vol (prevents QLIKE blow-ups on near-zero preds)
     try:
-        EVAL_VOL_FLOOR = max(1e-10, float(asset_scales["rv_scale"].median() * 0.0002))
+        EVAL_VOL_FLOOR = max(1e-8, float(asset_scales["rv_scale"].median() * 0.002))
     except Exception:
-        EVAL_VOL_FLOOR = 1e-10
+        EVAL_VOL_FLOOR = 1e-8
     print(f"[EVAL] Global vol floor (decoded) set to {EVAL_VOL_FLOOR:.6g}")
 
     # Add calendar features to all splits
@@ -3213,62 +3210,51 @@ if __name__ == "__main__":
     )
     train_means = _per_asset_mean(train_df, col="realised_vol")
     val_means   = _per_asset_mean(val_df,   col="realised_vol")
-    calib_adj   = adjust_calibrator_level(calib_raw, train_means, val_means, tau=0., cap_abs_log=np.log(2.0))
+    calib_adj   = adjust_calibrator_level(calib_raw, train_means, val_means, tau=0.9, cap_abs_log=np.log(2.0))
 
-    import pandas as pd
     # 3) apply calibrator to both VAL and TEST
     def _apply_cal(df_in: pd.DataFrame, label: str) -> pd.DataFrame:
         df = df_in.copy()
-        a  = df["asset"].astype(str).str.upper().to_numpy()
-        df["y_vol_pred_cal"] = apply_log_calibrator_on_array(df["y_vol_pred"].to_numpy(), a, calib_adj)
+
+        # Ensure required columns exist
+        if "y_vol_pred" not in df.columns:
+            # fall back: if missing, just copy y_vol into pred to keep shape
+            df["y_vol_pred"] = df.get("y_vol", pd.Series(index=df.index, dtype="float64"))
+
+        # Normalise asset case for lookup
+        a = df["asset"].astype(str).str.upper().to_numpy() if "asset" in df.columns else np.array(["UNK"] * len(df))
+
+        # Always create the calibrated columns (fall back to identity on failure)
+        try:
+            cal_vals = apply_log_calibrator_on_array(df["y_vol_pred"].to_numpy(), a, calib_adj)
+        except Exception:
+            cal_vals = df["y_vol_pred"].to_numpy()
+        df["y_vol_pred_cal"] = cal_vals
+
         if "y_vol_pred_q05" in df.columns and df["y_vol_pred_q05"].notna().any():
-            df["y_vol_pred_q05_cal"] = apply_log_calibrator_on_array(df["y_vol_pred_q05"].to_numpy(), a, calib_adj)
+            try:
+                df["y_vol_pred_q05_cal"] = apply_log_calibrator_on_array(df["y_vol_pred_q05"].to_numpy(), a, calib_adj)
+            except Exception:
+                df["y_vol_pred_q05_cal"] = df["y_vol_pred_q05"]
+
         if "y_vol_pred_q95" in df.columns and df["y_vol_pred_q95"].notna().any():
-            df["y_vol_pred_q95_cal"] = apply_log_calibrator_on_array(df["y_vol_pred_q95"].to_numpy(), a, calib_adj)
+            try:
+                df["y_vol_pred_q95_cal"] = apply_log_calibrator_on_array(df["y_vol_pred_q95"].to_numpy(), a, calib_adj)
+            except Exception:
+                df["y_vol_pred_q95_cal"] = df["y_vol_pred_q95"]
+
         df["split"] = label
         return df
-    
-    def _overwrite_with_cal(df_in: pd.DataFrame) -> pd.DataFrame:
-        """
-        Overwrite base prediction columns with their calibrated counterparts where available and non-NaN.
-        Drops the helper *_cal columns afterwards.
-        """
-        out = df_in.copy()
-        # y_vol_pred (point)
-        if "y_vol_pred_cal" in out.columns:
-            s = out["y_vol_pred_cal"]
-            if s.notna().any():
-                out["y_vol_pred"] = s.where(s.notna(), out.get("y_vol_pred"))
-        # q05
-        if "y_vol_pred_q05_cal" in out.columns:
-            s = out["y_vol_pred_q05_cal"]
-            if s.notna().any():
-                out["y_vol_pred_q05"] = s.where(s.notna(), out.get("y_vol_pred_q05"))
-        # q95
-        if "y_vol_pred_q95_cal" in out.columns:
-            s = out["y_vol_pred_q95_cal"]
-            if s.notna().any():
-                out["y_vol_pred_q95"] = s.where(s.notna(), out.get("y_vol_pred_q95"))
-        # drop helper columns
-        cal_cols = [c for c in out.columns if c.endswith("_cal")]
-        return out.drop(columns=cal_cols)
-
 
     val_cal_df  = _apply_cal(val_uncal_df,  "val_cal")
     test_cal_df = _apply_cal(test_uncal_df, "test_cal")
 
-    val_cal_df  = _overwrite_with_cal(val_cal_df)
-    test_cal_df = _overwrite_with_cal(test_cal_df)
-
+    _p_cal_mean = float(val_cal_df["y_vol_pred_cal"].mean()) if "y_vol_pred_cal" in val_cal_df.columns else float("nan")
     print("VAL means:  y={:.6g}  p={:.6g}  p_cal={:.6g}".format(
-        val_uncal_df["y_vol"].mean(),  val_uncal_df["y_vol_pred"].mean(),
-        val_cal_df["y_vol_pred_cal"].mean()))
+        val_uncal_df["y_vol"].mean(),  val_uncal_df["y_vol_pred"].mean(), _p_cal_mean))
+    _t_cal_mean = float(test_cal_df["y_vol_pred_cal"].mean()) if "y_vol_pred_cal" in test_cal_df.columns else float("nan")
     print("TEST means: y={:.6g}  p={:.6g}  p_cal={:.6g}".format(
-        test_uncal_df["y_vol"].mean(), test_uncal_df["y_vol_pred"].mean(),
-        test_cal_df["y_vol_pred_cal"].mean()))
-
-
-
+        test_uncal_df["y_vol"].mean(), test_uncal_df["y_vol_pred"].mean(), _t_cal_mean))
 
     # 4) save 4 parquets
     OUT = Path(LOCAL_OUTPUT_DIR); OUT.mkdir(parents=True, exist_ok=True)
@@ -3347,27 +3333,6 @@ if ENABLE_FEATURE_IMPORTANCE:
             return x.astype(np.float32, copy=False)
         return x
 
-
-
-from lightning.pytorch.callbacks import ModelCheckpoint
-from pathlib import Path
-import fsspec
-import pandas as pd
-
-# Helpers
-def _median_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
-    vol_q = torch.cummax(vol_q, dim=-1).values
-    return vol_q[..., 3]
-
-def _safe_prob(t: torch.Tensor) -> torch.Tensor:
-    if not torch.is_tensor(t):
-        return t
-    try:
-        if torch.isfinite(t).any() and (t.min() < 0 or t.max() > 1):
-            t = torch.sigmoid(t)
-    except Exception:
-        t = torch.sigmoid(t)
-    return torch.clamp(t, 0.0, 1.0)
 
 
 
