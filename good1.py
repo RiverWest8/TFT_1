@@ -426,13 +426,6 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, cal
     """
     # ---- (0) Model: prefer in-memory last-epoch; fallback to local last.ckpt if available
     model = getattr(trainer, "lightning_module", None)
-    try:
-        last_ckpt = LOCAL_CKPT_DIR / "last.ckpt"
-        if last_ckpt.exists():
-            LM = type(model) if model is not None else TemporalFusionTransformer
-            model = LM.load_from_checkpoint(str(last_ckpt))
-    except Exception:
-        pass
     if model is None:
         raise RuntimeError("No model available for export (expected in-memory last epoch).")
     model.eval().to(trainer.lightning_module.device)
@@ -594,20 +587,6 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, cal
                 y_dir_prob = torch.sigmoid(y_dir_prob)
             y_dir_prob = torch.clamp(y_dir_prob, 0.0, 1.0)
 
-        # TEST-only optional calibration
-        try:
-            if calibrator is not None and str(split).lower() == "test":
-                def _apply_cal(y):
-                    if y is None:
-                        return None
-                    return apply_piecewise_calibrator_on_preds(y, calibrator)
-                y_q50 = _apply_cal(y_q50)
-                if y_q05 is not None:
-                    y_q05 = _apply_cal(y_q05)
-                if y_q95 is not None:
-                    y_q95 = _apply_cal(y_q95)
-        except Exception as _e:
-            print(f"[WARN] test calibration skipped: {_e}")
 
         # map ids -> names
         aset = [id_to_name.get(int(i), str(int(i))) for i in g.detach().cpu().tolist()]
@@ -660,7 +639,207 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, cal
     df.to_parquet(out_path, index=False)
     print(f"✓ Wrote {split.upper()} predictions → {out_path}") 
 
+@torch.no_grad()
+def collect_split_predictions(trainer,
+                              dataloader,
+                              split: str) -> pd.DataFrame:
+    """
+    Predicts with the current in-memory model (no ckpt reload) and returns an
+    UNCALIBRATED dataframe with:
+      asset, time_idx, y_vol, y_vol_pred, y_vol_pred_q05, y_vol_pred_q95, y_dir, y_dir_prob
+    """
+    model = getattr(trainer, "lightning_module", None)
+    if model is None:
+        raise RuntimeError("No model in memory to predict with.")
+    model.eval().to(trainer.lightning_module.device)
 
+    # try to recover ID->name map and normalizer
+    id_to_name = {}
+    for cb in getattr(trainer, "callbacks", []):
+        if isinstance(cb, PerAssetMetrics):
+            id_to_name = {int(k): str(v) for k, v in getattr(cb, "id_to_name", {}).items()}
+            break
+
+    vol_norm = None
+    try:
+        vol_norm = _extract_norm_from_dataset(getattr(model, "dataset", None))
+    except Exception:
+        pass
+    if vol_norm is None:
+        try:
+            vol_norm = _extract_norm_from_dataset(getattr(dataloader, "dataset", None))
+        except Exception:
+            pass
+
+    # run predict
+    _pred_out = model.predict(dataloader, mode="raw", return_x=True)
+    if isinstance(_pred_out, (list, tuple)):
+        raw_preds = _pred_out[0] if len(_pred_out) >= 1 else None
+        raw_x     = _pred_out[1] if len(_pred_out) >= 2 else None
+    elif isinstance(_pred_out, dict):
+        raw_preds = _pred_out.get("prediction", _pred_out.get("predictions", _pred_out))
+        raw_x     = _pred_out.get("x", None)
+    else:
+        raw_preds, raw_x = _pred_out, None
+
+    def _to_list(obj):
+        if isinstance(obj, (list, tuple)):
+            return list(obj)
+        return [obj]
+
+    preds_list = _to_list(raw_preds)
+    x_list     = _to_list(raw_x)
+    if len(preds_list) == 1 and isinstance(preds_list[0], (dict, torch.Tensor)) and len(x_list) > 1:
+        preds_list = preds_list * len(x_list)
+
+    # accumulators
+    assets_all, t_all = [], []
+    y_true_all, y_dir_true_all, y_dirprob_all = [], [], []
+    y_q05_all, y_q50_all, y_q95_all = [], [], []
+
+    for pred_b, xb in zip(preds_list, x_list):
+        x = xb if isinstance(xb, dict) else (xb[0] if isinstance(xb, (list, tuple)) and xb and isinstance(xb[0], dict) else None)
+        if x is None:
+            continue
+        pred_t = pred_b["prediction"] if isinstance(pred_b, dict) and "prediction" in pred_b else pred_b
+        if pred_t is None:
+            continue
+
+        # group ids
+        g = None
+        for k in ("groups", "group_ids", "group_id"):
+            if k in x and x[k] is not None:
+                g = x[k]; break
+        if isinstance(g, (list, tuple)) and g:
+            g = g[0]
+        if torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
+            g = g.squeeze(-1)
+        if not torch.is_tensor(g):
+            continue
+        L = g.shape[0]
+        aset = [id_to_name.get(int(i), str(int(i))) for i in g.detach().cpu().tolist()]
+
+        # time index
+        t = x.get("decoder_time_idx", None) or x.get("decoder_relative_idx", None)
+        if torch.is_tensor(t):
+            while t.ndim > 1 and t.size(-1) == 1:
+                t = t.squeeze(-1)
+            t = t.reshape(-1)[:L]
+
+        # heads + quantiles (encoded)
+        p_vol_enc, p_dir = _extract_heads(pred_t)
+        if p_vol_enc is None:
+            continue
+        p_vol_enc = p_vol_enc.reshape(-1)[:L]
+        vol_q = _extract_vol_quantiles(pred_t)
+        q05_enc = q50_enc = q95_enc = None
+        if torch.is_tensor(vol_q) and vol_q.ndim == 2:
+            vol_q = torch.cummax(vol_q, dim=-1).values
+            K = vol_q.shape[1]
+            if K > max(Q95_IDX, Q05_IDX):
+                q05_enc = vol_q[:, Q05_IDX].reshape(-1)[:L]
+                q50_enc = vol_q[:, Q50_IDX].reshape(-1)[:L]
+                q95_enc = vol_q[:, Q95_IDX].reshape(-1)[:L]
+        if q50_enc is None:
+            q50_enc = p_vol_enc
+
+        # decode to physical scale
+        floor_val = float(globals().get("EVAL_VOL_FLOOR", 1e-8))
+        if vol_norm is not None:
+            y_q50 = safe_decode_vol(q50_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1)
+            y_q50 = torch.clamp(y_q50, min=floor_val)
+            y_q05 = safe_decode_vol(q05_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1) if q05_enc is not None else None
+            y_q95 = safe_decode_vol(q95_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1) if q95_enc is not None else None
+            if y_q05 is not None: y_q05 = torch.clamp(y_q05, min=floor_val)
+            if y_q95 is not None: y_q95 = torch.clamp(y_q95, min=floor_val)
+        else:
+            y_q50, y_q05, y_q95 = q50_enc, q05_enc, q95_enc
+
+        # true targets if present
+        y_vol_true, y_dir_true = None, None
+        dec_t = x.get("decoder_target") or x.get("target") or x.get("targets") or x.get("y") or x.get("decoder_y")
+        if torch.is_tensor(dec_t):
+            ytmp = dec_t
+            if ytmp.ndim == 3 and ytmp.size(1) == 1: ytmp = ytmp[:, 0, :]
+            if ytmp.ndim == 3 and ytmp.size(-1) == 1: ytmp = ytmp[..., 0]
+            if ytmp.ndim == 2 and ytmp.size(1) >= 1:
+                yv_enc = ytmp[:, 0]
+                y_vol_true = safe_decode_vol(yv_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1) if vol_norm is not None else yv_enc
+                if ytmp.size(1) > 1: y_dir_true = ytmp[:, 1]
+        elif isinstance(dec_t, (list, tuple)) and dec_t:
+            yv_enc = dec_t[0]
+            if torch.is_tensor(yv_enc):
+                if yv_enc.ndim == 3 and yv_enc.size(-1) == 1: yv_enc = yv_enc[..., 0]
+                if yv_enc.ndim == 2 and yv_enc.size(-1) == 1: yv_enc = yv_enc[:, 0]
+                y_vol_true = safe_decode_vol(yv_enc.unsqueeze(-1), vol_norm, g.unsqueeze(-1)).squeeze(-1) if vol_norm is not None else yv_enc
+            if len(dec_t) > 1 and torch.is_tensor(dec_t[1]):
+                y_dir_true = dec_t[1]
+                if y_dir_true.ndim == 3 and y_dir_true.size(-1) == 1: y_dir_true = y_dir_true[..., 0]
+                if y_dir_true.ndim == 2 and y_dir_true.size(-1) == 1: y_dir_true = y_dir_true[:, 0]
+
+        # dir prob
+        y_dir_prob = None
+        if p_dir is not None and torch.is_tensor(p_dir):
+            y_dir_prob = p_dir.reshape(-1)[:L]
+            try:
+                finite_any = bool(torch.isfinite(y_dir_prob).any().item())
+                if finite_any and (float(y_dir_prob.min()) < 0.0 or float(y_dir_prob.max()) > 1.0):
+                    y_dir_prob = torch.sigmoid(y_dir_prob)
+            except Exception:
+                y_dir_prob = torch.sigmoid(y_dir_prob)
+            y_dir_prob = torch.clamp(y_dir_prob, 0.0, 1.0)
+
+        # append (CPU numpy)
+        assets_all.extend(aset)
+        t_all.extend(t.detach().cpu().tolist() if isinstance(t, torch.Tensor) else [None] * L)
+        y_q05_all.extend(y_q05.detach().cpu().tolist() if y_q05 is not None else [None] * L)
+        y_q50_all.extend(y_q50.detach().cpu().tolist())
+        y_q95_all.extend(y_q95.detach().cpu().tolist() if y_q95 is not None else [None] * L)
+        y_true_all.extend(y_vol_true.detach().cpu().tolist() if y_vol_true is not None else [None] * L)
+        y_dir_true_all.extend(y_dir_true.detach().cpu().tolist() if y_dir_true is not None else [None] * L)
+        y_dirprob_all.extend(y_dir_prob.detach().cpu().tolist() if y_dir_prob is not None else [None] * L)
+
+    df = pd.DataFrame({
+        "asset": assets_all,
+        "time_idx": t_all,
+        "y_vol": y_true_all,
+        "y_vol_pred": y_q50_all,
+        "y_vol_pred_q05": y_q05_all,
+        "y_vol_pred_q95": y_q95_all,
+        "y_dir": y_dir_true_all,
+        "y_dir_prob": y_dirprob_all,
+    })
+
+    # attach real Time if available
+    try:
+        cand = ["val_df", "test_df", "raw_df", "full_df", "df"]
+        src = None
+        for nm in cand:
+            obj = globals().get(nm)
+            if isinstance(obj, pd.DataFrame) and {"asset","time_idx","Time"}.issubset(obj.columns):
+                src = obj[["asset","time_idx","Time"]].copy(); break
+        if src is not None:
+            src["asset"] = src["asset"].astype(str)
+            src["time_idx"] = pd.to_numeric(src["time_idx"], errors="coerce").astype("Int64").astype("int64")
+            df["asset"] = df["asset"].astype(str)
+            df["time_idx"] = pd.to_numeric(df["time_idx"], errors="coerce").astype("Int64").astype("int64")
+            df = df.merge(src, on=["asset","time_idx"], how="left", validate="m:1")
+            df["Time"] = pd.to_datetime(df["Time"], errors="coerce")
+            try: df["Time"] = df["Time"].dt.tz_localize(None)
+            except Exception: pass
+    except Exception as e:
+        print(f"[WARN] Could not attach Time column: {e}")
+
+    return df
+
+def _save_parquet(df: pd.DataFrame, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(path, index=False)
+    print(f"✓ Wrote {path}")
+    try:
+        upload_file_to_gcs(str(path), f"{GCS_OUTPUT_PREFIX}/{path.name}")
+    except Exception as e:
+        print(f"[WARN] GCS upload skipped: {e}")
 # -----------------------------------------------------------------------
 # Robust manual inverse for GroupNormalizer (fallback when decode fails)
 # -----------------------------------------------------------------------
@@ -792,7 +971,91 @@ if not hasattr(GroupNormalizer, "decode"):
 
     GroupNormalizer.decode = _gn_decode
 
+# ---------- Per-asset log-linear calibrator (VAL → TEST) ----------
 
+@torch.no_grad()
+def fit_log_calibrator_per_asset(df_val: pd.DataFrame,
+                                 asset_col: str = "asset",
+                                 y_col: str = "y_vol",
+                                 p_col: str = "y_vol_pred",
+                                 floor: float = 1e-10) -> dict:
+    """
+    Fit per-asset log-linear calibration on VAL:
+        log(y) = alpha_a + beta_a * log(p)
+    Returns dict: {asset: {"alpha": float, "beta": float}}
+    Notes: ignores non-positive y/p rows; falls back to alpha=0,beta=1 if not enough data.
+    """
+    out = {}
+    if df_val is None or df_val.empty:
+        return out
+    g = df_val[[asset_col, y_col, p_col]].copy()
+    g = g.replace([np.inf, -np.inf], np.nan).dropna()
+    g = g[(g[y_col] > floor) & (g[p_col] > floor)]
+    if g.empty:
+        return out
+
+    for a, dd in g.groupby(asset_col, sort=False):
+        yy = np.log(dd[y_col].astype(float).values)
+        pp = np.log(dd[p_col].astype(float).values)
+        if len(yy) < 20 or np.std(pp) < 1e-6:
+            out[str(a)] = {"alpha": 0.0, "beta": 1.0}
+            continue
+        # OLS closed form on logs
+        pp1 = np.c_[np.ones_like(pp), pp]
+        theta, *_ = np.linalg.lstsq(pp1, yy, rcond=None)
+        out[str(a)] = {"alpha": float(theta[0]), "beta": float(theta[1])}
+    return out
+
+
+def adjust_calibrator_level(calib: dict,
+                            train_means: dict,
+                            val_means: dict,
+                            tau: float = 0.5,
+                            cap_abs_log: float = np.log(2.0)) -> dict:
+    """
+    Shift each asset’s intercept toward TRAIN mean level:
+        alpha <- alpha + tau * (log(mu_train) - log(mu_val))
+    with |delta| capped by cap_abs_log (default ln 2 → ≤×2).
+    """
+    out = {k: dict(v) for k, v in (calib or {}).items()}
+    for a, ab in out.items():
+        mu_tr = float(train_means.get(a, np.nan))
+        mu_va = float(val_means.get(a, np.nan))
+        if np.isfinite(mu_tr) and np.isfinite(mu_va) and mu_tr > 0 and mu_va > 0:
+            delta = np.log(mu_tr) - np.log(mu_va)
+            # cap the adjustment
+            delta = float(np.clip(delta, -cap_abs_log, cap_abs_log))
+            ab["alpha"] = float(ab.get("alpha", 0.0)) + float(tau) * delta
+    return out
+
+
+@torch.no_grad()
+def apply_log_calibrator_on_array(y_pred: np.ndarray,
+                                  assets: np.ndarray,
+                                  calib: dict,
+                                  floor: float = 1e-10) -> np.ndarray:
+    """
+    Apply per-asset log-linear calibrator to a 1D numpy array of predictions.
+    Calibrator: y' = exp(alpha_a) * y^beta_a  (multiplicative on original scale)
+    """
+    if calib is None or not isinstance(calib, dict):
+        return y_pred
+    y = np.asarray(y_pred, dtype=np.float64).copy()
+    a = np.asarray(assets).astype(str)
+    good = np.isfinite(y) & (y > floor)
+    res = y.copy()
+    # vectorized by unique asset
+    for aa in np.unique(a[good]):
+        mask = good & (a == aa)
+        if not np.any(mask):
+            continue
+        alpha = float(calib.get(str(aa), {}).get("alpha", 0.0))
+        beta  = float(calib.get(str(aa), {}).get("beta",  1.0))
+        res[mask] = np.exp(alpha) * (y[mask] ** beta)
+    # maintain minimum positive floor
+    res[~np.isfinite(res)] = np.nan
+    res = np.clip(res, floor, np.inf)
+    return res
 
 from pytorch_forecasting.metrics import QuantileLoss, MultiLoss
 
@@ -1425,9 +1688,6 @@ class PerAssetMetrics(pl.Callback):
                 if self._pq95_dev:
                     pq95_cpu = torch.cat(self._pq95_dev).detach().cpu()
                     q95_dec = self.vol_norm.decode(pq95_cpu.unsqueeze(-1), group_ids=g_cpu.unsqueeze(-1)).squeeze(-1)
-
-                # Apply the same calibration used in metrics to the median so parquet matches plots
-                pv_dec = calibrate_vol_predictions(yv_dec, pv_dec)
 
                 # map group id -> name
                 assets = [self.id_to_name.get(int(i), str(int(i))) for i in g_cpu.tolist()]
@@ -3333,6 +3593,49 @@ if __name__ == "__main__":
     # Train the model
     trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
 
+# ===== After trainer.fit(model, ...) – LAST EPOCH EXPORTS =====
+print("\n>>> Collecting VAL predictions (uncalibrated) ...")
+val_uncal = collect_split_predictions(trainer, val_loader, split="val")
+val_uncal_path = LOCAL_OUTPUT_DIR / f"val_uncal_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+_save_parquet(val_uncal, val_uncal_path)
+
+# Fit per-asset log calibrator on VAL and bridge to TRAIN level (τ=0.5)
+print(">>> Fitting per-asset log calibrator on VAL and level-adjusting toward TRAIN ...")
+calib = fit_log_calibrator_per_asset(val_uncal, asset_col="asset", y_col="y_vol", p_col="y_vol_pred", floor=1e-10)
+train_means = train_df.groupby("asset", observed=True)["realised_vol"].mean().astype(float).to_dict()
+val_means   = val_df.groupby("asset",   observed=True)["realised_vol"].mean().astype(float).to_dict()
+calib = adjust_calibrator_level(calib, train_means, val_means, tau=0.5, cap_abs_log=np.log(2.0))
+
+# Make a calibrated copy of VAL (apply to q05/q50/q95)
+if not val_uncal.empty:
+    vcal = val_uncal.copy()
+    a = vcal["asset"].astype(str).values
+    # apply to all available vol columns
+    vcal["y_vol_pred"]      = apply_log_calibrator_on_array(vcal["y_vol_pred"].values, a, calib)
+    if "y_vol_pred_q05" in vcal.columns and vcal["y_vol_pred_q05"].notna().any():
+        vcal["y_vol_pred_q05"] = apply_log_calibrator_on_array(vcal["y_vol_pred_q05"].fillna(np.nan).values, a, calib)
+    if "y_vol_pred_q95" in vcal.columns and vcal["y_vol_pred_q95"].notna().any():
+        vcal["y_vol_pred_q95"] = apply_log_calibrator_on_array(vcal["y_vol_pred_q95"].fillna(np.nan).values, a, calib)
+    val_cal_path = LOCAL_OUTPUT_DIR / f"val_calibrated_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+    _save_parquet(vcal, val_cal_path)
+
+    # TEST: collect uncalibrated, then calibrated with the SAME adjusted calibrator
+    print("\n>>> Collecting TEST predictions (uncalibrated) ...")
+    test_uncal = collect_split_predictions(trainer, test_loader, split="test")
+    test_uncal_path = LOCAL_OUTPUT_DIR / f"test_uncal_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+    _save_parquet(test_uncal, test_uncal_path)
+
+    if not test_uncal.empty:
+        tcal = test_uncal.copy()
+        a = tcal["asset"].astype(str).values
+        tcal["y_vol_pred"]      = apply_log_calibrator_on_array(tcal["y_vol_pred"].values, a, calib)
+        if "y_vol_pred_q05" in tcal.columns and tcal["y_vol_pred_q05"].notna().any():
+            tcal["y_vol_pred_q05"] = apply_log_calibrator_on_array(tcal["y_vol_pred_q05"].fillna(np.nan).values, a, calib)
+        if "y_vol_pred_q95" in tcal.columns and tcal["y_vol_pred_q95"].notna().any():
+            tcal["y_vol_pred_q95"] = apply_log_calibrator_on_array(tcal["y_vol_pred_q95"].fillna(np.nan).values, a, calib)
+        test_cal_path = LOCAL_OUTPUT_DIR / f"test_calibrated_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
+        _save_parquet(tcal, test_cal_path)
+
     # Resolve the best checkpoint
     model_for_fi = _resolve_best_model(trainer, fallback=tft)
 
@@ -3356,21 +3659,7 @@ if ENABLE_FEATURE_IMPORTANCE:
         # fallback to validation dataset if needed
         train_vol_norm = _extract_norm_from_dataset(validation_dataset)
 
-    run_permutation_importance(
-        model=model_for_fi,
-        template_ds=training_dataset,          # 👈 use TRAIN template
-        base_df=val_df,
-        features=feats,
-        block_size=int(PERM_BLOCK_SIZE) if PERM_BLOCK_SIZE else 1,
-        batch_size=256,
-        max_batches=int(FI_MAX_BATCHES) if FI_MAX_BATCHES else 40,
-        num_workers=4,
-        prefetch=2,
-        pin_memory=pin,
-        vol_norm=train_vol_norm,               # 👈 ensure decoded metrics
-        out_csv_path=fi_csv,
-        uploader=upload_file_to_gcs,
-    )
+
     # --- Safe plotting/logging: deep-cast any nested tensors to CPU float32 ---
     # --- Safe plotting/logging: class-level patch to handle bf16 + integer lengths robustly ---
 
