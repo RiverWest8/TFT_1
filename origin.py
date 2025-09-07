@@ -3048,9 +3048,7 @@ def _train_single_fold(train_df: pd.DataFrame, val_df: pd.DataFrame, fold_id: in
     fold_logs.mkdir(parents=True, exist_ok=True)
 
     callbacks = [
-        SafeTQDMProgressBar(refresh_rate=getattr(ARGS, "log_every_n_steps", 200)),
         LearningRateMonitor(logging_interval="epoch"),
-        ModelCheckpoint(dirpath=str(fold_ckpt), filename="best", monitor="val_comp_overall", mode="min", save_top_k=1, save_last=True),
         per_asset_cb,
     ] + EXTRA_CALLBACKS
 
