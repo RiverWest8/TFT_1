@@ -3102,7 +3102,7 @@ def _derive_direction_inplace(df: "pd.DataFrame", group_col: str) -> "pd.DataFra
     # If we get here, we failed to derive; leave as-is
     return df
 
-# ---- Helper: coerce targets safely without leaking loop vars into except ----
+# ---- Helper: coerce targets safely without leaking loop vars into except 
 def _coerce_targets_inplace(df: "pd.DataFrame") -> None:
     if df is None or len(df) == 0:
         return
@@ -3171,19 +3171,6 @@ def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df
         if "direction" not in base.columns:
             raise ValueError("Required target column 'direction' missing from universal_data.parquet and could not be derived from returns/prices")
 
-    # Coerce targets to numeric (direction to {0,1})
-    try:
-        base["realised_vol"] = pd.to_numeric(base["realised_vol"], errors="coerce")
-    except Exception:
-        pass
-    try:
-        if not pd.api.types.is_numeric_dtype(_df["direction"]):
-            _df["direction"] = _df["direction"].map({"up":1, "down":0, True:1, False:0})
-        _df["direction"] = pd.to_numeric(_df["direction"], errors="coerce").fillna(0.0)
-        _df["direction"] = (_df["direction"] > 0.5).astype("float32")
-    except Exception:
-        _df["direction"] = pd.to_numeric(_df["direction"], errors="coerce").fillna(0.0)
-        _df["direction"] = (_df["direction"] > 0.5).astype("float32")
     # Determine per-asset cut time for last 10% (fixed TEST)
     test_cut_times = {}
     for asset, g in base.groupby(GROUP_ID[0], observed=True, sort=False):
