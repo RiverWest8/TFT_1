@@ -3,7 +3,7 @@
 """
 Temporal Fusion Transformer (TFT) pipeline
 ==========================================
-python3 TFT.py   --max_epochs 10   --batch_size 256   --max_encoder_length 64   --check_val_every_n_epoch 1   --log_every_n_steps 50   --num_workers 12   --prefetch_factor 2   --enable_perm_importance false   --perm_len 288   --fi_max_batches 15   --resume false   --gcs_data_prefix gs://river-ml-bucket/Data/CleanedData   --gcs_output_prefix gs://river-ml-bucket/Dissertation/Feature_Ablation/f_$(date -u +%s)
+python3 TFT.py   --max_epochs 10   --batch_size 256   --max_encoder_length 64   --check_val_every_n_epoch 1   --log_every_n_steps 50   --num_workers 12   --prefetch_factor 2 --resume false   --gcs_data_prefix gs://river-ml-bucket/Data/CleanedData   --gcs_output_prefix gs://river-ml-bucket/Dissertation/Feature_Ablation/f_$(date -u +%s)
 
 
 This script trains a single TFT model that jointly predicts:
@@ -218,15 +218,6 @@ def _extract_norm_from_dataset(ds):
 
     # already a single normalizer
     return tn
-
-
-def _point_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
-    """
-    Enforce non-decreasing quantiles along last dim and return the median (q=0.5).
-    Assumes VOL_QUANTILES has q=0.50 at index 3.
-    """
-    vol_q = torch.cummax(vol_q, dim=-1).values
-    return vol_q[..., 3]  # Q50_IDX
 
 #EXTRACT HEADSSSSS
 def _extract_heads(pred):
@@ -2631,7 +2622,7 @@ EXTRA_CALLBACKS = [
           save_last=True,
       ),
       StochasticWeightAveraging(swa_lrs = 1e6 , annealing_epochs = 1, annealing_strategy="cos", swa_epoch_start=max(1, int(0.9 * MAX_EPOCHS))),
-      CosineLR(start_epoch=10, eta_min_ratio=0.05, hold_last_epochs=2, warmup_steps=0),
+      CosineLR(start_epoch=10, eta_min_ratio=0.05, hold_last_epochs=1, warmup_steps=0),
       ]
 
 class ValLossHistory(pl.Callback):
@@ -2922,218 +2913,7 @@ def subset_time_series(df: pd.DataFrame, max_rows: int | None, mode: str = "per_
             out = out.tail(int(max_rows))
     return out.reset_index(drop=True)
 
-# -----------------------------------------------------------------------
-# Permutation Importance helpers at module scope (decoded metric = MAE + RMSE + 0.05 * DirBCE)
-# -----------------------------------------------------------------------
 
-
-# NOTE: If you explicitly instantiate a TQDMProgressBar in your callbacks, remove it or comment it out.
-# For example, if you see:
-# callbacks.append(TQDMProgressBar(...))
-# or
-# callbacks = [TQDMProgressBar(...), ...]
-# remove the TQDMProgressBar from the list.
-
-@torch.no_grad()
-def _evaluate_decoded_metrics(
-    model,
-    ds: TimeSeriesDataSet,
-    batch_size: int,
-    max_batches: int,
-    num_workers: int,
-    prefetch: int,
-    pin_memory: bool,
-    vol_norm,                 # GroupNormalizer from TRAIN (for realised_vol)
-):
-    """
-    Evaluate model on a dataset configured with predict=True, computing:
-      • MAE, RMSE, QLIKE on decoded realised_vol
-      • Brier on direction (if available)
-    Returns: (mae, rmse, brier, qlike, N)
-    """
-    model.eval()
-    model_device = next(model.parameters()).device  # <<< NEW
-
-    # dataloader mirrors validation loader; dataset already has predict=True
-    loader = ds.to_dataloader(
-        train=False,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        shuffle=False,
-        drop_last=False,
-        pin_memory=pin_memory,
-        persistent_workers=False,
-        prefetch_factor=prefetch if num_workers and num_workers > 0 else None,
-    )
-
-    # --- helper to move nested batch dicts to model_device ---
-    def _move_to_device(x):
-        if torch.is_tensor(x):
-            return x.to(model_device, non_blocking=True)
-        if isinstance(x, dict):
-            return {k: _move_to_device(v) for k, v in x.items()}
-        if isinstance(x, (list, tuple)):
-            t = [_move_to_device(v) for v in x]
-            return type(x)(t) if not isinstance(x, tuple) else tuple(t)
-        return x
-
-    g_list, yv_list, pv_list = [], [], []
-    yd_list, pd_list = [], []
-
-    batches_seen = 0
-    for batch in loader:
-        # Accept (x, y, *rest) or just x
-        if isinstance(batch, (list, tuple)):
-            x = batch[0]
-            y = batch[1] if len(batch) > 1 else None
-        else:
-            x, y = batch, None
-        if not isinstance(x, dict):
-            continue
-
-        # --- move nested tensors to the model device (helper stays unchanged) ---
-        x_dev = _move_to_device(x)
-        if y is not None:
-            y = _move_to_device(y)
-
-
-        # group ids (taken from x_dev so same device)
-        groups = None
-        for k in ("groups", "group_ids", "group_id"):
-            if k in x_dev and x_dev[k] is not None:
-                groups = x_dev[k]
-                break
-        if groups is None:
-            continue
-        g = groups[0] if isinstance(groups, (list, tuple)) else groups
-        while torch.is_tensor(g) and g.ndim > 1 and g.size(-1) == 1:
-            g = g.squeeze(-1)
-
-        # targets from decoder_target (fallback to y)
-        dec_t = x_dev.get("decoder_target", None)
-        y_vol_t, y_dir_t = None, None
-        if torch.is_tensor(dec_t):
-            t = dec_t
-            if t.ndim == 3 and t.size(-1) == 1:
-                t = t[..., 0]
-            if t.ndim == 2 and t.size(1) >= 1:
-                y_vol_t = t[:, 0]
-                if t.size(1) > 1:
-                    y_dir_t = t[:, 1]
-        elif isinstance(dec_t, (list, tuple)) and len(dec_t) >= 1:
-            y_vol_t = dec_t[0]
-            if torch.is_tensor(y_vol_t) and y_vol_t.ndim == 3 and y_vol_t.size(-1) == 1:
-                y_vol_t = y_vol_t[..., 0]
-            if len(dec_t) > 1 and torch.is_tensor(dec_t[1]):
-                y_dir_t = dec_t[1]
-                if y_dir_t.ndim == 3 and y_dir_t.size(-1) == 1:
-                    y_dir_t = y_dir_t[..., 0]
-
-        if (y_vol_t is None) and torch.is_tensor(y):
-            yy = y.to(model_device, non_blocking=True)  # <<< ensure same device if used
-            if yy.ndim == 3 and yy.size(1) == 1:
-                yy = yy[:, 0, :]
-            if yy.ndim == 2 and yy.size(1) >= 1:
-                y_vol_t = yy[:, 0]
-                if yy.size(1) > 1:
-                    y_dir_t = yy[:, 1]
-
-        if (y_vol_t is None) or (not torch.is_tensor(g)):
-            continue
-
-        # forward pass and head extraction
-        y_hat = model(x_dev)  # <<< CUDA-safe now
-        pred = getattr(y_hat, "prediction", y_hat)
-        if isinstance(pred, dict) and "prediction" in pred:
-            pred = pred["prediction"]
-
-        # split heads (same logic as before)
-        def _extract_heads(prediction):
-            if isinstance(prediction, (list, tuple)):
-                vol_q = prediction[0]
-                d_log = prediction[1] if len(prediction) > 1 else None
-                return vol_q, d_log
-            t = prediction
-            if torch.is_tensor(t):
-                if t.ndim >= 4 and t.size(1) == 1:
-                    t = t.squeeze(1)
-                if t.ndim == 3 and t.size(1) == 1:
-                    t = t[:, 0, :]
-                if t.ndim == 2:
-                    vol_q = t[:, :-1]
-                    d_log = t[:, -1]
-                    return vol_q, d_log
-            return None, None
-
-        p_vol, p_dir = _extract_heads(pred)
-        if p_vol is None:
-            continue
-
-        # take median quantile for vol
-        def _median_from_quantiles(vol_q: torch.Tensor) -> torch.Tensor:
-            vol_q = torch.cummax(vol_q, dim=-1).values
-            # assumes 7 quantiles with 0.50 at index 3
-            return vol_q[..., 3]
-
-        p_vol_med = _median_from_quantiles(p_vol)
-
-        L = g.shape[0]
-        g_list.append(g.reshape(L))
-        yv_list.append(y_vol_t.reshape(L))
-        pv_list.append(p_vol_med.reshape(L))
-
-        if y_dir_t is not None and p_dir is not None:
-            yd = y_dir_t.reshape(-1)
-            pd = p_dir.reshape(-1)
-            L2 = min(L, yd.numel(), pd.numel())
-            if L2 > 0:
-                yd_list.append(yd[:L2])
-                pd_list.append(pd[:L2])
-
-        batches_seen += 1
-        if max_batches is not None and max_batches > 0 and batches_seen >= max_batches:
-            break
-
-    if not g_list:
-        # empty input → return NaNs-ish but finite
-        return 1.0, 1.0, 0.25, 10.0, 0
-
-    device = g_list[0].device
-    g_all  = torch.cat(g_list).to(device)
-    y_all  = torch.cat(yv_list).to(device)
-    p_all  = torch.cat(pv_list).to(device)
-
-    # decode realised_vol
-    y_dec = safe_decode_vol(y_all.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
-    p_dec = safe_decode_vol(p_all.unsqueeze(-1), vol_norm, g_all.unsqueeze(-1)).squeeze(-1)
-    floor_val = globals().get("EVAL_VOL_FLOOR", 1e-8)
-    y_dec = torch.clamp(y_dec, min=floor_val)
-    p_dec = torch.clamp(p_dec, min=floor_val)
-
-    # metrics
-    eps = 1e-8
-    diff = (p_dec - y_dec)
-    mae  = diff.abs().mean().item()
-    rmse = (diff.pow(2).mean().sqrt().item())
-
-    sigma2_p = torch.clamp(p_dec.abs(), min=eps) ** 2
-    sigma2_y = torch.clamp(y_dec.abs(), min=eps) ** 2
-    ratio    = sigma2_y / sigma2_p
-    qlike    = (ratio - torch.log(ratio) - 1.0).mean().item()
-
-    brier = None
-    if yd_list and pd_list:
-        yd = torch.cat(yd_list).to(device).float()
-        pd = torch.cat(pd_list).to(device)
-        try:
-            if torch.isfinite(pd).any() and (pd.min() < 0 or pd.max() > 1):
-                pd = torch.sigmoid(pd)
-        except Exception:
-            pd = torch.sigmoid(pd)
-        pd = torch.clamp(pd, 0.0, 1.0)
-        brier = ((pd - yd) ** 2).mean().item()
-
-    return float(mae), float(rmse), (float(brier) if brier is not None else float("nan")), float(qlike), int(y_dec.numel())
 
 # --- after trainer.fit(...), before running FI ---
 def _resolve_best_model(trainer, fallback):
@@ -3565,48 +3345,81 @@ if __name__ == "__main__":
     # Train the model
     trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
 
-# ===== After trainer.fit(model, ...) – LAST EPOCH EXPORTS =====
-print("\n>>> Collecting VAL predictions (uncalibrated) ...")
-val_uncal = collect_split_predictions(trainer, val_dataloader, split="val")
-val_uncal_path = LOCAL_OUTPUT_DIR / f"val_uncal_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
-_save_parquet(val_uncal, val_uncal_path)
+    # ---------- AFTER trainer.fit(model, ...) ----------
 
-# Fit per-asset log calibrator on VAL and bridge to TRAIN level (τ=0.5)
-print(">>> Fitting per-asset log calibrator on VAL and level-adjusting toward TRAIN ...")
-calib = fit_log_calibrator_per_asset(val_uncal, asset_col="asset", y_col="y_vol", p_col="y_vol_pred", floor=1e-10)
-train_means = train_df.groupby("asset", observed=True)["realised_vol"].mean().astype(float).to_dict()
-val_means   = val_df.groupby("asset",   observed=True)["realised_vol"].mean().astype(float).to_dict()
-calib = adjust_calibrator_level(calib, train_means, val_means, tau=0.5, cap_abs_log=np.log(2.0))
+    # Make sure Time merge can find the source data
+    globals()["val_df"] = val_df
+    globals()["test_df"] = test_df
 
-# Make a calibrated copy of VAL (apply to q05/q50/q95)
-if not val_uncal.empty:
-    vcal = val_uncal.copy()
-    a = vcal["asset"].astype(str).values
-    # apply to all available vol columns
-    vcal["y_vol_pred"]      = apply_log_calibrator_on_array(vcal["y_vol_pred"].values, a, calib)
-    if "y_vol_pred_q05" in vcal.columns and vcal["y_vol_pred_q05"].notna().any():
-        vcal["y_vol_pred_q05"] = apply_log_calibrator_on_array(vcal["y_vol_pred_q05"].fillna(np.nan).values, a, calib)
-    if "y_vol_pred_q95" in vcal.columns and vcal["y_vol_pred_q95"].notna().any():
-        vcal["y_vol_pred_q95"] = apply_log_calibrator_on_array(vcal["y_vol_pred_q95"].fillna(np.nan).values, a, calib)
-    val_cal_path = LOCAL_OUTPUT_DIR / f"val_calibrated_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
-    _save_parquet(vcal, val_cal_path)
+    # 1) Collect UNCALIBRATED predictions (last epoch, in-memory model)
+    val_uncal_df  = collect_split_predictions(trainer, val_loader,  split="val")
+    test_uncal_df = collect_split_predictions(trainer, test_loader, split="test")
 
-    # TEST: collect uncalibrated, then calibrated with the SAME adjusted calibrator
-    print("\n>>> Collecting TEST predictions (uncalibrated) ...")
-    test_uncal = collect_split_predictions(trainer, test_dataloader, split="test")
-    test_uncal_path = LOCAL_OUTPUT_DIR / f"test_uncal_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
-    _save_parquet(test_uncal, test_uncal_path)
+    # 2) Fit per-asset log-calibrator on VAL and adjust toward TRAIN mean level
+    #    (handles the shift you observed: mean(train) ~ 0.00528, mean(val) ~ 0.00346, mean(test) ~ 0.00517)
+    def _per_asset_mean(df: pd.DataFrame, col="realised_vol", asset_col="asset") -> dict:
+        g = df[[asset_col, col]].replace([np.inf, -np.inf], np.nan).dropna()
+        return g.groupby(asset_col)[col].mean().to_dict() if not g.empty else {}
 
-    if not test_uncal.empty:
-        tcal = test_uncal.copy()
-        a = tcal["asset"].astype(str).values
-        tcal["y_vol_pred"]      = apply_log_calibrator_on_array(tcal["y_vol_pred"].values, a, calib)
-        if "y_vol_pred_q05" in tcal.columns and tcal["y_vol_pred_q05"].notna().any():
-            tcal["y_vol_pred_q05"] = apply_log_calibrator_on_array(tcal["y_vol_pred_q05"].fillna(np.nan).values, a, calib)
-        if "y_vol_pred_q95" in tcal.columns and tcal["y_vol_pred_q95"].notna().any():
-            tcal["y_vol_pred_q95"] = apply_log_calibrator_on_array(tcal["y_vol_pred_q95"].fillna(np.nan).values, a, calib)
-        test_cal_path = LOCAL_OUTPUT_DIR / f"test_calibrated_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
-        _save_parquet(tcal, test_cal_path)
+    calib_raw = fit_log_calibrator_per_asset(
+        df_val=val_uncal_df.rename(columns={"y_vol": "y_vol", "y_vol_pred": "y_vol_pred"}),
+        asset_col="asset", y_col="y_vol", p_col="y_vol_pred"
+    )
+
+    train_means = _per_asset_mean(train_df.rename(columns={"realised_vol": "realised_vol"}), col="realised_vol")
+    val_means   = _per_asset_mean(val_df.rename(columns={"realised_vol": "realised_vol"}),   col="realised_vol")
+
+    # tau ∈ [0,1]: how strongly to nudge the intercept toward train level
+    calib_adj = adjust_calibrator_level(calib_raw, train_means, val_means, tau=0.7)
+
+    # 3) Apply calibrator to VAL and TEST (creates calibrated copies)
+    def _apply_cal_to_df(df_in: pd.DataFrame) -> pd.DataFrame:
+        df = df_in.copy()
+        # Apply to point forecast
+        df["y_vol_pred_cal"] = apply_log_calibrator_on_array(
+            df["y_vol_pred"].to_numpy(), df["asset"].to_numpy(), calib_adj
+        )
+        # Optionally apply to quantiles if present (keeps intervals proportional)
+        if "y_vol_pred_q05" in df.columns and df["y_vol_pred_q05"].notna().any():
+            df["y_vol_pred_q05_cal"] = apply_log_calibrator_on_array(
+                df["y_vol_pred_q05"].to_numpy(), df["asset"].to_numpy(), calib_adj
+            )
+        if "y_vol_pred_q95" in df.columns and df["y_vol_pred_q95"].notna().any():
+            df["y_vol_pred_q95_cal"] = apply_log_calibrator_on_array(
+                df["y_vol_pred_q95"].to_numpy(), df["asset"].to_numpy(), calib_adj
+            )
+        return df
+
+    val_cal_df  = _apply_cal_to_df(val_uncal_df)
+    test_cal_df = _apply_cal_to_df(test_uncal_df)
+
+    # 4) Save all four parquets (UN/Calibrated, VAL/TEST)
+    OUT = Path(LOCAL_OUTPUT_DIR)
+    OUT.mkdir(parents=True, exist_ok=True)
+
+    p_val_uncal = OUT / f"tft_val_predictions_uncal_last_{RUN_SUFFIX}.parquet"
+    p_val_cal   = OUT / f"tft_val_predictions_cal_last_{RUN_SUFFIX}.parquet"
+    p_tst_uncal = OUT / f"tft_test_predictions_uncal_last_{RUN_SUFFIX}.parquet"
+    p_tst_cal   = OUT / f"tft_test_predictions_cal_last_{RUN_SUFFIX}.parquet"
+
+    val_uncal_df.to_parquet(p_val_uncal, index=False)
+    val_cal_df.to_parquet(p_val_cal, index=False)
+    test_uncal_df.to_parquet(p_tst_uncal, index=False)
+    test_cal_df.to_parquet(p_tst_cal, index=False)
+
+    print(f"✓ Wrote VAL uncal → {p_val_uncal}")
+    print(f"✓ Wrote VAL  cal → {p_val_cal}")
+    print(f"✓ Wrote TEST uncal → {p_tst_uncal}")
+    print(f"✓ Wrote TEST  cal → {p_tst_cal}")
+
+    # Optional: upload to GCS if configured
+    try:
+        upload_file_to_gcs(str(p_val_uncal), f"{GCS_OUTPUT_PREFIX}/{p_val_uncal.name}")
+        upload_file_to_gcs(str(p_val_cal),   f"{GCS_OUTPUT_PREFIX}/{p_val_cal.name}")
+        upload_file_to_gcs(str(p_tst_uncal), f"{GCS_OUTPUT_PREFIX}/{p_tst_uncal.name}")
+        upload_file_to_gcs(str(p_tst_cal),   f"{GCS_OUTPUT_PREFIX}/{p_tst_cal.name}")
+    except Exception as e:
+        print(f"[WARN] GCS upload skipped: {e}")
 
     # Resolve the best checkpoint
     model_for_fi = _resolve_best_model(trainer, fallback=tft)
