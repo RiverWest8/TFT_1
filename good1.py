@@ -3338,6 +3338,164 @@ if __name__ == "__main__":
     test_cal_df = _apply_affine_alignment(test_cal_df, aff_blend, asset_col="asset")
     print("[CAL] TRAIN-anchored affine alignment:", {k:(round(a,6), round(b,3)) for k,(a,b) in aff_blend.items()})
 
+    # === [CAL ALIGNMENT 2] Low-end fix via log-space isotonic multiplier + conditional q05/q95 ===
+    # Inserted AFTER affine alignment and BEFORE diagnostics/saving.
+
+    def _calib_fit_iso_mult_log(val_df, y_col="y_vol", p_col="y_vol_pred_cal", asset_col="asset",
+                                y_floor=1e-9, mult_clip=(0.3, 2.5), min_unique=40):
+        """
+        Learn per-asset monotone multiplier m(p) in log-space on VAL:
+            x = log(p), t = log(y) - log(p),   m = exp( iso(x) )
+        Returns dict[asset] -> (IsotonicRegression, use_log=True)
+        """
+        try:
+            from sklearn.isotonic import IsotonicRegression
+        except Exception:
+            print("[CAL] IsotonicRegression not available; skipping iso multiplier.")
+            return {}
+
+        models = {}
+        g = val_df[[asset_col, y_col, p_col]].replace([np.inf, -np.inf], np.nan).dropna()
+        if g.empty:
+            return models
+        for a, d in g.groupby(asset_col):
+            p = d[p_col].astype(float).to_numpy()
+            y = d[y_col].astype(float).to_numpy()
+            p = np.clip(p, y_floor, None)
+            y = np.clip(y, y_floor, None)
+            x = np.log(p)
+            t = np.log(y) - np.log(p)                     # ideal multiplier in log-space
+            lo, hi = np.log(mult_clip[0]), np.log(mult_clip[1])
+            if np.unique(x).size < max(10, min_unique):
+                continue
+            iso = IsotonicRegression(y_min=lo, y_max=hi, increasing=True, out_of_bounds="clip")
+            iso.fit(x, t)
+            models[str(a)] = (iso, True)
+        return models
+
+    def _calib_apply_iso_mult_log(df, models, asset_col="asset",
+                                  p_cols=("y_vol_pred_cal","y_vol_pred_q05_cal","y_vol_pred_q95_cal"),
+                                  y_floor=1e-9):
+        """
+        Apply m(p) to median and (optionally) to quantiles. Keeps non-negativity and quantile monotonicity.
+        """
+        if not models:
+            return df
+        out = df.copy()
+        for a, pack in models.items():
+            iso, use_log = pack
+            sel = out[asset_col].astype(str) == str(a)
+            if not np.any(sel) or iso is None:
+                continue
+            for c in p_cols:
+                if c in out.columns:
+                    p = out.loc[sel, c].astype(float).to_numpy()
+                    p = np.clip(p, y_floor, None)
+                    m = np.exp(iso.predict(np.log(p))) if use_log else iso.predict(p)
+                    out.loc[sel, c] = np.maximum(p * m, y_floor)
+        # keep quantiles monotone if present
+        if all(c in out.columns for c in ("y_vol_pred_q05_cal","y_vol_pred_cal","y_vol_pred_q95_cal")):
+            q05 = out["y_vol_pred_q05_cal"].to_numpy()
+            q50 = out["y_vol_pred_cal"].to_numpy()
+            q95 = out["y_vol_pred_q95_cal"].to_numpy()
+            out["y_vol_pred_q05_cal"] = np.minimum(q05, q50)
+            out["y_vol_pred_q95_cal"] = np.maximum(q95, q50)
+        return out
+
+    def _calib_fit_cond_residual_iso(val_df, y_col="y_vol", p_col="y_vol_pred_cal", asset_col="asset",
+                                     q_low=0.05, q_high=0.95, y_floor=1e-9, min_unique=40, use_log_x=True):
+        """
+        Learn per-asset conditional residual quantiles:
+            x = log(p_mid) if use_log_x else p_mid, r = y - p_mid
+        Fit isotonic models f05(x) ≈ Q_{0.05}(r|x), f95(x) ≈ Q_{0.95}(r|x)
+        Returns dict[asset] -> (iso05, iso95, use_log_x)
+        """
+        try:
+            from sklearn.isotonic import IsotonicRegression
+        except Exception:
+            print("[CAL] IsotonicRegression not available; skipping q05/q95 residual models.")
+            return {}
+        out = {}
+        g = val_df[[asset_col, y_col, p_col]].replace([np.inf, -np.inf], np.nan).dropna()
+        if g.empty:
+            return out
+        for a, d in g.groupby(asset_col):
+            p = d[p_col].astype(float).to_numpy()
+            y = d[y_col].astype(float).to_numpy()
+            p = np.clip(p, y_floor, None)
+            y = np.clip(y, y_floor, None)
+            r = y - p
+            x = np.log(p) if use_log_x else p
+            if np.unique(x).size < max(10, min_unique):
+                continue
+            # bin x, compute sample q05/q95 per bin, then isotonic-smooth
+            nb = max(20, int(np.sqrt(len(x))))
+            idx = np.argsort(x)
+            xb = x[idx]; rb = r[idx]
+            bins = np.array_split(np.arange(len(xb)), nb)
+            x_cent = np.array([xb[b].mean() for b in bins])
+            r05 = np.array([np.nanquantile(rb[b], q_low) for b in bins])
+            r95 = np.array([np.nanquantile(rb[b], q_high) for b in bins])
+            iso05 = IsotonicRegression(increasing=True, out_of_bounds="clip")
+            iso95 = IsotonicRegression(increasing=True, out_of_bounds="clip")
+            iso05.fit(x_cent, r05)
+            iso95.fit(x_cent, r95)
+            out[str(a)] = (iso05, iso95, use_log_x)
+        return out
+
+    def _calib_apply_cond_residual_iso(df, models, asset_col="asset",
+                                       p_mid="y_vol_pred_cal",
+                                       p_lo="y_vol_pred_q05_cal",
+                                       p_hi="y_vol_pred_q95_cal",
+                                       floor=1e-9):
+        """
+        Apply conditional residual quantiles to set q05/q95 around the calibrated median.
+        Enforces non-negativity and q05 ≤ q50 ≤ q95.
+        """
+        if not models:
+            return df
+        out = df.copy()
+        for a, pack in models.items():
+            iso05, iso95, use_log_x = pack
+            sel = out[asset_col].astype(str) == str(a)
+            if not np.any(sel) or p_mid not in out.columns or iso05 is None or iso95 is None:
+                continue
+            mid = out.loc[sel, p_mid].astype(float).to_numpy()
+            x = np.log(np.clip(mid, floor, None)) if use_log_x else np.clip(mid, floor, None)
+            lo = mid + iso05.predict(x)
+            hi = mid + iso95.predict(x)
+            lo = np.maximum(lo, floor)
+            hi = np.maximum(hi, lo)
+            if p_lo in out.columns:
+                out.loc[sel, p_lo] = lo
+            if p_hi in out.columns:
+                out.loc[sel, p_hi] = hi
+        return out
+
+    # ---- Fit on VAL (after affine), then apply to both VAL and TEST ----
+    _iso_models = _calib_fit_iso_mult_log(
+        val_cal_df,
+        y_col="y_vol", p_col="y_vol_pred_cal", asset_col="asset",
+        y_floor=float(globals().get("EVAL_VOL_FLOOR", 1e-9)),
+        mult_clip=(0.3, 2.5), min_unique=40,
+    )
+    if _iso_models:
+        val_cal_df  = _calib_apply_iso_mult_log(val_cal_df,  _iso_models, asset_col="asset")
+        test_cal_df = _calib_apply_iso_mult_log(test_cal_df, _iso_models, asset_col="asset")
+        print("[CAL] Applied per-asset isotonic multiplier (log-space).")
+
+    _res_models = _calib_fit_cond_residual_iso(
+        val_cal_df,
+        y_col="y_vol", p_col="y_vol_pred_cal", asset_col="asset",
+        q_low=0.05, q_high=0.95,
+        y_floor=float(globals().get("EVAL_VOL_FLOOR", 1e-9)),
+        min_unique=40, use_log_x=True,
+    )
+    if _res_models:
+        val_cal_df  = _calib_apply_cond_residual_iso(val_cal_df,  _res_models, asset_col="asset")
+        test_cal_df = _calib_apply_cond_residual_iso(test_cal_df, _res_models, asset_col="asset")
+        print("[CAL] Calibrated q05/q95 conditionally on the calibrated median.")
+
     # Diagnostics (means/stds by asset after alignment)
     def _diag_by_asset(df, asset_col="asset", y_col="y_vol", p_col="y_vol_pred_cal", label="VAL"):
         g = df[[asset_col, y_col, p_col]].replace([np.inf, -np.inf], np.nan).dropna()
