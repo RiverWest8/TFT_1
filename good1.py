@@ -3322,7 +3322,7 @@ if __name__ == "__main__":
 
     def _compute_affine_alignment_blended(train_df_in, val_df_in,
                                         y_col="y_vol", p_col="y_vol_pred_cal",
-                                        asset_col="asset", slope_clip=(0.8, 1.4),
+                                        asset_col="asset", slope_clip=(0.8, 1.6),
                                         train_weight_if_uplift=0.75, uplift_thresh=1.2):
         """
         Per-asset affine: p' = a + b p
@@ -3399,7 +3399,7 @@ if __name__ == "__main__":
     # Inserted AFTER affine alignment and BEFORE diagnostics/saving.
 
     def _calib_fit_iso_mult_log(val_df, y_col="y_vol", p_col="y_vol_pred_cal", asset_col="asset",
-                                y_floor=1e-9, mult_clip=(0.3, 2.5), min_unique=40):
+                                y_floor=1e-9, mult_clip=(0.3, 3.0), min_unique=40):
         """
         Learn per-asset monotone multiplier m(p) in log-space on VAL:
             x = log(p), t = log(y) - log(p),   m = exp( iso(x) )
@@ -3599,7 +3599,7 @@ if __name__ == "__main__":
         return out
 
     _anchor = _per_asset_mean_anchor(val_cal_df, y_col="y_vol", p_col="y_vol_pred_cal",
-                                    asset_col="asset", mult_clip=(0.9, 1.1))
+                                    asset_col="asset", mult_clip=(0.88, 1.12))
     if _anchor:
         val_cal_df  = _apply_mean_anchor(val_cal_df,  _anchor, asset_col="asset")
         test_cal_df = _apply_mean_anchor(test_cal_df, _anchor, asset_col="asset")
