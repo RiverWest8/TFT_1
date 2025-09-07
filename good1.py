@@ -92,37 +92,10 @@ from torchmetrics.classification import BinaryAUROC
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-def _permute_series_inplace(df: pd.DataFrame, col: str, block: int, group_col: str = "asset") -> None:
-    if col not in df.columns:
-        return
-    if group_col not in df.columns:
-        vals = df[col].values.copy()
-        np.random.shuffle(vals)
-        df[col] = vals
-        return
-    for _, idx in df.groupby(group_col, observed=True).groups.items():
-        idx = np.asarray(list(idx))
-        if block and block > 1:
-            shift = np.random.randint(1, max(2, len(idx)))
-            df.loc[idx, col] = df.loc[idx, col].values.take(np.arange(len(idx)) - shift, mode='wrap')
-        else:
-            vals = df.loc[idx, col].values.copy()
-            np.random.shuffle(vals)
-            df.loc[idx, col] = vals
-
-
-# helper (put once near the top of the file, or inline if you prefer)
-def _first_not_none(d, keys):
-    for k in keys:
-        v = d.get(k, None)
-        if v is not None:
-            return v
-    return None
 
 # ------------------ Imports ------------------
 
 from pytorch_forecasting import (
-    BaseModel,
     TemporalFusionTransformer,
     TimeSeriesDataSet,
 )
@@ -2716,7 +2689,6 @@ EMBEDDING_CARDINALITY = {}
 BATCH_SIZE   = 128
 MAX_EPOCHS   = 35
 EARLY_STOP_PATIENCE = 13
-PERM_BLOCK_SIZE = 288
 
 # Artifacts are written locally then uploaded to GCS
 from datetime import datetime, timezone, timedelta
@@ -3595,7 +3567,7 @@ if __name__ == "__main__":
 
 # ===== After trainer.fit(model, ...) – LAST EPOCH EXPORTS =====
 print("\n>>> Collecting VAL predictions (uncalibrated) ...")
-val_uncal = collect_split_predictions(trainer, val_loader, split="val")
+val_uncal = collect_split_predictions(trainer, val_dataloader, split="val")
 val_uncal_path = LOCAL_OUTPUT_DIR / f"val_uncal_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
 _save_parquet(val_uncal, val_uncal_path)
 
@@ -3621,7 +3593,7 @@ if not val_uncal.empty:
 
     # TEST: collect uncalibrated, then calibrated with the SAME adjusted calibrator
     print("\n>>> Collecting TEST predictions (uncalibrated) ...")
-    test_uncal = collect_split_predictions(trainer, test_loader, split="test")
+    test_uncal = collect_split_predictions(trainer, test_dataloader, split="test")
     test_uncal_path = LOCAL_OUTPUT_DIR / f"test_uncal_e{MAX_EPOCHS}_{RUN_SUFFIX}.parquet"
     _save_parquet(test_uncal, test_uncal_path)
 
@@ -3661,9 +3633,6 @@ if ENABLE_FEATURE_IMPORTANCE:
 
 
     # --- Safe plotting/logging: deep-cast any nested tensors to CPU float32 ---
-    # --- Safe plotting/logging: class-level patch to handle bf16 + integer lengths robustly ---
-
-    from pytorch_forecasting.models.base._base_model import BaseModel # type: ignore
 
     def _deep_cpu_float(x):
         if torch.is_tensor(x):
