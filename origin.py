@@ -3091,8 +3091,24 @@ def _train_single_fold(train_df: pd.DataFrame, val_df: pd.DataFrame, fold_id: in
                                             persistent_workers=num_workers>0, prefetch_factor=getattr(ARGS, "prefetch_factor", 2))
 
     # Define DIR_LOSS and fixed weights just above model instantiation
-    DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.10, pos_weight=1.001, brier_weight=0.18)
-    FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT = 1.0, 0.1
+    # ---- Global multitask losses & weights (shared fold + refit) ----
+    VOL_LOSS = AsymmetricQuantileLoss(
+        quantiles=VOL_QUANTILES,
+        underestimation_factor=1.0,
+        mean_bias_weight=0.0,
+        tail_q=0.90,
+        tail_weight=0.0,
+        qlike_weight=0.0,
+    )
+
+    DIR_LOSS = LabelSmoothedBCEWithBrier(
+        smoothing=0.10,
+        pos_weight=1.001,
+        brier_weight=0.18,
+    )
+
+    FIXED_VOL_WEIGHT: float = 1.0
+    FIXED_DIR_WEIGHT: float = 0.1
     model = TemporalFusionTransformer.from_dataset(
         training,
         hidden_size=96,
@@ -3107,6 +3123,7 @@ def _train_single_fold(train_df: pd.DataFrame, val_df: pd.DataFrame, fold_id: in
         logging_metrics=[],
         log_interval=50,
         log_val_interval=10,
+        reduce_on_plateau_patience=4,   # <<< add this for consistency
     )
 
     id_to_name = {}
@@ -3256,14 +3273,13 @@ def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df
     if uni_df is None or uni_df.empty:
         raise ValueError("Rolling-origin requires universal_data.parquet; uni_df is empty or None.")
     base = uni_df.copy()
-    # --- Canonicalise column names needed for rolling ---
-    # Ensure group id column exists under the canonical name
+
+    # --- Canonicalise column names ---
     if GROUP_ID and GROUP_ID[0] not in base.columns:
         for cand in ("asset", "symbol", "ticker", "instrument", "Asset"):
             if cand in base.columns:
                 base = base.rename(columns={cand: GROUP_ID[0]})
                 break
-    # Ensure time column exists under the canonical name
     if TIME_COL not in base.columns:
         for cand in ("Time", "time", "timestamp", "Timestamp", "datetime", "Datetime", "date", "Date"):
             if cand in base.columns:
@@ -3273,35 +3289,33 @@ def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df
         raise KeyError(f"Required time column '{TIME_COL}' not found in universal_data.parquet; available: {list(base.columns)[:30]}")
     base = base.sort_values([GROUP_ID[0], TIME_COL])
 
-    # Timezone-normalise and enforce target presence/dtypes
+    # Timezone-normalise
     try:
-        if TIME_COL in base.columns:
-            base[TIME_COL] = pd.to_datetime(base[TIME_COL], errors="coerce")
-            try:
-                base[TIME_COL] = base[TIME_COL].dt.tz_localize(None)
-            except Exception:
-                pass
+        base[TIME_COL] = pd.to_datetime(base[TIME_COL], errors="coerce")
+        try:
+            base[TIME_COL] = base[TIME_COL].dt.tz_localize(None)
+        except Exception:
+            pass
     except Exception as _e_tz:
         print(f"[WARN] Could not normalise timezone info (universal): {_e_tz}")
 
-    # Ensure targets exist; derive 'direction' if missing
+    # Ensure targets
     if "realised_vol" not in base.columns:
         raise ValueError("Required target column 'realised_vol' missing from universal_data.parquet")
-
     if "direction" not in base.columns:
         base = _derive_direction_inplace(base, GROUP_ID[0])
         if "direction" not in base.columns:
-            raise ValueError("Required target column 'direction' missing from universal_data.parquet and could not be derived from returns/prices")
+            raise ValueError("Required target column 'direction' missing and could not be derived")
 
-    # Determine per-asset cut time for last 10% (fixed TEST)
+    # Determine per-asset cut time for last 10%
     test_cut_times = {}
     for asset, g in base.groupby(GROUP_ID[0], observed=True, sort=False):
         if len(g) < 10:
             continue
-        k = int(max(1, np.floor(0.1 * len(g))))  # last 10%
+        k = int(max(1, np.floor(0.1 * len(g))))
         test_cut_times[asset] = g.iloc[-k][TIME_COL]
 
-    # Split base into pre-test (90%) and test (10%) per asset
+    # Split pre-test vs fixed test
     pre_list, test_list = [], []
     for asset, g in base.groupby(GROUP_ID[0], observed=True, sort=False):
         cut = test_cut_times.get(asset, g[TIME_COL].max() + pd.Timedelta(days=1))
@@ -3310,13 +3324,10 @@ def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df
     pre_df = pd.concat(pre_list, axis=0, ignore_index=True)
     fixed_test_df = pd.concat(test_list, axis=0, ignore_index=True)
 
-    # Safety: ensure targets present (no try/except leakage of loop vars)
     _coerce_targets_inplace(pre_df)
     _coerce_targets_inplace(fixed_test_df)
-    # Generate folds within pre-test region only
-    hard_end = pre_df[TIME_COL].max()
 
-    # Generate folds within pre-test region only
+    # Rolling folds
     hard_end = pre_df[TIME_COL].max()
     metrics = []
     for fold in generate_rolling_folds(
@@ -3337,7 +3348,6 @@ def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df
         m = _train_single_fold(tr_df, va_df, fold_id=f)
         metrics.append(m)
 
-        # Optional: export in-sample (TRAIN) predictions for this fold
         if getattr(ARGS, "save_insample_after_fold", False):
             try:
                 _, train_loader_ins = _make_ds_and_loader(
@@ -3352,7 +3362,7 @@ def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df
             except Exception as e:
                 print(f"[WARN] In-sample export failed for fold {f}: {e}")
 
-    # Aggregate & save
+    # Aggregate
     if metrics:
         met_df = pd.DataFrame(metrics).set_index("fold_id").sort_index()
         agg = met_df.mean(numeric_only=True).to_dict()
@@ -3369,58 +3379,73 @@ def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df
             upload_file_to_gcs(str(csv_path), f"{GCS_OUTPUT_PREFIX}/rolling_eval_folds.csv")
         except Exception as e:
             print(f"[WARN] GCS upload skipped: {e}")
-        # --- Optional final refit on all pre-test data and TEST export (default: ON) ---
+
+        # Final refit + TEST export
         if getattr(ARGS, "export_test_after_rolling", True):
             try:
                 print("\n>>> Final refit on pre-test data for TEST export …")
-                # Build datasets & loaders
                 train_all_ds, train_all_loader = _make_ds_and_loader(
-                    pre_df,
-                    max_encoder_length=MAX_ENCODER_LENGTH,
-                    max_prediction_length=int(getattr(ARGS, "roll_pred_len", 1)),
-                    batch_size=BATCH_SIZE,
-                    shuffle=False,
+                    pre_df, MAX_ENCODER_LENGTH, int(getattr(ARGS, "roll_pred_len", 1)), BATCH_SIZE, shuffle=False
                 )
                 test_ds, test_loader = _make_ds_and_loader(
-                    fixed_test_df,
-                    max_encoder_length=MAX_ENCODER_LENGTH,
-                    max_prediction_length=int(getattr(ARGS, "roll_pred_len", 1)),
-                    batch_size=BATCH_SIZE,
-                    shuffle=False,
+                    fixed_test_df, MAX_ENCODER_LENGTH, int(getattr(ARGS, "roll_pred_len", 1)), BATCH_SIZE, shuffle=False
                 )
-                # Fresh model
+
+                # Losses
                 VOL_LOSS = AsymmetricQuantileLoss(
-                      quantiles=VOL_QUANTILES,
-                      underestimation_factor=1.00,  # managed by BiasWarmupCallback
-                      mean_bias_weight=0.01,        # small centering on the median for MAE
-                      tail_q=0.85,
-                      tail_weight=1.0,              # will be ramped by TailWeightRamp
-                      qlike_weight=0.0,             # QLIKE weight is ramped safely in BiasWarmupCallback
-                      reduction="mean",
-                  )
+                    quantiles=VOL_QUANTILES,
+                    underestimation_factor=1.0,
+                    mean_bias_weight=0.01,
+                    tail_q=0.85,
+                    tail_weight=1.0,
+                    qlike_weight=0.0,
+                    reduction="mean",
+                )
+                counts = pre_df["direction"].value_counts()
+                n_pos = counts.get(1, 1)
+                n_neg = counts.get(0, 1)
+                pos_weight = float(n_neg / n_pos)
                 DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.02, pos_weight=pos_weight)
                 loss = MultiLoss([VOL_LOSS, DIR_LOSS], weights=[1.0, 0.1])
+
                 model = TemporalFusionTransformer.from_dataset(
                     train_all_ds,
                     hidden_size=96,
                     attention_head_size=4,
                     dropout=0.13,
                     hidden_continuous_size=24,
-                    learning_rate= 0.00085,
+                    learning_rate=0.00085,
                     optimizer="AdamW",
                     optimizer_params={"weight_decay": WEIGHT_DECAY},
-                    output_size=[7, 1],  # 7 quantiles + 1 logit
+                    output_size=[7, 1],
                     loss=loss,
                     logging_metrics=[],
                     log_interval=50,
                     log_val_interval=10,
                 )
-              
-                # Trainer for refit (NO validation on TEST to avoid leakage)
-                final_dir = LOCAL_RUN_DIR / "refit_full_pretest"
-                final_dir.mkdir(parents=True, exist_ok=True)
 
+                # Callbacks
+                id_to_name = {i: str(a) for i, a in enumerate(train_all_ds.data["asset"].unique())}
+                vol_norm = _extract_norm_from_dataset(train_all_ds)
+                per_asset_cb = PerAssetMetrics(id_to_name=id_to_name, vol_normalizer=vol_norm)
+
+                EXTRA_CALLBACKS = [
+                    BiasWarmupCallback(vol_loss=VOL_LOSS, target_under=1.05, target_mean_bias=0.04, warmup_epochs=6,
+                                       qlike_target_weight=0.05, start_mean_bias=0.02, mean_bias_ramp_until=6,
+                                       guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
+                                       guard_tol=getattr(ARGS, "warmup_guard_tol", 0.005), alpha_step=0.05),
+                    TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=1.1, ramp_epochs=24,
+                                   gate_by_calibration=True, gate_low=0.9, gate_high=1.1, gate_patience=2),
+                ]
+
+                final_dir = LOCAL_RUN_DIR / "refit_full_pretest"
+                ckpt_dir = final_dir / "checkpoints"
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
                 logger = TensorBoardLogger(save_dir=str(final_dir / "lightning_logs"), name="tft_refit")
+
+                callbacks = [per_asset_cb, ModelCheckpoint(dirpath=str(ckpt_dir), filename="last",
+                                                           save_top_k=0, save_last=True)] + EXTRA_CALLBACKS
+
                 trainer_final = Trainer(
                     max_epochs=MAX_EPOCHS,
                     accelerator=ACCELERATOR,
@@ -3432,46 +3457,37 @@ def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df
                     check_val_every_n_epoch=getattr(ARGS, "check_val_every_n_epoch", 1),
                     log_every_n_steps=getattr(ARGS, "log_every_n_steps", 200),
                 )
+
                 seed_everything(12345)
-                # Fit on all pre-test data ONLY (no validation dataloader passed)
                 trainer_final.fit(model, train_dataloaders=train_all_loader)
 
-                # Also export a VAL parquet from the refitted model using the last pre-TEST window
+                # Export VAL
                 try:
                     cal_days = int(getattr(ARGS, "roll_val_days", 90))
                     cal_end = pre_df[TIME_COL].max()
                     cal_start = cal_end - pd.Timedelta(days=cal_days)
                     cal_df = pre_df[(pre_df[TIME_COL] >= cal_start) & (pre_df[TIME_COL] <= cal_end)].copy()
-
-                    # Build loader and export with split="val". We temporarily set globals()["val_df"]
-                    # so the exporter can attach the real Time column during its merge step.
-                    _, cal_loader = _make_ds_and_loader(
-                        cal_df,
-                        max_encoder_length=MAX_ENCODER_LENGTH,
-                        max_prediction_length=int(getattr(ARGS, "roll_pred_len", 1)),
-                        batch_size=BATCH_SIZE,
-                        shuffle=False,
-                    )
-
+                    _, cal_loader = _make_ds_and_loader(cal_df, MAX_ENCODER_LENGTH,
+                                                        int(getattr(ARGS, "roll_pred_len", 1)), BATCH_SIZE, shuffle=False)
                     _val_df_backup = globals().get("val_df", None)
                     globals()["val_df"] = cal_df
                     val_out = LOCAL_OUTPUT_DIR / f"tft_val_predictions_refit_{RUN_SUFFIX}.parquet"
-                    _export_split_from_best(trainer_final, cal_loader, split="val", out_path=val_out, calibrator=None)
-                    # restore prior global if any
+                    _export_split_from_best(trainer_final, cal_loader, "val", val_out, calibrator=None)
                     globals()["val_df"] = _val_df_backup
-
                     try:
                         upload_file_to_gcs(str(val_out), f"{GCS_OUTPUT_PREFIX}/{val_out.name}")
                     except Exception as _e_up:
                         print(f"[WARN] Could not upload refit VAL parquet: {_e_up}")
                 except Exception as _e_cal:
                     print(f"[WARN] Refit VAL export skipped: {_e_cal}")
-                # Export TEST predictions (no calibration by default)
+
+                # Export TEST
                 test_out = LOCAL_OUTPUT_DIR / f"tft_test_predictions_refit_{RUN_SUFFIX}.parquet"
-                _export_split_from_best(trainer_final, test_loader, split="test", out_path=test_out, calibrator=None)
+                _export_split_from_best(trainer_final, test_loader, "test", test_out, calibrator=None)
+
             except Exception as e:
                 print(f"[WARN] Final refit+TEST export skipped: {e}")
-
+                
 # -----------------------------------------------------------------------
 # Calendar features (help the model learn intraday/weekly seasonality)
 # -----------------------------------------------------------------------
