@@ -3238,7 +3238,6 @@ def _train_single_fold(train_df: pd.DataFrame, val_df: pd.DataFrame, fold_id: in
         logging_metrics=[],
         log_interval=50,
         log_val_interval=10,
-        reduce_on_plateau_patience=None,
     )
     id_to_name = {}
     try:
@@ -3539,7 +3538,6 @@ def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df
                     logging_metrics=[],
                     log_interval=50,
                     log_val_interval=10,
-                    reduce_on_plateau_patience=None,
                 )
 
                 # Callbacks
