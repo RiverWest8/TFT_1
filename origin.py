@@ -721,8 +721,7 @@ def _make_ds_and_loader(df: "pd.DataFrame", max_encoder_length: int, max_predict
     base_exclude = set(GROUP_ID + [TIME_COL, "time_idx"] + ["realised_vol", "direction", "split"])
     all_numeric = [c for c, dt in df.dtypes.items() if (c not in base_exclude) and is_numeric_dtype(dt)]
 
-    calendar_cols = ["sin_tod", "cos_tod", "sin_dow", "cos_dow"]
-    time_varying_known_reals = calendar_cols + ["Is_Weekend"]
+    time_varying_known_reals =  ["Is_Weekend"]
 
     try:
         _drops = set(globals().get("drop_features", []) or [])
