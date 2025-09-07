@@ -113,12 +113,7 @@ def _permute_series_inplace(df: "pd.DataFrame", col: str, block: int, group_col:
 
 
 # helper (put once near the top of the file, or inline if you prefer)
-def _first_not_none(d, keys):
-    for k in keys:
-        v = d.get(k, None)
-        if v is not None:
-            return v
-    return None
+
 
 # ------------------ Imports ------------------
 
@@ -3095,16 +3090,23 @@ def _train_single_fold(train_df: pd.DataFrame, val_df: pd.DataFrame, fold_id: in
     val_loader   = validation.to_dataloader(train=False, batch_size=BATCH_SIZE, num_workers=num_workers,
                                             persistent_workers=num_workers>0, prefetch_factor=getattr(ARGS, "prefetch_factor", 2))
 
-    vol_loss = VOL_LOSS
-    dir_loss = LabelSmoothedBCEWithBrier(smoothing=0.10, pos_weight=1.001, brier_weight=0.18)
-    loss = MultiLoss([vol_loss, dir_loss], weights=[1.0, 1.0])
-
+    # Define DIR_LOSS and fixed weights just above model instantiation
+    DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.10, pos_weight=1.001, brier_weight=0.18)
+    FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT = 1.0, 0.1
     model = TemporalFusionTransformer.from_dataset(
         training,
-        learning_rate=LR_OVERRIDE or 1e-3,
-        loss=loss,
-        output_size=[len(VOL_QUANTILES), 1],
-        reduce_on_plateau_patience=4,
+        hidden_size=96,
+        attention_head_size=4,
+        dropout=0.13,
+        hidden_continuous_size=24,
+        learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.00085),
+        optimizer="AdamW",
+        optimizer_params={"weight_decay": WEIGHT_DECAY},
+        output_size=[7, 1],  # 7 quantiles + 1 logit
+        loss=MultiLoss([VOL_LOSS, DIR_LOSS], weights=[FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT]),
+        logging_metrics=[],
+        log_interval=50,
+        log_val_interval=10,
     )
 
     id_to_name = {}
@@ -3128,12 +3130,10 @@ def _train_single_fold(train_df: pd.DataFrame, val_df: pd.DataFrame, fold_id: in
     fold_ckpt.mkdir(parents=True, exist_ok=True)
     fold_logs.mkdir(parents=True, exist_ok=True)
 
-    callbacks = [
-        LearningRateMonitor(logging_interval="epoch"),
-        per_asset_cb,
-    ] + EXTRA_CALLBACKS
-
     logger = TensorBoardLogger(save_dir=str(fold_logs), name=f"tft_fold_{fold_id}")
+
+    # Leaner set of callbacks, as instructed
+    callbacks = [per_asset_cb, ModelCheckpoint(dirpath=str(fold_ckpt), filename="last", save_top_k=0, save_last=True)] + EXTRA_CALLBACKS
 
     trainer = Trainer(
         max_epochs=MAX_EPOCHS,
@@ -3406,7 +3406,7 @@ def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df
                     attention_head_size=4,
                     dropout=0.13,
                     hidden_continuous_size=24,
-                    learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.00085),
+                    learning_rate= 0.00085,
                     optimizer="AdamW",
                     optimizer_params={"weight_decay": WEIGHT_DECAY},
                     output_size=[7, 1],  # 7 quantiles + 1 logit
@@ -3419,16 +3419,7 @@ def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df
                 # Trainer for refit (NO validation on TEST to avoid leakage)
                 final_dir = LOCAL_RUN_DIR / "refit_full_pretest"
                 final_dir.mkdir(parents=True, exist_ok=True)
-                callbacks = [
-                    SafeTQDMProgressBar(refresh_rate=getattr(ARGS, "log_every_n_steps", 200)),
-                    LearningRateMonitor(logging_interval="epoch"),
-                    ModelCheckpoint(
-                        dirpath=str(final_dir / "checkpoints"),
-                        filename="last",
-                        save_top_k=0,   # no monitored metric; save_last keeps the last checkpoint
-                        save_last=True,
-                    ),
-                ]
+
                 logger = TensorBoardLogger(save_dir=str(final_dir / "lightning_logs"), name="tft_refit")
                 trainer_final = Trainer(
                     max_epochs=MAX_EPOCHS,
