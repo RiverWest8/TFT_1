@@ -781,7 +781,10 @@ def fit_log_calibrator_per_asset(df_val: pd.DataFrame,
         # OLS closed form on logs
         pp1 = np.c_[np.ones_like(pp), pp]
         theta, *_ = np.linalg.lstsq(pp1, yy, rcond=None)
-        out[str(a)] = {"alpha": float(theta[0]), "beta": float(theta[1])}
+        alpha = float(theta[0])
+        beta  = float(theta[1])
+        beta  = float(np.clip(beta, 0.8, 1.6))        # <-- NEW
+        out[str(a)] = {"alpha": alpha, "beta": beta}
     return out
 
 
@@ -3210,8 +3213,9 @@ if __name__ == "__main__":
     )
     train_means = _per_asset_mean(train_df, col="realised_vol")
     val_means   = _per_asset_mean(val_df,   col="realised_vol")
-    calib_adj   = adjust_calibrator_level(calib_raw, train_means, val_means, tau=0.7, cap_abs_log=np.log(2.0))
+    calib_adj   = adjust_calibrator_level(calib_raw, train_means, val_means, tau=0., cap_abs_log=np.log(2.0))
 
+    import pandas as pd
     # 3) apply calibrator to both VAL and TEST
     def _apply_cal(df_in: pd.DataFrame, label: str) -> pd.DataFrame:
         df = df_in.copy()
@@ -3223,9 +3227,38 @@ if __name__ == "__main__":
             df["y_vol_pred_q95_cal"] = apply_log_calibrator_on_array(df["y_vol_pred_q95"].to_numpy(), a, calib_adj)
         df["split"] = label
         return df
+    
+    def _overwrite_with_cal(df_in: pd.DataFrame) -> pd.DataFrame:
+        """
+        Overwrite base prediction columns with their calibrated counterparts where available and non-NaN.
+        Drops the helper *_cal columns afterwards.
+        """
+        out = df_in.copy()
+        # y_vol_pred (point)
+        if "y_vol_pred_cal" in out.columns:
+            s = out["y_vol_pred_cal"]
+            if s.notna().any():
+                out["y_vol_pred"] = s.where(s.notna(), out.get("y_vol_pred"))
+        # q05
+        if "y_vol_pred_q05_cal" in out.columns:
+            s = out["y_vol_pred_q05_cal"]
+            if s.notna().any():
+                out["y_vol_pred_q05"] = s.where(s.notna(), out.get("y_vol_pred_q05"))
+        # q95
+        if "y_vol_pred_q95_cal" in out.columns:
+            s = out["y_vol_pred_q95_cal"]
+            if s.notna().any():
+                out["y_vol_pred_q95"] = s.where(s.notna(), out.get("y_vol_pred_q95"))
+        # drop helper columns
+        cal_cols = [c for c in out.columns if c.endswith("_cal")]
+        return out.drop(columns=cal_cols)
+
 
     val_cal_df  = _apply_cal(val_uncal_df,  "val_cal")
     test_cal_df = _apply_cal(test_uncal_df, "test_cal")
+
+    val_cal_df  = _overwrite_with_cal(val_cal_df)
+    test_cal_df = _overwrite_with_cal(test_cal_df)
 
     print("VAL means:  y={:.6g}  p={:.6g}  p_cal={:.6g}".format(
         val_uncal_df["y_vol"].mean(),  val_uncal_df["y_vol_pred"].mean(),
@@ -3233,6 +3266,9 @@ if __name__ == "__main__":
     print("TEST means: y={:.6g}  p={:.6g}  p_cal={:.6g}".format(
         test_uncal_df["y_vol"].mean(), test_uncal_df["y_vol_pred"].mean(),
         test_cal_df["y_vol_pred_cal"].mean()))
+
+
+
 
     # 4) save 4 parquets
     OUT = Path(LOCAL_OUTPUT_DIR); OUT.mkdir(parents=True, exist_ok=True)
