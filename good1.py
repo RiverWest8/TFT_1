@@ -2436,7 +2436,7 @@ EXTRA_CALLBACKS = [
           save_last=True,
       ),
       StochasticWeightAveraging(swa_lrs = 4.25e5 , annealing_epochs = 1, annealing_strategy="cos", swa_epoch_start=max(1, int(0.9 * MAX_EPOCHS))),
-      CosineLR(start_epoch=10, eta_min_ratio=0.05, hold_last_epochs=1, warmup_steps=0),
+      CosineLR(start_epoch=8, eta_min_ratio=0.05, hold_last_epochs=1, warmup_steps=0),
       ]
 
 
