@@ -424,7 +424,7 @@ def build_callbacks(ds, vol_loss) -> _List[pl.Callback]:
     """
     Returns the full callback stack:
       [TQDMProgressBar, EarlyStopping, PerAssetMetrics, (optional MirrorBest), LR monitor, ValHistory]
-      + [BiasWarmup, TailRamp, ReduceLROnPlateau, SWA, CosineLR, ModelCheckpoint(save_last)]
+      + [BiasWarmup, TailRamp, ModelCheckpoint(save_last)]
     """
     # id->name mapping for metrics
     try:
