@@ -1066,18 +1066,6 @@ class AsymmetricQuantileLoss(QuantileLoss):
 
     def forward(self, y_pred, target):
         base = self.loss_per_prediction(y_pred, target).mean()
-        # --- Ensure tz-naive timestamps everywhere to avoid naive/aware comparisons ---
-        try:
-            for _df in (base, train_df, val_df, test_df):
-                if _df is not None and TIME_COL in _df.columns:
-                    _df[TIME_COL] = pd.to_datetime(_df[TIME_COL], errors="coerce")
-                    try:
-                        _df[TIME_COL] = _df[TIME_COL].dt.tz_localize(None)
-                    except Exception:
-                        pass
-        except Exception as _e_tz:
-            print(f"[WARN] Could not normalise timezone info: {_e_tz}")
-
         # ---- mean-bias regulariser on the median (q=0.5) ----
         if self.mean_bias_weight > 0:
             try:
