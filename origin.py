@@ -480,11 +480,6 @@ def build_callbacks(ds, vol_loss) -> _List[pl.Callback]:
         ),
     ]
 
-    # LR scheduling bundle: plateau early, cosine later
-    plateau_cb = ReduceLROnPlateauCallback(
-        monitor="val_comp_overall", factor=0.5, patience=6, min_lr=3e-5, cooldown=1, stop_after_epoch=8
-    )
-    cosine_cb = CosineLR(start_epoch=10, eta_min_ratio=0.05, hold_last_epochs=2, warmup_steps=0)
 
     # Keep a checkpoint per fold (best + last) so resume works
     fold_ckpt_cb = ModelCheckpoint(
@@ -500,9 +495,9 @@ def build_callbacks(ds, vol_loss) -> _List[pl.Callback]:
     stack = [progress_cb, es_cb, metrics_cb]
     if mirror_cb is not None:
         stack.append(mirror_cb)
-    stack += [lr_cb, ]
+    stack += [lr_cb]
     stack += warmups
-    stack += [plateau_cb, cosine_cb, fold_ckpt_cb]
+    stack += [fold_ckpt_cb]
     return stack
 
 @torch.no_grad()
