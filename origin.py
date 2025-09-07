@@ -3244,8 +3244,7 @@ def _train_single_fold(train_df: pd.DataFrame, val_df: pd.DataFrame, fold_id: in
 
     logger = TensorBoardLogger(save_dir=str(fold_logs), name=f"tft_fold_{fold_id}")
 
-    # Leaner set of callbacks, as instructed
-    callbacks = [per_asset_cb, ModelCheckpoint(dirpath=str(fold_ckpt), filename="last", save_top_k=0, save_last=True)] + EXTRA_CALLBACKS
+
 
     # Build the *full* stack in one place so folds and refit stay identical
     EXTRA_CALLBACKS = build_callbacks(training, VOL_LOSS)
