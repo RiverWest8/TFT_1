@@ -2439,6 +2439,60 @@ EXTRA_CALLBACKS = [
       CosineLR(start_epoch=10, eta_min_ratio=0.05, hold_last_epochs=1, warmup_steps=0),
       ]
 
+
+# === [CALLBACK] Print best composite metric each epoch ===
+class BestCompositePrinter(pl.Callback):
+    """
+    Prints when the monitored composite metric improves and tracks the best value.
+    Supports either 'val_composite_overall' or 'val_comp_overall' (whichever is present).
+    """
+    def __init__(self,
+                 monitor_keys=("val_composite_overall", "val_comp_overall"),
+                 mode="min"):
+        super().__init__()
+        self.monitor_keys = tuple(monitor_keys)
+        self.mode = str(mode).lower()  # "min" or "max"
+        self.best = None
+
+    def _to_float(self, x):
+        try:
+            return float(x.item() if hasattr(x, "item") else x)
+        except Exception:
+            return None
+
+    def _get_metric(self, trainer):
+        m = getattr(trainer, "callback_metrics", {}) or {}
+        for k in self.monitor_keys:
+            if k in m:
+                val = self._to_float(m[k])
+                if val is not None:
+                    return k, val
+        return None, None
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        key, current = self._get_metric(trainer)
+        if key is None or current is None:
+            # metric not logged this epoch
+            return
+
+        # First observation
+        if self.best is None:
+            self.best = current
+            print(f"[COMP] First {key} = {current:.6f}")
+            return
+
+        # Compare for improvement
+        improved = (self.mode == "min" and current < self.best) or \
+                   (self.mode == "max" and current > self.best)
+
+        if improved:
+            delta = (self.best - current) if self.mode == "min" else (current - self.best)
+            pct = (delta / (abs(self.best) + 1e-12)) * 100.0
+            print(f"[COMP] New best {key} = {current:.6f}  (Δ={delta:+.6f}, {pct:+.2f}%)")
+            self.best = current
+        else:
+            print(f"[COMP] No improvement. Best {key} = {self.best:.6f}  (current={current:.6f})")
+
 class ValLossHistory(pl.Callback):
     """
     Records per-epoch validation metrics to a CSV so you can plot later.
@@ -3088,7 +3142,10 @@ if __name__ == "__main__":
 
     lr_cb = LearningRateMonitor(logging_interval="step")
 
-
+    comp_print_cb = BestCompositePrinter(
+        monitor_keys=("val_composite_overall"),
+        mode="min"  # lower composite is better
+    )
 
 
   
@@ -3119,7 +3176,7 @@ if __name__ == "__main__":
         gradient_clip_val=GRADIENT_CLIP_VAL,
         num_sanity_val_steps = 0,
         logger=logger,
-        callbacks=[TQDMProgressBar(refresh_rate=50), es_cb, metrics_cb, mirror_cb, lr_cb, val_hist_cb] + EXTRA_CALLBACKS,
+        callbacks=[TQDMProgressBar(refresh_rate=50),comp_print_cb, es_cb, metrics_cb, mirror_cb, lr_cb, val_hist_cb] + EXTRA_CALLBACKS,
         check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
         log_every_n_steps=int(ARGS.log_every_n_steps),
         enable_progress_bar=False,
@@ -3495,6 +3552,58 @@ if __name__ == "__main__":
         val_cal_df  = _calib_apply_cond_residual_iso(val_cal_df,  _res_models, asset_col="asset")
         test_cal_df = _calib_apply_cond_residual_iso(test_cal_df, _res_models, asset_col="asset")
         print("[CAL] Calibrated q05/q95 conditionally on the calibrated median.")
+
+    # --- [POST-ISO MEAN ANCHOR] Per-asset gentle mean re-alignment on VAL, applied to VAL & TEST ---
+    def _per_asset_mean_anchor(val_df, y_col="y_vol", p_col="y_vol_pred_cal",
+                            asset_col="asset", mult_clip=(0.9, 1.1), eps=1e-12):
+        """
+        Compute per-asset multiplicative factor c so that mean(c*p) ≈ mean(y) on VAL.
+        Clip c to avoid over-correction, then reuse c for TEST.
+        Returns dict[asset] -> c
+        """
+        factors = {}
+        g = val_df[[asset_col, y_col, p_col]].replace([np.inf, -np.inf], np.nan).dropna()
+        if g.empty:
+            return factors
+        for a, d in g.groupby(asset_col):
+            my = float(d[y_col].mean())
+            mp = float(d[p_col].mean())
+            if not np.isfinite(my) or not np.isfinite(mp) or mp <= eps:
+                c = 1.0
+            else:
+                c = np.clip(my / mp, mult_clip[0], mult_clip[1])
+            factors[str(a)] = float(c)
+        return factors
+
+    def _apply_mean_anchor(df, factors, asset_col="asset",
+                        cols=("y_vol_pred_cal","y_vol_pred_q05_cal","y_vol_pred_q95_cal"),
+                        floor=1e-9):
+        if not factors:
+            return df
+        out = df.copy()
+        for a, c in factors.items():
+            sel = out[asset_col].astype(str) == str(a)
+            if not np.any(sel):
+                continue
+            for ccol in cols:
+                if ccol in out.columns:
+                    v = out.loc[sel, ccol].astype(float).to_numpy()
+                    out.loc[sel, ccol] = np.maximum(v * float(c), floor)
+        # keep quantiles monotone if present
+        if all(cc in out.columns for cc in ("y_vol_pred_q05_cal","y_vol_pred_cal","y_vol_pred_q95_cal")):
+            q05 = out["y_vol_pred_q05_cal"].to_numpy()
+            q50 = out["y_vol_pred_cal"].to_numpy()
+            q95 = out["y_vol_pred_q95_cal"].to_numpy()
+            out["y_vol_pred_q05_cal"] = np.minimum(q05, q50)
+            out["y_vol_pred_q95_cal"] = np.maximum(q95, q50)
+        return out
+
+    _anchor = _per_asset_mean_anchor(val_cal_df, y_col="y_vol", p_col="y_vol_pred_cal",
+                                    asset_col="asset", mult_clip=(0.9, 1.1))
+    if _anchor:
+        val_cal_df  = _apply_mean_anchor(val_cal_df,  _anchor, asset_col="asset")
+        test_cal_df = _apply_mean_anchor(test_cal_df, _anchor, asset_col="asset")
+        print("[CAL] Applied post-iso mean anchor per asset:", {k: round(v, 4) for k, v in _anchor.items()})
 
     # Diagnostics (means/stds by asset after alignment)
     def _diag_by_asset(df, asset_col="asset", y_col="y_vol", p_col="y_vol_pred_cal", label="VAL"):
