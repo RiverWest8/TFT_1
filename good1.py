@@ -130,14 +130,13 @@ import argparse
 import pytorch_forecasting as pf
 import inspect
 
-VOL_QUANTILES = [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95] #The quantiles which yielded our best so far
-#Q50_IDX = VOL_QUANTILES.index(0.50)  
-#VOL_QUANTILES = [0.05, 0.15, 0.35, 0.50, 0.65, 0.85, 0.95]
-Q50_IDX = VOL_QUANTILES.index(0.50)
+# Quantiles and indices (single source of truth)
+VOL_QUANTILES = [0.05, 0.165, 0.25, 0.50, 0.75, 0.835, 0.95]
 Q05_IDX = VOL_QUANTILES.index(0.05)
+Q50_IDX = VOL_QUANTILES.index(0.50)
 Q95_IDX = VOL_QUANTILES.index(0.95)
-# Floor used when computing decoded QLIKE to avoid blow-ups when y or ŷ ~ 0
 EVAL_VOL_FLOOR = 1e-8
+
 
 # Composite metric weights (override via --metric_weights "w_mae,w_rmse,w_qlike")
 COMP_WEIGHTS = (1.0, 1.0, 0.004)  # default: slightly emphasise QLIKE for RV focus
@@ -472,17 +471,25 @@ def collect_split_predictions(trainer,
         if p_vol_enc is None:
             continue
         p_vol_enc = p_vol_enc.reshape(-1)[:L]
-        vol_q = _extract_vol_quantiles(pred_t)
+
+        # Pull full quantile tensor robustly; never mirror q50 into q05/q95
         q05_enc = q50_enc = q95_enc = None
-        if torch.is_tensor(vol_q) and vol_q.ndim == 2:
-            vol_q = torch.cummax(vol_q, dim=-1).values
-            K = vol_q.shape[1]
-            if K > max(Q95_IDX, Q05_IDX):
+        vol_q = _extract_vol_quantiles(pred_t)
+        if torch.is_tensor(vol_q):
+            if vol_q.ndim == 3 and vol_q.size(1) == 1:
+                vol_q = vol_q.squeeze(1)  # [B, K]
+            if vol_q.ndim >= 3 and vol_q.size(-1) >= len(VOL_QUANTILES):
+                vol_q = vol_q.reshape(-1, vol_q.size(-1))
+            if vol_q.ndim == 2 and vol_q.size(-1) >= len(VOL_QUANTILES):
+                vol_q = torch.cummax(vol_q[:, :len(VOL_QUANTILES)], dim=-1).values
                 q05_enc = vol_q[:, Q05_IDX].reshape(-1)[:L]
                 q50_enc = vol_q[:, Q50_IDX].reshape(-1)[:L]
                 q95_enc = vol_q[:, Q95_IDX].reshape(-1)[:L]
+
+        # fallback: point = median when quantiles unavailable
         if q50_enc is None:
             q50_enc = p_vol_enc
+        # IMPORTANT: leave q05_enc/q95_enc as None if not present (do not copy q50)
 
         # decode to physical scale
         floor_val = float(globals().get("EVAL_VOL_FLOOR", 1e-8))
@@ -3139,6 +3146,11 @@ if __name__ == "__main__":
     # 1) Collect UNCALIBRATED predictions (last epoch, in-memory model)
     val_uncal_df  = collect_split_predictions(trainer, val_dataloader,  split="val")
     test_uncal_df = collect_split_predictions(trainer, test_dataloader, split="test")
+    # Harmonize asset keys (upper-case) across all frames so calibrator matches
+    for _df in (train_df, val_df, test_df):
+        _df["asset"] = _df["asset"].astype(str).str.upper()
+    for _df in (val_uncal_df, test_uncal_df):
+        _df["asset"] = _df["asset"].astype(str).str.upper()
 
     # 2) Fit per-asset log-calibrator on VAL and adjust toward TRAIN mean level
     #    (handles the shift you observed: mean(train) ~ 0.00528, mean(val) ~ 0.00346, mean(test) ~ 0.00517)
@@ -3157,26 +3169,40 @@ if __name__ == "__main__":
     # tau ∈ [0,1]: how strongly to nudge the intercept toward train level
     calib_adj = adjust_calibrator_level(calib_raw, train_means, val_means, tau=0.7)
 
-    # 3) Apply calibrator to VAL and TEST (creates calibrated copies)
     def _apply_cal_to_df(df_in: pd.DataFrame) -> pd.DataFrame:
         df = df_in.copy()
-        # Apply to point forecast
+        a = df["asset"].astype(str).str.upper().to_numpy()
+        # Point forecast (q50)
         df["y_vol_pred_cal"] = apply_log_calibrator_on_array(
-            df["y_vol_pred"].to_numpy(), df["asset"].to_numpy(), calib_adj
+            df["y_vol_pred"].to_numpy(), a, calib_adj
         )
-        # Optionally apply to quantiles if present (keeps intervals proportional)
+        # Quantiles if available
         if "y_vol_pred_q05" in df.columns and df["y_vol_pred_q05"].notna().any():
             df["y_vol_pred_q05_cal"] = apply_log_calibrator_on_array(
-                df["y_vol_pred_q05"].to_numpy(), df["asset"].to_numpy(), calib_adj
+                df["y_vol_pred_q05"].to_numpy(), a, calib_adj
             )
         if "y_vol_pred_q95" in df.columns and df["y_vol_pred_q95"].notna().any():
             df["y_vol_pred_q95_cal"] = apply_log_calibrator_on_array(
-                df["y_vol_pred_q95"].to_numpy(), df["asset"].to_numpy(), calib_adj
+                df["y_vol_pred_q95"].to_numpy(), a, calib_adj
             )
         return df
 
     val_cal_df  = _apply_cal_to_df(val_uncal_df)
     test_cal_df = _apply_cal_to_df(test_uncal_df)
+    print(
+        "VAL means: y={:.6g} p={:.6g} p_cal={:.6g}".format(
+            val_uncal_df["y_vol"].mean(),
+            val_uncal_df["y_vol_pred"].mean(),
+            val_cal_df["y_vol_pred_cal"].mean(),
+        )
+    )
+    print(
+        "TEST means: y={:.6g} p={:.6g} p_cal={:.6g}".format(
+            test_uncal_df["y_vol"].mean(),
+            test_uncal_df["y_vol_pred"].mean(),
+            test_cal_df["y_vol_pred_cal"].mean(),
+        )
+    )
 
     # 4) Save all four parquets (UN/Calibrated, VAL/TEST)
     OUT = Path(LOCAL_OUTPUT_DIR)
@@ -3191,6 +3217,18 @@ if __name__ == "__main__":
     val_cal_df.to_parquet(p_val_cal, index=False)
     test_uncal_df.to_parquet(p_tst_uncal, index=False)
     test_cal_df.to_parquet(p_tst_cal, index=False)
+    # quick sanity: calibration should shift p toward y
+    print("VAL means:  y={:.6g}  p={:.6g}  p_cal={:.6g}".format(
+        val_uncal_df["y_vol"].mean(), val_uncal_df["y_vol_pred"].mean(),
+        val_cal_df.get("y_vol_pred_cal", pd.Series(dtype=float)).mean()))
+    print("TEST means: y={:.6g}  p={:.6g}  p_cal={:.6g}".format(
+        test_uncal_df["y_vol"].mean(), test_uncal_df["y_vol_pred"].mean(),
+        test_cal_df.get("y_vol_pred_cal", pd.Series(dtype=float)).mean()))
+
+    _save_parquet(val_uncal_df,  p_val_uncal)
+    _save_parquet(val_cal_df,    p_val_cal)
+    _save_parquet(test_uncal_df, p_tst_uncal)
+    _save_parquet(test_cal_df,   p_tst_cal)
 
     print(f"✓ Wrote VAL uncal → {p_val_uncal}")
     print(f"✓ Wrote VAL  cal → {p_val_cal}")
