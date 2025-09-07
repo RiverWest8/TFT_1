@@ -565,26 +565,48 @@ def collect_split_predictions(trainer,
         "y_dir": y_dir_true_all,
         "y_dir_prob": y_dirprob_all,
     })
+    # normalize asset, tag split
+    df["asset"] = df["asset"].astype(str).str.upper()
+    df["split"] = split
 
-    # attach real Time if available
+    # attach real Time if available – prefer the matching split
     try:
-        cand = ["val_df", "test_df", "raw_df", "full_df", "df"]
         src = None
-        for nm in cand:
-            obj = globals().get(nm)
-            if isinstance(obj, pd.DataFrame) and {"asset","time_idx","Time"}.issubset(obj.columns):
-                src = obj[["asset","time_idx","Time"]].copy(); break
+        s = str(split).lower()
+        if s == "val" and "val_df" in globals() and isinstance(val_df, pd.DataFrame):
+            src = val_df[["asset","time_idx","Time"]].copy()
+        elif s == "test" and "test_df" in globals() and isinstance(test_df, pd.DataFrame):
+            src = test_df[["asset","time_idx","Time"]].copy()
+        else:
+            # fallback scan (should rarely run)
+            for nm in ("val_df", "test_df", "raw_df", "full_df", "df"):
+                obj = globals().get(nm)
+                if isinstance(obj, pd.DataFrame) and {"asset","time_idx","Time"}.issubset(obj.columns):
+                    src = obj[["asset","time_idx","Time"]].copy()
+                    break
         if src is not None:
-            src["asset"] = src["asset"].astype(str)
+            src["asset"] = src["asset"].astype(str).str.upper()
             src["time_idx"] = pd.to_numeric(src["time_idx"], errors="coerce").astype("Int64").astype("int64")
-            df["asset"] = df["asset"].astype(str)
-            df["time_idx"] = pd.to_numeric(df["time_idx"], errors="coerce").astype("Int64").astype("int64")
+            df["time_idx"]  = pd.to_numeric(df["time_idx"],  errors="coerce").astype("Int64").astype("int64")
             df = df.merge(src, on=["asset","time_idx"], how="left", validate="m:1")
             df["Time"] = pd.to_datetime(df["Time"], errors="coerce")
-            try: df["Time"] = df["Time"].dt.tz_localize(None)
-            except Exception: pass
+            try:
+                df["Time"] = df["Time"].dt.tz_localize(None)
+            except Exception:
+                pass
     except Exception as e:
         print(f"[WARN] Could not attach Time column: {e}")
+
+    # enforce quantile ordering if both exist (do NOT mirror q50 when missing)
+    try:
+        if "y_vol_pred_q05" in df.columns and "y_vol_pred_q95" in df.columns:
+            q05 = pd.to_numeric(df["y_vol_pred_q05"], errors="coerce")
+            q50 = pd.to_numeric(df["y_vol_pred"],      errors="coerce")
+            q95 = pd.to_numeric(df["y_vol_pred_q95"], errors="coerce")
+            df["y_vol_pred_q05"] = np.minimum(q05, np.minimum(q50, q95))
+            df["y_vol_pred_q95"] = np.maximum(q95, np.maximum(q50, q05))
+    except Exception as _e_q:
+        print(f"[WARN] could not enforce quantiles: {_e_q}")
 
     return df
 
@@ -3139,75 +3161,81 @@ if __name__ == "__main__":
 
     # ---------- AFTER trainer.fit(model, ...) ----------
 
-    # Make sure Time merge can find the source data
-    globals()["val_df"] = val_df
+    # ensure split DFs are available (for Time merge)
+    globals()["val_df"]  = val_df
     globals()["test_df"] = test_df
 
-    # 1) Collect UNCALIBRATED predictions (last epoch, in-memory model)
+    # quick ranges (sanity)
+    def _split_range(df: pd.DataFrame):
+        if "Time" in df.columns:
+            t = pd.to_datetime(df["Time"], errors="coerce")
+            t = t[ t.notna() ]
+            if not t.empty:
+                return t.min(), t.max(), len(df)
+        return None, None, len(df)
+
+    vmin, vmax, vn = _split_range(val_df)
+    tmin, tmax, tn = _split_range(test_df)
+    print(f"[VAL]  N={vn}  Time[{vmin} → {vmax}]")
+    print(f"[TEST] N={tn}  Time[{tmin} → {tmax}]")
+
+    # 1) last-epoch predictions, uncalibrated
     val_uncal_df  = collect_split_predictions(trainer, val_dataloader,  split="val")
     test_uncal_df = collect_split_predictions(trainer, test_dataloader, split="test")
-    # Harmonize asset keys (upper-case) across all frames so calibrator matches
-    for _df in (train_df, val_df, test_df):
-        _df["asset"] = _df["asset"].astype(str).str.upper()
-    for _df in (val_uncal_df, test_uncal_df):
+
+    # normalize asset case for consistency
+    for _df in (train_df, val_df, test_df, val_uncal_df, test_uncal_df):
         _df["asset"] = _df["asset"].astype(str).str.upper()
 
-    # 2) Fit per-asset log-calibrator on VAL and adjust toward TRAIN mean level
-    #    (handles the shift you observed: mean(train) ~ 0.00528, mean(val) ~ 0.00346, mean(test) ~ 0.00517)
+    # warn if overlap by (asset,time_idx)
+    def _overlap(a: pd.DataFrame, b: pd.DataFrame) -> int:
+        cols = [c for c in ("asset","time_idx") if c in a.columns and c in b.columns]
+        if len(cols) < 2:
+            return 0
+        ka = a[cols].dropna().astype({cols[0]: str, cols[1]: int}).drop_duplicates()
+        kb = b[cols].dropna().astype({cols[0]: str, cols[1]: int}).drop_duplicates()
+        return int(ka.merge(kb, on=cols, how="inner").shape[0])
+    ov = _overlap(val_uncal_df, test_uncal_df)
+    if ov > 0:
+        print(f"[WARN] VAL/TEST predictions share {ov} rows by (asset,time_idx). Check your splits/data loaders.")
+
+    # 2) fit per-asset log calibrator on VAL, nudge intercept toward TRAIN
     def _per_asset_mean(df: pd.DataFrame, col="realised_vol", asset_col="asset") -> dict:
         g = df[[asset_col, col]].replace([np.inf, -np.inf], np.nan).dropna()
         return g.groupby(asset_col)[col].mean().to_dict() if not g.empty else {}
 
     calib_raw = fit_log_calibrator_per_asset(
-        df_val=val_uncal_df.rename(columns={"y_vol": "y_vol", "y_vol_pred": "y_vol_pred"}),
+        df_val=val_uncal_df.rename(columns={"y_vol":"y_vol","y_vol_pred":"y_vol_pred"}),
         asset_col="asset", y_col="y_vol", p_col="y_vol_pred"
     )
+    train_means = _per_asset_mean(train_df, col="realised_vol")
+    val_means   = _per_asset_mean(val_df,   col="realised_vol")
+    calib_adj   = adjust_calibrator_level(calib_raw, train_means, val_means, tau=0.7, cap_abs_log=np.log(2.0))
 
-    train_means = _per_asset_mean(train_df.rename(columns={"realised_vol": "realised_vol"}), col="realised_vol")
-    val_means   = _per_asset_mean(val_df.rename(columns={"realised_vol": "realised_vol"}),   col="realised_vol")
-
-    # tau ∈ [0,1]: how strongly to nudge the intercept toward train level
-    calib_adj = adjust_calibrator_level(calib_raw, train_means, val_means, tau=0.7)
-
-    def _apply_cal_to_df(df_in: pd.DataFrame) -> pd.DataFrame:
+    # 3) apply calibrator to both VAL and TEST
+    def _apply_cal(df_in: pd.DataFrame, label: str) -> pd.DataFrame:
         df = df_in.copy()
-        a = df["asset"].astype(str).str.upper().to_numpy()
-        # Point forecast (q50)
-        df["y_vol_pred_cal"] = apply_log_calibrator_on_array(
-            df["y_vol_pred"].to_numpy(), a, calib_adj
-        )
-        # Quantiles if available
+        a  = df["asset"].astype(str).str.upper().to_numpy()
+        df["y_vol_pred_cal"] = apply_log_calibrator_on_array(df["y_vol_pred"].to_numpy(), a, calib_adj)
         if "y_vol_pred_q05" in df.columns and df["y_vol_pred_q05"].notna().any():
-            df["y_vol_pred_q05_cal"] = apply_log_calibrator_on_array(
-                df["y_vol_pred_q05"].to_numpy(), a, calib_adj
-            )
+            df["y_vol_pred_q05_cal"] = apply_log_calibrator_on_array(df["y_vol_pred_q05"].to_numpy(), a, calib_adj)
         if "y_vol_pred_q95" in df.columns and df["y_vol_pred_q95"].notna().any():
-            df["y_vol_pred_q95_cal"] = apply_log_calibrator_on_array(
-                df["y_vol_pred_q95"].to_numpy(), a, calib_adj
-            )
+            df["y_vol_pred_q95_cal"] = apply_log_calibrator_on_array(df["y_vol_pred_q95"].to_numpy(), a, calib_adj)
+        df["split"] = label
         return df
 
-    val_cal_df  = _apply_cal_to_df(val_uncal_df)
-    test_cal_df = _apply_cal_to_df(test_uncal_df)
-    print(
-        "VAL means: y={:.6g} p={:.6g} p_cal={:.6g}".format(
-            val_uncal_df["y_vol"].mean(),
-            val_uncal_df["y_vol_pred"].mean(),
-            val_cal_df["y_vol_pred_cal"].mean(),
-        )
-    )
-    print(
-        "TEST means: y={:.6g} p={:.6g} p_cal={:.6g}".format(
-            test_uncal_df["y_vol"].mean(),
-            test_uncal_df["y_vol_pred"].mean(),
-            test_cal_df["y_vol_pred_cal"].mean(),
-        )
-    )
+    val_cal_df  = _apply_cal(val_uncal_df,  "val_cal")
+    test_cal_df = _apply_cal(test_uncal_df, "test_cal")
 
-    # 4) Save all four parquets (UN/Calibrated, VAL/TEST)
-    OUT = Path(LOCAL_OUTPUT_DIR)
-    OUT.mkdir(parents=True, exist_ok=True)
+    print("VAL means:  y={:.6g}  p={:.6g}  p_cal={:.6g}".format(
+        val_uncal_df["y_vol"].mean(),  val_uncal_df["y_vol_pred"].mean(),
+        val_cal_df["y_vol_pred_cal"].mean()))
+    print("TEST means: y={:.6g}  p={:.6g}  p_cal={:.6g}".format(
+        test_uncal_df["y_vol"].mean(), test_uncal_df["y_vol_pred"].mean(),
+        test_cal_df["y_vol_pred_cal"].mean()))
 
+    # 4) save 4 parquets
+    OUT = Path(LOCAL_OUTPUT_DIR); OUT.mkdir(parents=True, exist_ok=True)
     p_val_uncal = OUT / f"tft_val_predictions_uncal_last_{RUN_SUFFIX}.parquet"
     p_val_cal   = OUT / f"tft_val_predictions_cal_last_{RUN_SUFFIX}.parquet"
     p_tst_uncal = OUT / f"tft_test_predictions_uncal_last_{RUN_SUFFIX}.parquet"
@@ -3217,24 +3245,11 @@ if __name__ == "__main__":
     val_cal_df.to_parquet(p_val_cal, index=False)
     test_uncal_df.to_parquet(p_tst_uncal, index=False)
     test_cal_df.to_parquet(p_tst_cal, index=False)
-    # quick sanity: calibration should shift p toward y
-    print("VAL means:  y={:.6g}  p={:.6g}  p_cal={:.6g}".format(
-        val_uncal_df["y_vol"].mean(), val_uncal_df["y_vol_pred"].mean(),
-        val_cal_df.get("y_vol_pred_cal", pd.Series(dtype=float)).mean()))
-    print("TEST means: y={:.6g}  p={:.6g}  p_cal={:.6g}".format(
-        test_uncal_df["y_vol"].mean(), test_uncal_df["y_vol_pred"].mean(),
-        test_cal_df.get("y_vol_pred_cal", pd.Series(dtype=float)).mean()))
-
-    _save_parquet(val_uncal_df,  p_val_uncal)
-    _save_parquet(val_cal_df,    p_val_cal)
-    _save_parquet(test_uncal_df, p_tst_uncal)
-    _save_parquet(test_cal_df,   p_tst_cal)
 
     print(f"✓ Wrote VAL uncal → {p_val_uncal}")
     print(f"✓ Wrote VAL  cal → {p_val_cal}")
     print(f"✓ Wrote TEST uncal → {p_tst_uncal}")
     print(f"✓ Wrote TEST  cal → {p_tst_cal}")
-
     # Optional: upload to GCS if configured
     try:
         upload_file_to_gcs(str(p_val_uncal), f"{GCS_OUTPUT_PREFIX}/{p_val_uncal.name}")
