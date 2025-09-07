@@ -3352,8 +3352,8 @@ if __name__ == "__main__":
     globals()["test_df"] = test_df
 
     # 1) Collect UNCALIBRATED predictions (last epoch, in-memory model)
-    val_uncal_df  = collect_split_predictions(trainer, val_loader,  split="val")
-    test_uncal_df = collect_split_predictions(trainer, test_loader, split="test")
+    val_uncal_df  = collect_split_predictions(trainer, val_dataloader,  split="val")
+    test_uncal_df = collect_split_predictions(trainer, test_dataloader, split="test")
 
     # 2) Fit per-asset log-calibrator on VAL and adjust toward TRAIN mean level
     #    (handles the shift you observed: mean(train) ~ 0.00528, mean(val) ~ 0.00346, mean(test) ~ 0.00517)
