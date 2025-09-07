@@ -408,16 +408,25 @@ def _extract_vol_quantiles(pred):
         return flat[:, :K]
     return None
 
+class MirrorCheckpoints(pl.Callback):
+    def on_validation_end(self, trainer, pl_module):
+        mirror_local_ckpts_to_gcs()
+    def on_exception(self, trainer, pl_module, err):
+        mirror_local_ckpts_to_gcs()
+    def on_train_end(self, trainer, pl_module):
+        mirror_local_ckpts_to_gcs()
+
+# ---- Unified callback builder (folds + refit) ----
 # ---- Unified callback builder (folds + refit) ----
 from typing import List as _List
 
-def build_callbacks(ds, vol_loss, ckpt_dir: str | Path | None = None) -> _List[pl.Callback]:
+def build_callbacks(ds, vol_loss) -> _List[pl.Callback]:
     """
     Returns the full callback stack:
-      [TQDMProgressBar, EarlyStopping, PerAssetMetrics, MirrorBest?, LR monitor, ValHistory, ModelCheckpoint(last-only)]
-      + [BiasWarmup, TailRamp]
+      [TQDMProgressBar, EarlyStopping, PerAssetMetrics, (optional MirrorBest), LR monitor, ValHistory]
+      + [BiasWarmup, TailRamp, ReduceLROnPlateau, SWA, CosineLR, ModelCheckpoint(save_last)]
     """
-    # Per-asset names + normalizer
+    # id->name mapping for metrics
     try:
         id_to_name = {int(k): str(v) for k, v in ds.categoricals["asset"].vocab.items()}
     except Exception:
@@ -428,18 +437,24 @@ def build_callbacks(ds, vol_loss, ckpt_dir: str | Path | None = None) -> _List[p
 
     vol_norm = _extract_norm_from_dataset(ds)
 
-    # Core monitoring callbacks
     progress_cb = TQDMProgressBar(refresh_rate=int(getattr(ARGS, "log_every_n_steps", 50)))
     es_cb = EarlyStopping(
-        monitor="val_composite_overall",   # ensure this matches your logged metric
+        monitor="val_comp_overall",      # keep consistent with your val hook
         mode="min",
-        patience=int(getattr(ARGS, "early_stop_patience", 9)),
+        patience=int(getattr(ARGS, "early_stop_patience", 6)),
         min_delta=float(getattr(ARGS, "early_stop_min_delta", 1e-4)),
         verbose=True,
     )
     metrics_cb = PerAssetMetrics(id_to_name=id_to_name, vol_normalizer=vol_norm)
     lr_cb = LearningRateMonitor(logging_interval="epoch")
-    # Warmups
+
+
+
+    try:
+        mirror_cb = MirrorCheckpoints()
+    except Exception:
+        mirror_cb = None
+
     warmups = [
         BiasWarmupCallback(
             vol_loss=vol_loss,
@@ -465,12 +480,27 @@ def build_callbacks(ds, vol_loss, ckpt_dir: str | Path | None = None) -> _List[p
         ),
     ]
 
-    # Checkpoint: save ONLY last.ckpt (let Trainer.default_root_dir handle path if dir not passed)
-    ckpt_cb = ModelCheckpoint(
-        dirpath=str(ckpt_dir) if ckpt_dir is not None else None,
-        filename="last",
-        save_top_k=0,      # don't track a metric; just keep 'last'
+    # LR scheduling bundle: plateau early, cosine later
+    plateau_cb = ReduceLROnPlateauCallback(
+        monitor="val_comp_overall", factor=0.5, patience=6, min_lr=3e-5, cooldown=1, stop_after_epoch=8
+    )
+    cosine_cb = CosineLR(start_epoch=10, eta_min_ratio=0.05, hold_last_epochs=2, warmup_steps=0)
+
+    # Keep a checkpoint per fold (best + last) so resume works
+    fold_ckpt_cb = ModelCheckpoint(
+        dirpath=str(LOCAL_CKPT_DIR),
+        filename="fold-{epoch:02d}-{val_comp_overall:.4f}",
+        monitor="val_comp_overall",
+        mode="min",
+        save_top_k=2,
         save_last=True,
+        auto_insert_metric_name=False,
+    )
+
+    # Optional SWA (kept as you had)
+    swa_cb = StochasticWeightAveraging(
+        swa_lrs=1e-6, annealing_epochs=1, annealing_strategy="cos",
+        swa_epoch_start=max(1, int(0.9 * MAX_EPOCHS))
     )
 
     stack = [progress_cb, es_cb, metrics_cb]
@@ -478,7 +508,7 @@ def build_callbacks(ds, vol_loss, ckpt_dir: str | Path | None = None) -> _List[p
         stack.append(mirror_cb)
     stack += [lr_cb, val_hist_cb]
     stack += warmups
-    stack.append(ckpt_cb)
+    stack += [plateau_cb, cosine_cb, fold_ckpt_cb, swa_cb]
     return stack
 
 @torch.no_grad()
@@ -3532,13 +3562,13 @@ def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df
                 ckpt_dir = final_dir / "checkpoints"
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
                 logger = TensorBoardLogger(save_dir=str(final_dir / "lightning_logs"), name="tft_refit")
-                EXTRA_CALLBACKS = build_callbacks(train_all_ds, VOL_LOSS)
+                EXTRA_CALLBACKS_REFIT = build_callbacks(train_all_ds, VOL_LOSS)
                 trainer_final = Trainer(
                     max_epochs=MAX_EPOCHS,
                     accelerator=ACCELERATOR,
                     devices=DEVICES,
                     precision=PRECISION,
-                    callbacks=EXTRA_CALLBACKS,
+                    callbacks=EXTRA_CALLBACKS_REFIT,
                     logger=logger,
                     default_root_dir=str(final_dir),
                     check_val_every_n_epoch=getattr(ARGS, "check_val_every_n_epoch", 1),
