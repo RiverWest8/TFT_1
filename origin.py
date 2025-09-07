@@ -697,10 +697,47 @@ def _numeric_feature_columns(df: "pd.DataFrame", exclude: set[str]):
             # odd dtype → skip
             continue
     return cols
+# ---- Helper: ensure calendar features exist on any dataframe we feed into PF ----
+def _ensure_calendar_features(df: "pd.DataFrame") -> "pd.DataFrame":
+    if df is None or len(df) == 0:
+        return df
+    if TIME_COL not in df.columns:
+        return df
+    t = pd.to_datetime(df[TIME_COL], errors="coerce")
+    try:
+        # make tz-naive consistently
+        t = t.dt.tz_convert(None)
+    except Exception:
+        try:
+            t = t.dt.tz_localize(None)
+        except Exception:
+            pass
+    df[TIME_COL] = t
+
+    # day-of-week and time-of-day cyclical encodings
+    sec = (t.dt.hour.astype(float) * 3600.0 + t.dt.minute.astype(float) * 60.0 + t.dt.second.astype(float))
+    angle_tod = 2.0 * math.pi * (sec / 86400.0)
+    angle_dow = 2.0 * math.pi * (t.dt.dayofweek.astype(float) / 7.0)
+
+    # Create columns only if missing to avoid recomputing/warnings
+    if "sin_tod" not in df.columns:
+        df["sin_tod"] = np.sin(angle_tod)
+    if "cos_tod" not in df.columns:
+        df["cos_tod"] = np.cos(angle_tod)
+    if "sin_dow" not in df.columns:
+        df["sin_dow"] = np.sin(angle_dow)
+    if "cos_dow" not in df.columns:
+        df["cos_dow"] = np.cos(angle_dow)
+    # Weekend flag as int8 (known real; PF will scale it)
+    if "Is_Weekend" not in df.columns:
+        df["Is_Weekend"] = (t.dt.dayofweek >= 5).astype("int8")
+    return df
 
 @torch.no_grad()
 def _make_ds_and_loader(df: "pd.DataFrame", max_encoder_length: int, max_prediction_length: int, batch_size: int, shuffle: bool = False):
     """Build a minimal TimeSeriesDataSet & DataLoader for a given split dataframe."""
+    # Ensure calendar features exist (sin/cos of DoW / ToD, Is_Weekend)
+    df = _ensure_calendar_features(df.copy())
     # Ensure time_idx exists and is sorted per asset
     if "time_idx" not in df.columns:
         # requires Time column – we normalised it earlier in rolling; assert present here too
@@ -721,13 +758,15 @@ def _make_ds_and_loader(df: "pd.DataFrame", max_encoder_length: int, max_predict
     base_exclude = set(GROUP_ID + [TIME_COL, "time_idx"] + ["realised_vol", "direction", "split"])
     all_numeric = [c for c, dt in df.dtypes.items() if (c not in base_exclude) and is_numeric_dtype(dt)]
 
-    time_varying_known_reals =  ["Is_Weekend"]
+    # Only include known features that truly exist
+    known_cands = ["sin_tod", "cos_tod", "sin_dow", "cos_dow", "Is_Weekend"]
+    time_varying_known_reals = [c for c in known_cands if c in df.columns]
 
     try:
         _drops = set(globals().get("drop_features", []) or [])
     except Exception:
         _drops = set()
-    time_varying_unknown_reals = [c for c in all_numeric if c not in _drops]
+    time_varying_unknown_reals = [c for c in all_numeric if c not in _drops and c not in time_varying_known_reals]
 
     training = TimeSeriesDataSet(
         df,
@@ -2959,6 +2998,10 @@ def _build_datasets_for_split(train_df: "pd.DataFrame", val_df: "pd.DataFrame",
     return training, validation
 
 def _train_single_fold(train_df: pd.DataFrame, val_df: pd.DataFrame, fold_id: int):
+    
+    # Guarantee calendar features for both train and val parts
+    train_df = _ensure_calendar_features(train_df.copy())
+    val_df   = _ensure_calendar_features(val_df.copy())
     training, validation = _build_datasets_for_split(
         train_df, val_df,
         max_encoder_length=MAX_ENCODER_LENGTH,
