@@ -408,7 +408,78 @@ def _extract_vol_quantiles(pred):
         return flat[:, :K]
     return None
 
+# ---- Unified callback builder (folds + refit) ----
+from typing import List as _List
 
+def build_callbacks(ds, vol_loss, ckpt_dir: str | Path | None = None) -> _List[pl.Callback]:
+    """
+    Returns the full callback stack:
+      [TQDMProgressBar, EarlyStopping, PerAssetMetrics, MirrorBest?, LR monitor, ValHistory, ModelCheckpoint(last-only)]
+      + [BiasWarmup, TailRamp]
+    """
+    # Per-asset names + normalizer
+    try:
+        id_to_name = {int(k): str(v) for k, v in ds.categoricals["asset"].vocab.items()}
+    except Exception:
+        try:
+            id_to_name = {i: str(a) for i, a in enumerate(getattr(ds.data, "asset").unique())}
+        except Exception:
+            id_to_name = {}
+
+    vol_norm = _extract_norm_from_dataset(ds)
+
+    # Core monitoring callbacks
+    progress_cb = TQDMProgressBar(refresh_rate=int(getattr(ARGS, "log_every_n_steps", 50)))
+    es_cb = EarlyStopping(
+        monitor="val_composite_overall",   # ensure this matches your logged metric
+        mode="min",
+        patience=int(getattr(ARGS, "early_stop_patience", 9)),
+        min_delta=float(getattr(ARGS, "early_stop_min_delta", 1e-4)),
+        verbose=True,
+    )
+    metrics_cb = PerAssetMetrics(id_to_name=id_to_name, vol_normalizer=vol_norm)
+    lr_cb = LearningRateMonitor(logging_interval="epoch")
+    # Warmups
+    warmups = [
+        BiasWarmupCallback(
+            vol_loss=vol_loss,
+            target_under=1.09,
+            target_mean_bias=0.04,
+            warmup_epochs=6,
+            qlike_target_weight=0.05,
+            start_mean_bias=0.02,
+            mean_bias_ramp_until=6,
+            guard_patience=int(getattr(ARGS, "warmup_guard_patience", 2)),
+            guard_tol=float(getattr(ARGS, "warmup_guard_tol", 0.005)),
+            alpha_step=0.05,
+        ),
+        TailWeightRamp(
+            vol_loss=vol_loss,
+            start=1.0,
+            end=1.1,
+            ramp_epochs=24,
+            gate_by_calibration=True,
+            gate_low=0.9,
+            gate_high=1.1,
+            gate_patience=2,
+        ),
+    ]
+
+    # Checkpoint: save ONLY last.ckpt (let Trainer.default_root_dir handle path if dir not passed)
+    ckpt_cb = ModelCheckpoint(
+        dirpath=str(ckpt_dir) if ckpt_dir is not None else None,
+        filename="last",
+        save_top_k=0,      # don't track a metric; just keep 'last'
+        save_last=True,
+    )
+
+    stack = [progress_cb, es_cb, metrics_cb]
+    if mirror_cb is not None:
+        stack.append(mirror_cb)
+    stack += [lr_cb, val_hist_cb]
+    stack += warmups
+    stack.append(ckpt_cb)
+    return stack
 
 @torch.no_grad()
 def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, calibrator: dict | None = None):
@@ -1759,17 +1830,24 @@ class BiasWarmupCallback(pl.Callback):
         self._frozen = False
 
     def _resolve_vol_loss(self, pl_module):
-        import inspect
         def is_vol_loss(obj):
-            if obj is None:
-                return False
-            name = obj.__class__.__name__
-            return hasattr(obj, "loss_per_prediction") and hasattr(obj, "quantiles") and (
-                name == "AsymmetricQuantileLoss" or hasattr(obj, "qlike_weight")
-            )
-        cand = self._vol_loss_hint
+            return obj is not None and hasattr(obj, "loss_per_prediction") and hasattr(obj, "quantiles")
+        # 0) use the hint if valid
+        cand = getattr(self, "_vol_loss_hint", None)
         if is_vol_loss(cand):
             return cand
+        # 1) try the MultiLoss container on the module
+        try:
+            ml = getattr(pl_module, "loss", None)
+            inner = getattr(ml, "losses", None) or getattr(ml, "_losses", None)
+            if isinstance(inner, (list, tuple)):
+                for l in inner:
+                    if is_vol_loss(l):
+                        return l
+        except Exception:
+            pass
+        # 2) last resort: scan attributes
+        import inspect
         for _, v in inspect.getmembers(pl_module):
             if is_vol_loss(v):
                 return v
@@ -2598,6 +2676,33 @@ class CosineLR(pl.Callback):
         #     except Exception:
         #         pass
 
+
+def get_extra_callbacks(vol_loss):
+    return [
+        BiasWarmupCallback(
+            vol_loss=vol_loss,
+            target_under=1.09,
+            target_mean_bias=0.04,
+            warmup_epochs=6,
+            qlike_target_weight=0.05,
+            start_mean_bias=0.02,
+            mean_bias_ramp_until=6,
+            guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
+            guard_tol=getattr(ARGS, "warmup_guard_tol", 0.005),
+            alpha_step=0.05,
+        ),
+        TailWeightRamp(
+            vol_loss=vol_loss,
+            start=1.0,
+            end=1.1,
+            ramp_epochs=24,
+            gate_by_calibration=True,
+            gate_low=0.9,
+            gate_high=1.1,
+            gate_patience=2,
+        ),
+    ]
+
 class ReduceLROnPlateauCallback(pl.Callback):
     def __init__(self, monitor="val_comp_overall", factor=0.5, patience=5, min_lr=1e-5, cooldown=0, stop_after_epoch=9):
         self.monitor, self.factor, self.patience, self.min_lr, self.cooldown = monitor, factor, patience, min_lr, cooldown
@@ -2666,7 +2771,7 @@ EXTRA_CALLBACKS = [
           gate_patience=2,
       ),
       ReduceLROnPlateauCallback(
-          monitor="val_composite_overall", factor=0.5, patience=6, min_lr=3e-5, cooldown=1, stop_after_epoch=8
+          monitor="val_composite_overall", factor=0.5, patience=6, min_lr=0.00085, cooldown=1, stop_after_epoch=8
       ),
       ModelCheckpoint(
           dirpath=str(LOCAL_CKPT_DIR),
@@ -3090,25 +3195,16 @@ def _train_single_fold(train_df: pd.DataFrame, val_df: pd.DataFrame, fold_id: in
     val_loader   = validation.to_dataloader(train=False, batch_size=BATCH_SIZE, num_workers=num_workers,
                                             persistent_workers=num_workers>0, prefetch_factor=getattr(ARGS, "prefetch_factor", 2))
 
-    # Define DIR_LOSS and fixed weights just above model instantiation
-    # ---- Global multitask losses & weights (shared fold + refit) ----
+    DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.10, pos_weight=1.001, brier_weight=0.18)
     VOL_LOSS = AsymmetricQuantileLoss(
         quantiles=VOL_QUANTILES,
-        underestimation_factor=1.0,
-        mean_bias_weight=0.0,
-        tail_q=0.90,
-        tail_weight=0.0,
-        qlike_weight=0.0,
+        underestimation_factor=1.00,   # steered by BiasWarmupCallback
+        mean_bias_weight=0.01,
+        tail_q=0.85,
+        tail_weight=1.0,                # ramped by TailWeightRamp
+        qlike_weight=0.0,               # set via warmup callback
+        reduction="mean",
     )
-
-    DIR_LOSS = LabelSmoothedBCEWithBrier(
-        smoothing=0.10,
-        pos_weight=1.001,
-        brier_weight=0.18,
-    )
-
-    FIXED_VOL_WEIGHT: float = 1.0
-    FIXED_DIR_WEIGHT: float = 0.1
     model = TemporalFusionTransformer.from_dataset(
         training,
         hidden_size=96,
@@ -3118,14 +3214,12 @@ def _train_single_fold(train_df: pd.DataFrame, val_df: pd.DataFrame, fold_id: in
         learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.00085),
         optimizer="AdamW",
         optimizer_params={"weight_decay": WEIGHT_DECAY},
-        output_size=[7, 1],  # 7 quantiles + 1 logit
-        loss=MultiLoss([VOL_LOSS, DIR_LOSS], weights=[FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT]),
+        output_size=[7, 1],
+        loss=MultiLoss([VOL_LOSS, DIR_LOSS], weights=[1.0, 0.1]),
         logging_metrics=[],
         log_interval=50,
         log_val_interval=10,
-        reduce_on_plateau_patience=4,   # <<< add this for consistency
     )
-
     id_to_name = {}
     try:
         enc = training.get_parameters()
@@ -3152,20 +3246,24 @@ def _train_single_fold(train_df: pd.DataFrame, val_df: pd.DataFrame, fold_id: in
     # Leaner set of callbacks, as instructed
     callbacks = [per_asset_cb, ModelCheckpoint(dirpath=str(fold_ckpt), filename="last", save_top_k=0, save_last=True)] + EXTRA_CALLBACKS
 
+    # Build the *full* stack in one place so folds and refit stay identical
+    EXTRA_CALLBACKS = build_callbacks(training, VOL_LOSS)
+
     trainer = Trainer(
-        max_epochs=MAX_EPOCHS,
         accelerator=ACCELERATOR,
         devices=DEVICES,
         precision=PRECISION,
-        callbacks=callbacks,
+        max_epochs=MAX_EPOCHS,
+        gradient_clip_val=GRADIENT_CLIP_VAL,
+        num_sanity_val_steps=0,
         logger=logger,
-        default_root_dir=str(fold_dir),
-        check_val_every_n_epoch=getattr(ARGS, "check_val_every_n_epoch", 1),
-        log_every_n_steps=getattr(ARGS, "log_every_n_steps", 200),
-        enable_progress_bar = False
+        callbacks=EXTRA_CALLBACKS,
+        check_val_every_n_epoch=int(ARGS.check_val_every_n_epoch),
+        log_every_n_steps=int(ARGS.log_every_n_steps),
+        enable_progress_bar=False,
     )
 
-    seed_everything(42 + int(fold_id))
+    seed_everything(8)
     trainer.fit(model, train_loader, val_loader)
 
     try:
@@ -3446,6 +3544,8 @@ def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df
                 callbacks = [per_asset_cb, ModelCheckpoint(dirpath=str(ckpt_dir), filename="last",
                                                            save_top_k=0, save_last=True)] + EXTRA_CALLBACKS
 
+                callbacks = [per_asset_cb, ModelCheckpoint(dirpath=str(ckpt_dir), filename="last",
+                                                          save_top_k=0, save_last=True)] + EXTRA_CALLBACKS
                 trainer_final = Trainer(
                     max_epochs=MAX_EPOCHS,
                     accelerator=ACCELERATOR,
@@ -3458,7 +3558,7 @@ def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df
                     log_every_n_steps=getattr(ARGS, "log_every_n_steps", 200),
                 )
 
-                seed_everything(12345)
+                seed_everything(8)
                 trainer_final.fit(model, train_dataloaders=train_all_loader)
 
                 # Export VAL
