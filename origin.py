@@ -1526,7 +1526,21 @@ class PerAssetMetrics(pl.Callback):
             epoch_num = None
 
         # Composite loss (absolute form for validation)
-        val_comp = float(composite_score(overall_mae, overall_rmse, overall_qlike))
+        # Gate QLIKE weight early / when miscalibrated so the monitor reflects MAE/RMSE progress
+        w_mae, w_rmse, w_qlike = COMP_WEIGHTS
+        mean_scale = trainer.callback_metrics.get("val_mean_scale", None)
+        try:
+            ms = float(mean_scale.item() if hasattr(mean_scale, "item") else mean_scale)
+        except Exception:
+            ms = None
+
+        # If calibration is far from 1 or during the first few epochs, damp QLIKE’s influence
+        if (ms is None) or (ms < 0.85) or (ms > 1.15) or (int(getattr(trainer, "current_epoch", 0)) < 4):
+            w_qlike_eff = 0.0005
+        else:
+            w_qlike_eff = w_qlike
+
+        val_comp = w_mae * overall_mae + w_rmse * overall_rmse + w_qlike_eff * overall_qlike
         # Preferred monitor key
         trainer.callback_metrics["val_comp_overall"]      = torch.tensor(val_comp)
         # Backward-compat alias (some monitors used this)
@@ -1965,8 +1979,9 @@ class BiasWarmupCallback(pl.Callback):
             err = np.log(max(1e-6, self._scale_ema))   # log mean(y)/mean(p)
             step = np.clip(1.0 + self.alpha_step * err, 1.0 - self.alpha_step, 1.0 + self.alpha_step)
             alpha = (1.0 + (self.target_under - 1.0) * prog) * step
-            if self._scale_ema < 0.995:  # already over-predicting
-                alpha = min(alpha, 1.0)
+            # allow a small portion of the ramp even when over-predicting, instead of clamping to 1.0
+            if self._scale_ema < 0.995:
+                alpha = max(1.0, 1.0 + 0.33 * ((self.target_under - 1.0) * prog))
         vol_loss.underestimation_factor = float(max(1.0, min(alpha, self.target_under)))
 
         # mean-bias gentle ramp
