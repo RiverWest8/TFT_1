@@ -3143,7 +3143,7 @@ if __name__ == "__main__":
     lr_cb = LearningRateMonitor(logging_interval="step")
 
     comp_print_cb = BestCompositePrinter(
-        monitor_keys=("val_composite_overall"),
+        monitor_keys=("val_composite_overall", "val_comp_overall"),
         mode="min"  # lower composite is better
     )
 
