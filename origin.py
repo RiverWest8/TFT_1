@@ -987,6 +987,77 @@ class LabelSmoothedBCEWithBrier(nn.Module):
 
         return bce + self.brier_weight * brier
 
+# ---- Fixed multitask loss weights and optimiser knobs ----
+FIXED_VOL_WEIGHT: float = 1.0
+FIXED_DIR_WEIGHT: float = 0.1
+WEIGHT_DECAY: float = 1e-2  # AdamW wd; override via --weight_decay if you expose it
+LR_OVERRIDE = None
+try:
+    if "ARGS" in globals() and getattr(ARGS, "learning_rate", None) is not None:
+        LR_OVERRIDE = float(getattr(ARGS, "learning_rate"))
+except Exception:
+    LR_OVERRIDE = None
+
+class TailWeightRamp(pl.Callback):
+    """
+    Linearly ramp vol_loss.tail_weight from `start` to `end` over `ramp_epochs`.
+    Optionally gate by calibration: mean(y)/mean(p) must be in [gate_low, gate_high]
+    for `gate_patience` consecutive validations to increase the tail emphasis.
+    """
+    def __init__(self, vol_loss, start: float = 1.0, end: float = 1.1, ramp_epochs: int = 24,
+                 gate_by_calibration: bool = True, gate_low: float = 0.9, gate_high: float = 1.1, gate_patience: int = 2):
+        super().__init__()
+        self._vol_loss_hint = vol_loss
+        self.start = float(start)
+        self.end = float(end)
+        self.ramp_epochs = int(max(1, ramp_epochs))
+        self.gate = bool(gate_by_calibration)
+        self.gate_low = float(gate_low)
+        self.gate_high = float(gate_high)
+        self.gate_patience = int(max(1, gate_patience))
+        self._ok_streak = 0
+
+    def _resolve_vol_loss(self, pl_module):
+        def is_vol_loss(obj):
+            return obj is not None and hasattr(obj, "quantiles") and hasattr(obj, "loss_per_prediction")
+        cand = self._vol_loss_hint
+        if is_vol_loss(cand):
+            return cand
+        for _, v in inspect.getmembers(pl_module):
+            if is_vol_loss(v):
+                return v
+        return None
+
+    def on_validation_end(self, trainer, pl_module):
+        if not self.gate:
+            self._ok_streak = self.gate_patience
+            return
+        vms = trainer.callback_metrics.get("val_mean_scale", None)
+        try:
+            s = float(vms.item() if hasattr(vms, "item") else vms)
+        except Exception:
+            s = None
+        if s is not None and (self.gate_low <= s <= self.gate_high):
+            self._ok_streak = min(self._ok_streak + 1, self.gate_patience)
+        else:
+            self._ok_streak = 0
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        vol_loss = self._resolve_vol_loss(pl_module)
+        if vol_loss is None:
+            return
+        e = int(getattr(trainer, "current_epoch", 0))
+        # if gating is enabled, require enough consecutive 'ok' validations before ramping
+        if self.gate and self._ok_streak < self.gate_patience:
+            tw = self.start
+        else:
+            prog = min(1.0, max(0.0, e / float(self.ramp_epochs)))
+            tw = self.start + (self.end - self.start) * prog
+        try:
+            vol_loss.tail_weight = float(tw)
+        except Exception:
+            pass
+
 import torch
 import torch.nn.functional as F
 
@@ -1861,7 +1932,18 @@ class MedianMSELoss(nn.Module):
         q50 = y_hat_quantiles[:, 3]  # index of 0.50
         return F.mse_loss(q50, y_true)
 
-            
+# --- Losses (bind to names used by callbacks) ---
+VOL_LOSS = AsymmetricQuantileLoss(
+    quantiles=VOL_QUANTILES,
+    underestimation_factor=1.0,
+    mean_bias_weight=0.0,
+    tail_q=0.90,
+    tail_weight=1.0,          # will be ramped by TailWeightRamp
+    qlike_weight=0.0,         # diagnostics proxy only (BiasWarmup manages this)
+)
+DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.10, pos_weight=1.001, brier_weight=0.18)
+
+TASK_LOSS = MultiLoss([VOL_LOSS, DIR_LOSS], weights=[FIXED_VOL_WEIGHT, FIXED_DIR_WEIGHT])
 # -----------------------------------------------------------------------
 # Compute / device configuration (optimised for NVIDIA L4 on GCP)
 # -----------------------------------------------------------------------
@@ -3307,16 +3389,33 @@ def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df
                     shuffle=False,
                 )
                 # Fresh model
-                vol_loss = AsymmetricQuantileLoss(quantiles=VOL_QUANTILES)
-                dir_loss = LabelSmoothedBCEWithBrier(smoothing=0.10, pos_weight=1.001, brier_weight=0.18)
-                loss = MultiLoss([vol_loss, dir_loss], weights=[1.0, 1.0])
+                VOL_LOSS = AsymmetricQuantileLoss(
+                      quantiles=VOL_QUANTILES,
+                      underestimation_factor=1.00,  # managed by BiasWarmupCallback
+                      mean_bias_weight=0.01,        # small centering on the median for MAE
+                      tail_q=0.85,
+                      tail_weight=1.0,              # will be ramped by TailWeightRamp
+                      qlike_weight=0.0,             # QLIKE weight is ramped safely in BiasWarmupCallback
+                      reduction="mean",
+                  )
+                DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.02, pos_weight=pos_weight)
+                loss = MultiLoss([VOL_LOSS, DIR_LOSS], weights=[1.0, 0.1])
                 model = TemporalFusionTransformer.from_dataset(
                     train_all_ds,
-                    learning_rate=_first_not_none(vars(ARGS), ["learning_rate"]) or 1e-3,
+                    hidden_size=96,
+                    attention_head_size=4,
+                    dropout=0.13,
+                    hidden_continuous_size=24,
+                    learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.00085),
+                    optimizer="AdamW",
+                    optimizer_params={"weight_decay": WEIGHT_DECAY},
+                    output_size=[7, 1],  # 7 quantiles + 1 logit
                     loss=loss,
-                    output_size=[len(VOL_QUANTILES), 1],
-                    reduce_on_plateau_patience=4,
+                    logging_metrics=[],
+                    log_interval=50,
+                    log_val_interval=10,
                 )
+              
                 # Trainer for refit (NO validation on TEST to avoid leakage)
                 final_dir = LOCAL_RUN_DIR / "refit_full_pretest"
                 final_dir.mkdir(parents=True, exist_ok=True)
