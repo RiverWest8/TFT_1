@@ -11,7 +11,7 @@ This script trains a single TFT model that jointly predicts:
   • the direction of the next period’s price move (binary classification)
 
 It expects three parquet files:
-    ▸ /Users/riverwest-gomila/Desktop/Data/CleanedData/universal_train_trunc.parquet
+    ▸ /Users/riverwest-gomila/Desktop/Data/CleanedData/universal_train.parquet
     ▸ /Users/riverwest-gomila/Desktop/Data/CleanedData/universal_val.parquet
     ▸ /Users/riverwest-gomila/Desktop/Data/CleanedData/universal_test.parquet
 
@@ -783,7 +783,7 @@ def fit_log_calibrator_per_asset(df_val: pd.DataFrame,
         theta, *_ = np.linalg.lstsq(pp1, yy, rcond=None)
         alpha = float(theta[0])
         beta  = float(theta[1])
-        beta  = float(np.clip(beta, 0.8, 1.6))        # <-- NEW
+        beta  = float(np.clip(beta, 1.0, 1.6))        # <-- NEW
         out[str(a)] = {"alpha": alpha, "beta": beta}
     return out
 
@@ -914,7 +914,7 @@ class AsymmetricQuantileLoss(QuantileLoss):
         quantiles,
         underestimation_factor: float = 1.00, #1.1115
         mean_bias_weight: float = 0.0,
-        tail_q: float = 0.90,         # ← was 0.85
+        tail_q: float = 0.85,         # ← was 0.85
         tail_weight: float = 0.0,
         qlike_weight: float = 0.0,   # set to 0.0 because we cannot safely decode inside the loss
         eps: float = 1e-8,
@@ -2798,9 +2798,9 @@ if __name__ == "__main__":
         df["rv_scale"].fillna(asset_scale_map.median(), inplace=True)
     # Global decoded-scale floor for vol (prevents QLIKE blow-ups on near-zero preds)
     try:
-        EVAL_VOL_FLOOR = max(1e-8, float(asset_scales["rv_scale"].median() * 0.002))
+        EVAL_VOL_FLOOR = max(1e-10, float(asset_scales["rv_scale"].median() * 0.0002))
     except Exception:
-        EVAL_VOL_FLOOR = 1e-8
+        EVAL_VOL_FLOOR = 1e-10
     print(f"[EVAL] Global vol floor (decoded) set to {EVAL_VOL_FLOOR:.6g}")
 
     # Add calendar features to all splits
