@@ -507,7 +507,15 @@ def _export_split_from_best(trainer, dataloader, split: str, out_path: Path, cal
 
         # true targets if present
         y_vol_true, y_dir_true = None, None
-        dec_t = x.get("decoder_target") or x.get("target") or x.get("targets") or x.get("y") or x.get("decoder_y")
+        dec_t = x.get("decoder_target", None)
+        if dec_t is None:
+            dec_t = x.get("target", None)
+        if dec_t is None:
+            dec_t = x.get("targets", None)
+        if dec_t is None:
+            dec_t = x.get("y", None)
+        if dec_t is None:
+            dec_t = x.get("decoder_y", None)
         if torch.is_tensor(dec_t):
             ytmp = dec_t
             if ytmp.ndim == 3 and ytmp.size(1) == 1:
@@ -684,7 +692,9 @@ def collect_split_predictions(trainer,
         aset = [id_to_name.get(int(i), str(int(i))) for i in g.detach().cpu().tolist()]
 
         # time index
-        t = x.get("decoder_time_idx", None) or x.get("decoder_relative_idx", None)
+        t = x.get("decoder_time_idx", None)
+        if t is None:
+            t = x.get("decoder_relative_idx", None)
         if torch.is_tensor(t):
             while t.ndim > 1 and t.size(-1) == 1:
                 t = t.squeeze(-1)
@@ -721,7 +731,15 @@ def collect_split_predictions(trainer,
 
         # true targets if present
         y_vol_true, y_dir_true = None, None
-        dec_t = x.get("decoder_target") or x.get("target") or x.get("targets") or x.get("y") or x.get("decoder_y")
+        dec_t = x.get("decoder_target", None)
+        if dec_t is None:
+            dec_t = x.get("target", None)
+        if dec_t is None:
+            dec_t = x.get("targets", None)
+        if dec_t is None:
+            dec_t = x.get("y", None)
+        if dec_t is None:
+            dec_t = x.get("decoder_y", None)
         if torch.is_tensor(dec_t):
             ytmp = dec_t
             if ytmp.ndim == 3 and ytmp.size(1) == 1: ytmp = ytmp[:, 0, :]
