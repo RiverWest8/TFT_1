@@ -1781,7 +1781,7 @@ parser.add_argument("--perm_block_size", type=int, default=None, help="Alias for
 parser.add_argument(
     "--enable_perm_importance", "--enable-feature-importance",
     type=lambda s: str(s).lower() in ("1","true","t","yes","y","on"),
-    default=None,
+    default=False,
     help="Enable permutation feature importance (true/false)"
 )
 # Cloud paths / storage overrides
