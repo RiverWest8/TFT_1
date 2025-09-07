@@ -3529,31 +3529,17 @@ def run_rolling_origin(train_df: "pd.DataFrame", val_df: "pd.DataFrame", test_df
                 vol_norm = _extract_norm_from_dataset(train_all_ds)
                 per_asset_cb = PerAssetMetrics(id_to_name=id_to_name, vol_normalizer=vol_norm)
 
-                EXTRA_CALLBACKS = [
-                    BiasWarmupCallback(vol_loss=VOL_LOSS, target_under=1.05, target_mean_bias=0.04, warmup_epochs=6,
-                                       qlike_target_weight=0.05, start_mean_bias=0.02, mean_bias_ramp_until=6,
-                                       guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
-                                       guard_tol=getattr(ARGS, "warmup_guard_tol", 0.005), alpha_step=0.05),
-                    TailWeightRamp(vol_loss=VOL_LOSS, start=1.0, end=1.1, ramp_epochs=24,
-                                   gate_by_calibration=True, gate_low=0.9, gate_high=1.1, gate_patience=2),
-                ]
-
                 final_dir = LOCAL_RUN_DIR / "refit_full_pretest"
                 ckpt_dir = final_dir / "checkpoints"
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
                 logger = TensorBoardLogger(save_dir=str(final_dir / "lightning_logs"), name="tft_refit")
-
-                callbacks = [per_asset_cb, ModelCheckpoint(dirpath=str(ckpt_dir), filename="last",
-                                                           save_top_k=0, save_last=True)] + EXTRA_CALLBACKS
-
-                callbacks = [per_asset_cb, ModelCheckpoint(dirpath=str(ckpt_dir), filename="last",
-                                                          save_top_k=0, save_last=True)] + EXTRA_CALLBACKS
+                EXTRA_CALLBACKS = build_callbacks(train_all_ds, VOL_LOSS)
                 trainer_final = Trainer(
                     max_epochs=MAX_EPOCHS,
                     accelerator=ACCELERATOR,
                     devices=DEVICES,
                     precision=PRECISION,
-                    callbacks=callbacks,
+                    callbacks=EXTRA_CALLBACKS,
                     logger=logger,
                     default_root_dir=str(final_dir),
                     check_val_every_n_epoch=getattr(ARGS, "check_val_every_n_epoch", 1),
