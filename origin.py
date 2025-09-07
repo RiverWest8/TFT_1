@@ -497,18 +497,12 @@ def build_callbacks(ds, vol_loss) -> _List[pl.Callback]:
         auto_insert_metric_name=False,
     )
 
-    # Optional SWA (kept as you had)
-    swa_cb = StochasticWeightAveraging(
-        swa_lrs=1e-6, annealing_epochs=1, annealing_strategy="cos",
-        swa_epoch_start=max(1, int(0.9 * MAX_EPOCHS))
-    )
-
     stack = [progress_cb, es_cb, metrics_cb]
     if mirror_cb is not None:
         stack.append(mirror_cb)
-    stack += [lr_cb, val_hist_cb]
+    stack += [lr_cb, ]
     stack += warmups
-    stack += [plateau_cb, cosine_cb, fold_ckpt_cb, swa_cb]
+    stack += [plateau_cb, cosine_cb, fold_ckpt_cb]
     return stack
 
 @torch.no_grad()
