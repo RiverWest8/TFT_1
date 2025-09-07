@@ -699,13 +699,26 @@ def _numeric_feature_columns(df: "pd.DataFrame", exclude: set[str]):
     return cols
 # ---- Helper: ensure calendar features exist on any dataframe we feed into PF ----
 def _ensure_calendar_features(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Ensure sin/cos DoW/ToD + Is_Weekend exist.
+    SAFE: no-ops unless df is a real pandas.DataFrame with TIME_COL.
+    """
+    # Hard guard: if called with a Tensor/batch dict/etc., just return unchanged
+    try:
+        import pandas as _pd
+        if not isinstance(df, _pd.DataFrame):
+            return df
+    except Exception:
+        # if pandas is not available or isinstance check fails, bail out silently
+        return df
+
     if df is None or len(df) == 0:
         return df
     if TIME_COL not in df.columns:
         return df
+
     t = pd.to_datetime(df[TIME_COL], errors="coerce")
+    # make tz-naive consistently (safe for tz-aware or naive)
     try:
-        # make tz-naive consistently
         t = t.dt.tz_convert(None)
     except Exception:
         try:
@@ -719,7 +732,6 @@ def _ensure_calendar_features(df: "pd.DataFrame") -> "pd.DataFrame":
     angle_tod = 2.0 * math.pi * (sec / 86400.0)
     angle_dow = 2.0 * math.pi * (t.dt.dayofweek.astype(float) / 7.0)
 
-    # Create columns only if missing to avoid recomputing/warnings
     if "sin_tod" not in df.columns:
         df["sin_tod"] = np.sin(angle_tod)
     if "cos_tod" not in df.columns:
@@ -728,7 +740,6 @@ def _ensure_calendar_features(df: "pd.DataFrame") -> "pd.DataFrame":
         df["sin_dow"] = np.sin(angle_dow)
     if "cos_dow" not in df.columns:
         df["cos_dow"] = np.cos(angle_dow)
-    # Weekend flag as int8 (known real; PF will scale it)
     if "Is_Weekend" not in df.columns:
         df["Is_Weekend"] = (t.dt.dayofweek >= 5).astype("int8")
     return df
@@ -3064,6 +3075,7 @@ def _train_single_fold(train_df: pd.DataFrame, val_df: pd.DataFrame, fold_id: in
         default_root_dir=str(fold_dir),
         check_val_every_n_epoch=getattr(ARGS, "check_val_every_n_epoch", 1),
         log_every_n_steps=getattr(ARGS, "log_every_n_steps", 200),
+        enable_progress_bar = False
     )
 
     seed_everything(42 + int(fold_id))
