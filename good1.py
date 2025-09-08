@@ -58,7 +58,7 @@ import lightning.pytorch as pl
 
 BATCH_SIZE   = 128
 MAX_EPOCHS   = 35
-EARLY_STOP_PATIENCE = 15
+EARLY_STOP_PATIENCE = 20
 PERM_BLOCK_SIZE = 288
 
 # Extra belt-and-braces: swallow BrokenPipe errors on stdout.flush() if any other lib calls it.
@@ -2547,7 +2547,7 @@ EMBEDDING_CARDINALITY = {}
 
 BATCH_SIZE   = 128
 MAX_EPOCHS   = 35
-EARLY_STOP_PATIENCE = 13
+EARLY_STOP_PATIENCE = 20
 
 # Artifacts are written locally then uploaded to GCS
 from datetime import datetime, timezone, timedelta
