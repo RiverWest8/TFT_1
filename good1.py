@@ -2440,11 +2440,11 @@ EXTRA_CALLBACKS = [
       ]
 
 
-# === [CALLBACK] Print best composite metric each epoch ===
 class BestCompositePrinter(pl.Callback):
     """
     Prints when the monitored composite metric improves and tracks the best value.
     Supports either 'val_composite_overall' or 'val_comp_overall' (whichever is present).
+    Always reports "No improvement" explicitly if current >= best.
     """
     def __init__(self,
                  monitor_keys=("val_composite_overall", "val_comp_overall"),
@@ -2472,8 +2472,7 @@ class BestCompositePrinter(pl.Callback):
     def on_validation_epoch_end(self, trainer, pl_module):
         key, current = self._get_metric(trainer)
         if key is None or current is None:
-            # metric not logged this epoch
-            return
+            return  # nothing logged this epoch
 
         # First observation
         if self.best is None:
@@ -2859,7 +2858,18 @@ if __name__ == "__main__":
     val_df   = add_calendar_features(val_df)
     test_df  = add_calendar_features(test_df)
 
+    # --- Drop MVMD features (for runs without MVMD) ---
+    def drop_mvmd_cols(df: pd.DataFrame) -> pd.DataFrame:
+        if df is not None:
+            drop_cols = [c for c in df.columns if c.lower().startswith("mvmd")]
+            if drop_cols:
+                print(f"Dropping MVMD columns: {drop_cols}")
+                df = df.drop(columns=drop_cols)
+        return df
 
+    train_df = drop_mvmd_cols(train_df)
+    val_df   = drop_mvmd_cols(val_df)
+    test_df  = drop_mvmd_cols(test_df)
     # Optional quick-run subsetting for speed
     _mode = getattr(ARGS, "subset_mode", "per_asset_tail")
     if getattr(ARGS, "train_max_rows", None):
