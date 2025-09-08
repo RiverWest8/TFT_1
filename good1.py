@@ -1568,7 +1568,7 @@ class BiasWarmupCallback(pl.Callback):
         guard_patience: int = 2,
         guard_tol: float = 0.0,
         alpha_step: float = 0.05,
-        scale_ema_alpha: float = 0.88,
+        scale_ema_alpha: float = 0.5,
     ):
         super().__init__()
         self._vol_loss_hint = vol_loss
@@ -1628,7 +1628,7 @@ class BiasWarmupCallback(pl.Callback):
             vms = trainer.callback_metrics.get("val_mean_scale", None)
             if vms is not None:
                 s = float(vms.item() if hasattr(vms, "item") else vms)
-                a = getattr(self, "scale_ema_alpha", 0.88)
+                a = getattr(self, "scale_ema_alpha", 0.5)
                 self._scale_ema = s if (self._scale_ema is None) else (1.0 - a) * self._scale_ema + a * s
         except Exception:
             pass
@@ -1714,7 +1714,7 @@ class BiasWarmupCallback(pl.Callback):
         if hasattr(vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
             q_target = float(self.qlike_target_weight)
             q_prog   = min(1.0, float(e) / float(max(self.warm, 8)))
-            near_ok  = (self._scale_ema is None) or (0.98 <= self._scale_ema <= 1.02)
+            near_ok  = (self._scale_ema is None) or (0.995 <= self._scale_ema <= 1.005)
 
             qlike_floor = 0.02  # keep some scale pressure even when gated
             if near_ok:
@@ -2394,7 +2394,7 @@ class ReduceLROnPlateauCallback(pl.Callback):
 VOL_LOSS = AsymmetricQuantileLoss(
     quantiles=VOL_QUANTILES,
     underestimation_factor=1.00,  # managed by BiasWarmupCallback
-    mean_bias_weight=0.01,        # small centering on the median for MAE
+    mean_bias_weight=0.02,        # small centering on the median for MAE
     tail_q=0.85,
     tail_weight=1.0,              # will be ramped by TailWeightRamp
     qlike_weight=0.0,             # QLIKE weight is ramped safely in BiasWarmupCallback
@@ -2404,15 +2404,15 @@ VOL_LOSS = AsymmetricQuantileLoss(
 EXTRA_CALLBACKS = [
       BiasWarmupCallback(
           vol_loss=VOL_LOSS,
-          target_under=1.05,
+          target_under=1.06,
           target_mean_bias=0.04,
-          warmup_epochs=6,
+          warmup_epochs=8,
           qlike_target_weight=0.05,   # keep out of the loss; diagnostics only
           start_mean_bias=0.02,
           mean_bias_ramp_until=6,
           guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
           guard_tol=getattr(ARGS, "warmup_guard_tol", 0.005),
-          alpha_step=0.05,
+          alpha_step=0.01,
       ),
       TailWeightRamp(
           vol_loss=VOL_LOSS,
@@ -2435,7 +2435,6 @@ EXTRA_CALLBACKS = [
           save_top_k=2,
           save_last=True,
       ),
-      StochasticWeightAveraging(swa_lrs = 4.25e5 , annealing_epochs = 1, annealing_strategy="cos", swa_epoch_start=max(1, int(0.9 * MAX_EPOCHS))),
       CosineLR(start_epoch=8, eta_min_ratio=0.05, hold_last_epochs=1, warmup_steps=0),
       ]
 
