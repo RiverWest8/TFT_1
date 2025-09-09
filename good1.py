@@ -610,6 +610,104 @@ def collect_split_predictions(trainer,
 
     return df
 
+# ---------------- DM (Diebold–Mariano) helpers: TEST-only payload ----------------
+def _augment_with_pointwise_losses_for_dm(df: pd.DataFrame, floor: float = 1e-8) -> pd.DataFrame:
+    """
+    Add per-sample losses needed for DM tests (regression + direction).
+    Works post-hoc on the dataframe returned by `collect_split_predictions`.
+
+    Losses (elementwise):
+      • vol_loss_mae    = |ŷ - y|
+      • vol_loss_sq     = (ŷ - y)^2
+      • vol_loss_qlike  = (y^2 / max(ŷ, eps)^2) - log(y^2 / max(ŷ, eps)^2) - 1
+      • dir_loss_brier  = (p - y_dir)^2  (if direction cols exist)
+      • dir_loss_01     = 1{ 1[p>=0.5] ≠ y_dir } (if direction cols exist)
+    """
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+
+    # Ensure numeric with safe floors
+    y = pd.to_numeric(out.get("y_vol"), errors="coerce").astype(float)
+    p = pd.to_numeric(out.get("y_vol_pred"), errors="coerce").astype(float)
+    eps = float(floor)
+
+    # Regression losses
+    diff = p - y
+    out["vol_loss_mae"] = np.abs(diff)
+    out["vol_loss_sq"] = diff * diff
+
+    s2y = np.square(y)
+    s2p = np.square(np.clip(p, eps, np.inf))
+    ratio = s2y / s2p
+    ratio = np.clip(ratio, np.exp(-50.0), np.exp(50.0))  # numerical guard
+    out["vol_loss_qlike"] = (ratio - np.log(ratio) - 1.0)
+
+    # Direction losses (if available)
+    if "y_dir" in out.columns and "y_dir_prob" in out.columns:
+        yd = pd.to_numeric(out["y_dir"], errors="coerce").astype(float)
+        pr = pd.to_numeric(out["y_dir_prob"], errors="coerce").astype(float).clip(0.0, 1.0)
+        out["dir_loss_brier"] = (pr - yd) ** 2
+        out["dir_loss_01"] = ((pr >= 0.5).astype(int) != yd.astype(int)).astype(int)
+    else:
+        out["dir_loss_brier"] = np.nan
+        out["dir_loss_01"] = np.nan
+
+    # Basic keys for alignment (ensure they exist)
+    for c in ("asset", "time_idx", "Time", "split"):
+        if c not in out.columns:
+            out[c] = np.nan
+
+    # Normalise dtypes
+    out["asset"] = out["asset"].astype(str)
+    try:
+        out["time_idx"] = pd.to_numeric(out["time_idx"], errors="coerce").astype("Int64")
+    except Exception:
+        pass
+    try:
+        out["Time"] = pd.to_datetime(out["Time"], errors="coerce")
+    except Exception:
+        pass
+
+    return out
+
+
+class SaveTestDMPayloadCallback(pl.Callback):
+    """
+    On fit end, collect TEST predictions and write a DM-ready parquet with per-sample losses.
+    Hard-coded: TEST ONLY. No CLI flags. No validation output.
+    """
+    def __init__(self, test_dataloader=None):
+        super().__init__()
+        self._test_dl = test_dataloader  # if None, will resolve from globals()
+
+    def _resolve_test_dl(self):
+        if self._test_dl is not None:
+            return self._test_dl
+        try:
+            return globals().get("test_dataloader", None)
+        except Exception:
+            return None
+
+    @torch.no_grad()
+    def on_fit_end(self, trainer, pl_module):
+        test_dl = self._resolve_test_dl()
+        if test_dl is None:
+            print("[DM] No test_dataloader found; skipping DM payload.")
+            return
+        try:
+            df_test = collect_split_predictions(trainer, test_dl, split="test")
+            df_dm = _augment_with_pointwise_losses_for_dm(
+                df_test, floor=float(globals().get("EVAL_VOL_FLOOR", 1e-8))
+            )
+            df_dm["split"] = "test"
+            out_path = LOCAL_OUTPUT_DIR / f"dm_payload_test_{RUN_SUFFIX}.parquet"
+            _save_parquet(df_dm, out_path)  # uses your existing _save_parquet (writes + optional GCS)
+            print(f"✓ Saved DM TEST payload → {out_path}")
+        except Exception as e:
+            print(f"[WARN] DM payload (test) not written: {e}")
+
 def _save_parquet(df: pd.DataFrame, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(path, index=False)
@@ -3194,7 +3292,8 @@ if __name__ == "__main__":
         enable_progress_bar=False,
     )
 
-
+    # Hard-coded: write DM TEST payload at end of training
+    trainer.callbacks.append(SaveTestDMPayloadCallback())
     from types import MethodType
 
     # Completely skip PF's internal figure creation & TensorBoard logging during validation.
