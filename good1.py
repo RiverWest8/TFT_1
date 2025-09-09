@@ -3326,6 +3326,21 @@ if __name__ == "__main__":
 
     # Train the model
     trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
+    # --- DM payload (TEST only) ---
+    try:
+        # Collect UNCALIBRATED pointwise predictions on TEST, then attach per-sample losses
+        df_test = collect_split_predictions(trainer, test_dataloader, split="test")
+        df_dm = _augment_with_pointwise_losses_for_dm(
+            df_test, floor=float(globals().get("EVAL_VOL_FLOOR", 1e-8))
+        )
+        df_dm["split"] = "test"
+
+        # Save locally and (if configured) to GCS alongside other outputs
+        out_path = LOCAL_OUTPUT_DIR / f"dm_payload_test_{RUN_SUFFIX}.parquet"
+        _save_parquet(df_dm, out_path)
+        print(f"✓ Saved DM TEST payload → {out_path}")
+    except Exception as e:
+        print(f"[WARN] DM payload (test) not written: {e}")
 
     # ---------- AFTER trainer.fit(model, ...) ----------
 
