@@ -3224,7 +3224,7 @@ if __name__ == "__main__":
 
 
     FIXED_VOL_WEIGHT = 1.0
-    FIXED_DIR_WEIGHT = 0.0
+    FIXED_DIR_WEIGHT = 0.1
  
 
     tft = TemporalFusionTransformer.from_dataset(
@@ -3431,6 +3431,7 @@ if __name__ == "__main__":
 
     val_cal_df  = _apply_cal(val_uncal_df,  "val_cal")
     test_cal_df = _apply_cal(test_uncal_df, "test_cal")
+    
 
     # === [CAL ALIGNMENT] Per-asset affine alignment (mean+std), TRAIN-anchored ===
     # Why: VAL < TRAIN/TEST volatility → pure VAL-based calibration under-scales TEST.
@@ -3754,6 +3755,22 @@ if __name__ == "__main__":
     print("TEST means: y={:.6g}  p={:.6g}  p_cal={:.6g}".format(
         test_uncal_df["y_vol"].mean(), test_uncal_df["y_vol_pred"].mean(), _t_cal_mean))
 
+
+    # --- DM payload (TEST, calibrated) ---
+    try:
+        # Reuse DM augmentation by presenting calibrated median as y_vol_pred
+        df_cal_dm = test_cal_df.copy()
+        if "y_vol_pred_cal" in df_cal_dm.columns:
+            df_cal_dm["y_vol_pred"] = df_cal_dm["y_vol_pred_cal"]
+        df_dm_cal = _augment_with_pointwise_losses_for_dm(
+            df_cal_dm, floor=float(globals().get("EVAL_VOL_FLOOR", 1e-8))
+        )
+        df_dm_cal["split"] = "test_cal"
+        out_path_cal = LOCAL_OUTPUT_DIR / f"dm_payload_test_cal_{RUN_SUFFIX}.parquet"
+        _save_parquet(df_dm_cal, out_path_cal)
+        print(f"✓ Saved DM TEST (calibrated) payload → {out_path_cal}")
+    except Exception as e:
+        print(f"[WARN] DM payload (test calibrated) not written: {e}")
     # 4) save 4 parquets
     OUT = Path(LOCAL_OUTPUT_DIR); OUT.mkdir(parents=True, exist_ok=True)
     p_val_uncal = OUT / f"tft_val_predictions_uncal_last_{RUN_SUFFIX}.parquet"
