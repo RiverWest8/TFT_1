@@ -380,16 +380,31 @@ def _extract_vol_quantiles(pred):
 @torch.no_grad()
 def collect_split_predictions(trainer,
                               dataloader,
-                              split: str) -> pd.DataFrame:
+                              split: str,
+                              pl_module=None) -> pd.DataFrame:
     """
     Predicts with the current in-memory model (no ckpt reload) and returns an
     UNCALIBRATED dataframe with:
       asset, time_idx, y_vol, y_vol_pred, y_vol_pred_q05, y_vol_pred_q95, y_dir, y_dir_prob
     """
-    model = getattr(trainer, "lightning_module", None)
+    model = pl_module or getattr(trainer, "lightning_module", None)
     if model is None:
         raise RuntimeError("No model in memory to predict with.")
-    model.eval().to(trainer.lightning_module.device)
+    # Try to move to a sensible device (works even if trainer is None)
+    dev = None
+    try:
+        dev = getattr(getattr(trainer, "lightning_module", None), "device", None)
+    except Exception:
+        dev = None
+    if dev is None:
+        dev = getattr(model, "device", None)
+    try:
+        if dev is not None:
+            model.eval().to(dev)
+        else:
+            model.eval()
+    except Exception:
+        model.eval()
 
     # try to recover ID->name map and normalizer
     id_to_name = {}
@@ -676,11 +691,23 @@ def _augment_with_pointwise_losses_for_dm(df: pd.DataFrame, floor: float = 1e-8)
 class SaveTestDMPayloadCallback(pl.Callback):
     """
     On fit end, collect TEST predictions and write a DM-ready parquet with per-sample losses.
-    Hard-coded: TEST ONLY. No CLI flags. No validation output.
+    Additionally, save VAL/TEST **uncalibrated** and **calibrated** prediction parquets for
+    both the in-memory ("last") model and the best checkpoint model.
+
+    Hard-coded: TEST-only DM payloads. No CLI flags.
     """
-    def __init__(self, test_dataloader=None):
+    def __init__(self, val_dataloader=None, test_dataloader=None):
         super().__init__()
-        self._test_dl = test_dataloader  # if None, will resolve from globals()
+        self._val_dl = val_dataloader
+        self._test_dl = test_dataloader
+
+    def _resolve_val_dl(self):
+        if self._val_dl is not None:
+            return self._val_dl
+        try:
+            return globals().get("val_dataloader", None)
+        except Exception:
+            return None
 
     def _resolve_test_dl(self):
         if self._test_dl is not None:
@@ -690,23 +717,126 @@ class SaveTestDMPayloadCallback(pl.Callback):
         except Exception:
             return None
 
+    def _find_best_ckpt_path(self, trainer):
+        try:
+            from lightning.pytorch.callbacks import ModelCheckpoint
+        except Exception:
+            ModelCheckpoint = None
+        best = None
+        try:
+            for cb in getattr(trainer, "callbacks", []) or []:
+                if ModelCheckpoint is not None and isinstance(cb, ModelCheckpoint):
+                    p = getattr(cb, "best_model_path", None)
+                    if p and os.path.exists(p):
+                        best = p
+                        break
+        except Exception:
+            best = None
+        return best
+
+    @torch.no_grad()
+    def _save_pred_bundles(self, trainer, pl_module, tag: str):
+        """Save VAL/TEST uncal + cal bundles for the given module under a tag ('last'/'best')."""
+        val_dl = self._resolve_val_dl()
+        test_dl = self._resolve_test_dl()
+        if val_dl is None and test_dl is None:
+            print(f"[DM] No dataloaders available; skipping {tag} bundles.")
+            return
+
+        # 1) Collect UNCAL predictions
+        df_val = collect_split_predictions(trainer, val_dl, split="val", pl_module=pl_module) if val_dl is not None else None
+        df_tst = collect_split_predictions(trainer, test_dl, split="test", pl_module=pl_module) if test_dl is not None else None
+
+        # 2) Save UNCAL parquets
+        if df_val is not None and not df_val.empty:
+            _save_parquet(df_val, LOCAL_OUTPUT_DIR / f"tft_val_predictions_uncal_{tag}_{RUN_SUFFIX}.parquet")
+        if df_tst is not None and not df_tst.empty:
+            _save_parquet(df_tst, LOCAL_OUTPUT_DIR / f"tft_test_predictions_uncal_{tag}_{RUN_SUFFIX}.parquet")
+
+        # 3) Fit per-asset log-linear calibrator on VAL and apply to VAL/TEST
+        if df_val is not None and not df_val.empty:
+            calib = fit_log_calibrator_per_asset(df_val, y_col="y_vol", p_col="y_vol_pred")
+            # Optional: anchor intercepts toward TRAIN mean level if we can recover means
+            try:
+                train_df_local = globals().get("train_df", None)
+                if isinstance(train_df_local, pd.DataFrame) and {"asset","realised_vol"}.issubset(train_df_local.columns):
+                    train_means = train_df_local.groupby("asset")["realised_vol"].mean().to_dict()
+                else:
+                    train_means = {}
+                val_means = df_val.groupby("asset")["y_vol"].mean().to_dict()
+                calib = adjust_calibrator_level(calib, train_means, val_means, tau=0.9)
+            except Exception:
+                pass
+
+            def _apply_cal(df_in: pd.DataFrame) -> pd.DataFrame:
+                if df_in is None or df_in.empty:
+                    return None
+                out = df_in.copy()
+                try:
+                    out["y_vol_pred_cal"] = apply_log_calibrator_on_array(out["y_vol_pred"].values, out["asset"].values, calib)
+                except Exception:
+                    out["y_vol_pred_cal"] = out["y_vol_pred"].values
+                # Calibrate q05/q95 if present
+                for qcol in ("y_vol_pred_q05", "y_vol_pred_q95"):
+                    if qcol in out.columns and out[qcol].notna().any():
+                        try:
+                            out[qcol+"_cal"] = apply_log_calibrator_on_array(out[qcol].astype(float).values, out["asset"].values, calib)
+                        except Exception:
+                            out[qcol+"_cal"] = out[qcol].values
+                # Enforce monotonicity around calibrated median if bands exist
+                try:
+                    if "y_vol_pred_q05_cal" in out.columns and "y_vol_pred_q95_cal" in out.columns:
+                        q05 = pd.to_numeric(out["y_vol_pred_q05_cal"], errors="coerce")
+                        q50 = pd.to_numeric(out["y_vol_pred_cal"], errors="coerce")
+                        q95 = pd.to_numeric(out["y_vol_pred_q95_cal"], errors="coerce")
+                        out["y_vol_pred_q05_cal"] = np.minimum(q05, np.minimum(q50, q95))
+                        out["y_vol_pred_q95_cal"] = np.maximum(q95, np.maximum(q50, q05))
+                except Exception:
+                    pass
+                return out
+
+            df_val_cal = _apply_cal(df_val)
+            df_tst_cal = _apply_cal(df_tst)
+
+            if df_val_cal is not None:
+                _save_parquet(df_val_cal, LOCAL_OUTPUT_DIR / f"tft_val_predictions_cal_{tag}_{RUN_SUFFIX}.parquet")
+            if df_tst_cal is not None:
+                _save_parquet(df_tst_cal, LOCAL_OUTPUT_DIR / f"tft_test_predictions_cal_{tag}_{RUN_SUFFIX}.parquet")
+
+        # 4) DM payload for TEST only
+        if df_tst is not None and not df_tst.empty:
+            df_dm = _augment_with_pointwise_losses_for_dm(df_tst, floor=float(globals().get("EVAL_VOL_FLOOR", 1e-8)))
+            _save_parquet(df_dm, LOCAL_OUTPUT_DIR / f"dm_payload_test_{tag}_{RUN_SUFFIX}.parquet")
+
     @torch.no_grad()
     def on_fit_end(self, trainer, pl_module):
-        test_dl = self._resolve_test_dl()
-        if test_dl is None:
-            print("[DM] No test_dataloader found; skipping DM payload.")
+        # Always save for the in-memory (last) model
+        try:
+            self._save_pred_bundles(trainer, pl_module, tag="last")
+            print("✓ Saved LAST (in-memory) VAL/TEST uncal+cal predictions and TEST DM payload.")
+        except Exception as e:
+            print(f"[WARN] Could not save LAST prediction bundles: {e}")
+
+        # If we have a best checkpoint, load and save under tag='best'
+        best_path = self._find_best_ckpt_path(trainer)
+        if not best_path:
+            print("[DM] No best checkpoint path found; skipping BEST bundles.")
             return
         try:
-            df_test = collect_split_predictions(trainer, test_dl, split="test")
-            df_dm = _augment_with_pointwise_losses_for_dm(
-                df_test, floor=float(globals().get("EVAL_VOL_FLOOR", 1e-8))
-            )
-            df_dm["split"] = "test"
-            out_path = LOCAL_OUTPUT_DIR / f"dm_payload_test_{RUN_SUFFIX}.parquet"
-            _save_parquet(df_dm, out_path)  # uses your existing _save_parquet (writes + optional GCS)
-            print(f"✓ Saved DM TEST payload → {out_path}")
+            cls = type(pl_module)
+            best_model = cls.load_from_checkpoint(best_path, strict=False)
+            # Move to same device as current module if possible
+            try:
+                dev = getattr(pl_module, "device", None)
+                if dev is not None:
+                    best_model.to(dev)
+            except Exception:
+                pass
+            best_model.eval()
+            self._save_pred_bundles(trainer, best_model, tag="best")
+            print(f"✓ Saved BEST checkpoint bundles from: {best_path}")
         except Exception as e:
-            print(f"[WARN] DM payload (test) not written: {e}")
+            print(f"[WARN] Could not load/save BEST checkpoint bundles: {e}")
 
 def _save_parquet(df: pd.DataFrame, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -3326,6 +3456,73 @@ if __name__ == "__main__":
 
     # Train the model
     trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
+
+    # ================= SAVE TEST PREDICTIONS & DM PAYLOADS: LAST & BEST =================
+    import copy, torch
+
+    # --- 1) LAST CHECKPOINT (weights as they are after fit) ---
+    try:
+        # Collect TEST predictions (uncalibrated) with the current in-memory weights ("last")
+        df_test_last = collect_split_predictions(trainer, test_dataloader, split="test")
+
+        # Save DM payload for LAST
+        df_dm_last = _augment_with_pointwise_losses_for_dm(
+            df_test_last, floor=float(globals().get("EVAL_VOL_FLOOR", 1e-8))
+        )
+        df_dm_last["split"] = "test"
+        out_dm_last = LOCAL_OUTPUT_DIR / f"dm_payload_test_last_{RUN_SUFFIX}.parquet"
+        _save_parquet(df_dm_last, out_dm_last)
+        print(f"✓ Saved DM TEST payload (LAST) → {out_dm_last}")
+    except Exception as e:
+        print(f"[WARN] Could not save DM TEST payload (LAST): {e}")
+
+    # --- 2) BEST CHECKPOINT (re-load best weights, collect, then restore) ---
+    try:
+        # Resolve best checkpoint path from ModelCheckpoint callback
+        best_path = None
+        for cb in trainer.callbacks:
+            if hasattr(cb, "best_model_path") and cb.best_model_path:
+                best_path = cb.best_model_path
+                break
+        if not best_path:
+            raise RuntimeError("Best checkpoint path not found on trainer.callbacks")
+
+        print(f"[BEST] Loading best checkpoint → {best_path}")
+
+        # Save current weights so we can restore after collecting best
+        _state_last = copy.deepcopy(model.state_dict())
+
+        # Load best weights into the same model instance
+        ckpt = torch.load(best_path, map_location="cpu")
+        sd = ckpt.get("state_dict", ckpt)
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        if missing or unexpected:
+            print(f"[BEST] load_state_dict: missing={len(missing)} unexpected={len(unexpected)}")
+        model.eval()
+
+        # Collect TEST predictions with BEST weights
+        df_test_best = collect_split_predictions(trainer, test_dataloader, split="test")
+
+        # Save raw TEST predictions (UNCAL) for BEST
+        out_pred_best = LOCAL_OUTPUT_DIR / f"tft_test_predictions_uncal_best_{RUN_SUFFIX}.parquet"
+        _save_parquet(df_test_best, out_pred_best)
+        print(f"✓ Wrote TEST uncal (BEST) → {out_pred_best}")
+
+        # Save DM payload for BEST
+        df_dm_best = _augment_with_pointwise_losses_for_dm(
+            df_test_best, floor=float(globals().get("EVAL_VOL_FLOOR", 1e-8))
+        )
+        df_dm_best["split"] = "test"
+        out_dm_best = LOCAL_OUTPUT_DIR / f"dm_payload_test_best_{RUN_SUFFIX}.parquet"
+        _save_parquet(df_dm_best, out_dm_best)
+        print(f"✓ Saved DM TEST payload (BEST) → {out_dm_best}")
+
+        # Restore LAST weights back into model (optional but keeps state consistent)
+        model.load_state_dict(_state_last, strict=False)
+        model.train()
+    except Exception as e:
+        print(f"[WARN] BEST checkpoint export failed: {e}")
+    # ==========================================================
     # --- DM payload (TEST only) ---
     try:
         # Collect UNCALIBRATED pointwise predictions on TEST, then attach per-sample losses
