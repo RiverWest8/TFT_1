@@ -3090,7 +3090,7 @@ if __name__ == "__main__":
     train_df = add_calendar_features(train_df)
     val_df   = add_calendar_features(val_df)
     test_df  = add_calendar_features(test_df)
-    ''' 
+     
     # --- Drop MVMD features (for runs without MVMD) ---
     def drop_mvmd_cols(df: pd.DataFrame) -> pd.DataFrame:
         if df is not None:
@@ -3103,7 +3103,7 @@ if __name__ == "__main__":
     train_df = drop_mvmd_cols(train_df)
     val_df   = drop_mvmd_cols(val_df)
     test_df  = drop_mvmd_cols(test_df)
-    '''
+    
     # Optional quick-run subsetting for speed
     _mode = getattr(ARGS, "subset_mode", "per_asset_tail")
     if getattr(ARGS, "train_max_rows", None):
@@ -3358,7 +3358,7 @@ if __name__ == "__main__":
 
 
     FIXED_VOL_WEIGHT = 1.0
-    FIXED_DIR_WEIGHT = 0.0
+    FIXED_DIR_WEIGHT = 0.1
  
 
     tft = TemporalFusionTransformer.from_dataset(
