@@ -380,31 +380,16 @@ def _extract_vol_quantiles(pred):
 @torch.no_grad()
 def collect_split_predictions(trainer,
                               dataloader,
-                              split: str,
-                              pl_module=None) -> pd.DataFrame:
+                              split: str) -> pd.DataFrame:
     """
     Predicts with the current in-memory model (no ckpt reload) and returns an
     UNCALIBRATED dataframe with:
       asset, time_idx, y_vol, y_vol_pred, y_vol_pred_q05, y_vol_pred_q95, y_dir, y_dir_prob
     """
-    model = pl_module or getattr(trainer, "lightning_module", None)
+    model = getattr(trainer, "lightning_module", None)
     if model is None:
         raise RuntimeError("No model in memory to predict with.")
-    # Try to move to a sensible device (works even if trainer is None)
-    dev = None
-    try:
-        dev = getattr(getattr(trainer, "lightning_module", None), "device", None)
-    except Exception:
-        dev = None
-    if dev is None:
-        dev = getattr(model, "device", None)
-    try:
-        if dev is not None:
-            model.eval().to(dev)
-        else:
-            model.eval()
-    except Exception:
-        model.eval()
+    model.eval().to(trainer.lightning_module.device)
 
     # try to recover ID->name map and normalizer
     id_to_name = {}
@@ -624,223 +609,6 @@ def collect_split_predictions(trainer,
         print(f"[WARN] could not enforce quantiles: {_e_q}")
 
     return df
-
-# ---------------- DM (Diebold–Mariano) helpers: TEST-only payload ----------------
-def _augment_with_pointwise_losses_for_dm(df: pd.DataFrame, floor: float = 1e-8) -> pd.DataFrame:
-    """
-    Add per-sample losses needed for DM tests (regression + direction).
-    Works post-hoc on the dataframe returned by `collect_split_predictions`.
-
-    Losses (elementwise):
-      • vol_loss_mae    = |ŷ - y|
-      • vol_loss_sq     = (ŷ - y)^2
-      • vol_loss_qlike  = (y^2 / max(ŷ, eps)^2) - log(y^2 / max(ŷ, eps)^2) - 1
-      • dir_loss_brier  = (p - y_dir)^2  (if direction cols exist)
-      • dir_loss_01     = 1{ 1[p>=0.5] ≠ y_dir } (if direction cols exist)
-    """
-    if df is None or df.empty:
-        return df
-
-    out = df.copy()
-
-    # Ensure numeric with safe floors
-    y = pd.to_numeric(out.get("y_vol"), errors="coerce").astype(float)
-    p = pd.to_numeric(out.get("y_vol_pred"), errors="coerce").astype(float)
-    eps = float(floor)
-
-    # Regression losses
-    diff = p - y
-    out["vol_loss_mae"] = np.abs(diff)
-    out["vol_loss_sq"] = diff * diff
-
-    s2y = np.square(y)
-    s2p = np.square(np.clip(p, eps, np.inf))
-    ratio = s2y / s2p
-    ratio = np.clip(ratio, np.exp(-50.0), np.exp(50.0))  # numerical guard
-    out["vol_loss_qlike"] = (ratio - np.log(ratio) - 1.0)
-
-    # Direction losses (if available)
-    if "y_dir" in out.columns and "y_dir_prob" in out.columns:
-        yd = pd.to_numeric(out["y_dir"], errors="coerce").astype(float)
-        pr = pd.to_numeric(out["y_dir_prob"], errors="coerce").astype(float).clip(0.0, 1.0)
-        out["dir_loss_brier"] = (pr - yd) ** 2
-        out["dir_loss_01"] = ((pr >= 0.5).astype(int) != yd.astype(int)).astype(int)
-    else:
-        out["dir_loss_brier"] = np.nan
-        out["dir_loss_01"] = np.nan
-
-    # Basic keys for alignment (ensure they exist)
-    for c in ("asset", "time_idx", "Time", "split"):
-        if c not in out.columns:
-            out[c] = np.nan
-
-    # Normalise dtypes
-    out["asset"] = out["asset"].astype(str)
-    try:
-        out["time_idx"] = pd.to_numeric(out["time_idx"], errors="coerce").astype("Int64")
-    except Exception:
-        pass
-    try:
-        out["Time"] = pd.to_datetime(out["Time"], errors="coerce")
-    except Exception:
-        pass
-
-    return out
-
-
-class SaveTestDMPayloadCallback(pl.Callback):
-    """
-    On fit end, collect TEST predictions and write a DM-ready parquet with per-sample losses.
-    Additionally, save VAL/TEST **uncalibrated** and **calibrated** prediction parquets for
-    both the in-memory ("last") model and the best checkpoint model.
-
-    Hard-coded: TEST-only DM payloads. No CLI flags.
-    """
-    def __init__(self, val_dataloader=None, test_dataloader=None):
-        super().__init__()
-        self._val_dl = val_dataloader
-        self._test_dl = test_dataloader
-
-    def _resolve_val_dl(self):
-        if self._val_dl is not None:
-            return self._val_dl
-        try:
-            return globals().get("val_dataloader", None)
-        except Exception:
-            return None
-
-    def _resolve_test_dl(self):
-        if self._test_dl is not None:
-            return self._test_dl
-        try:
-            return globals().get("test_dataloader", None)
-        except Exception:
-            return None
-
-    def _find_best_ckpt_path(self, trainer):
-        try:
-            from lightning.pytorch.callbacks import ModelCheckpoint
-        except Exception:
-            ModelCheckpoint = None
-        best = None
-        try:
-            for cb in getattr(trainer, "callbacks", []) or []:
-                if ModelCheckpoint is not None and isinstance(cb, ModelCheckpoint):
-                    p = getattr(cb, "best_model_path", None)
-                    if p and os.path.exists(p):
-                        best = p
-                        break
-        except Exception:
-            best = None
-        return best
-
-    @torch.no_grad()
-    def _save_pred_bundles(self, trainer, pl_module, tag: str):
-        """Save VAL/TEST uncal + cal bundles for the given module under a tag ('last'/'best')."""
-        val_dl = self._resolve_val_dl()
-        test_dl = self._resolve_test_dl()
-        if val_dl is None and test_dl is None:
-            print(f"[DM] No dataloaders available; skipping {tag} bundles.")
-            return
-
-        # 1) Collect UNCAL predictions
-        df_val = collect_split_predictions(trainer, val_dl, split="val", pl_module=pl_module) if val_dl is not None else None
-        df_tst = collect_split_predictions(trainer, test_dl, split="test", pl_module=pl_module) if test_dl is not None else None
-
-        # 2) Save UNCAL parquets
-        if df_val is not None and not df_val.empty:
-            _save_parquet(df_val, LOCAL_OUTPUT_DIR / f"tft_val_predictions_uncal_{tag}_{RUN_SUFFIX}.parquet")
-        if df_tst is not None and not df_tst.empty:
-            _save_parquet(df_tst, LOCAL_OUTPUT_DIR / f"tft_test_predictions_uncal_{tag}_{RUN_SUFFIX}.parquet")
-
-        # 3) Fit per-asset log-linear calibrator on VAL and apply to VAL/TEST
-        if df_val is not None and not df_val.empty:
-            calib = fit_log_calibrator_per_asset(df_val, y_col="y_vol", p_col="y_vol_pred")
-            # Optional: anchor intercepts toward TRAIN mean level if we can recover means
-            try:
-                train_df_local = globals().get("train_df", None)
-                if isinstance(train_df_local, pd.DataFrame) and {"asset","realised_vol"}.issubset(train_df_local.columns):
-                    train_means = train_df_local.groupby("asset")["realised_vol"].mean().to_dict()
-                else:
-                    train_means = {}
-                val_means = df_val.groupby("asset")["y_vol"].mean().to_dict()
-                calib = adjust_calibrator_level(calib, train_means, val_means, tau=0.9)
-            except Exception:
-                pass
-
-            def _apply_cal(df_in: pd.DataFrame) -> pd.DataFrame:
-                if df_in is None or df_in.empty:
-                    return None
-                out = df_in.copy()
-                try:
-                    out["y_vol_pred_cal"] = apply_log_calibrator_on_array(out["y_vol_pred"].values, out["asset"].values, calib)
-                except Exception:
-                    out["y_vol_pred_cal"] = out["y_vol_pred"].values
-                # Calibrate q05/q95 if present
-                for qcol in ("y_vol_pred_q05", "y_vol_pred_q95"):
-                    if qcol in out.columns and out[qcol].notna().any():
-                        try:
-                            out[qcol+"_cal"] = apply_log_calibrator_on_array(out[qcol].astype(float).values, out["asset"].values, calib)
-                        except Exception:
-                            out[qcol+"_cal"] = out[qcol].values
-                # Enforce monotonicity around calibrated median if bands exist
-                try:
-                    if "y_vol_pred_q05_cal" in out.columns and "y_vol_pred_q95_cal" in out.columns:
-                        q05 = pd.to_numeric(out["y_vol_pred_q05_cal"], errors="coerce")
-                        q50 = pd.to_numeric(out["y_vol_pred_cal"], errors="coerce")
-                        q95 = pd.to_numeric(out["y_vol_pred_q95_cal"], errors="coerce")
-                        out["y_vol_pred_q05_cal"] = np.minimum(q05, np.minimum(q50, q95))
-                        out["y_vol_pred_q95_cal"] = np.maximum(q95, np.maximum(q50, q05))
-                except Exception:
-                    pass
-                return out
-
-            df_val_cal = _apply_cal(df_val)
-            df_tst_cal = _apply_cal(df_tst)
-
-            if df_val_cal is not None:
-                _save_parquet(df_val_cal, LOCAL_OUTPUT_DIR / f"tft_val_predictions_cal_{tag}_{RUN_SUFFIX}.parquet")
-            if df_tst_cal is not None:
-                _save_parquet(df_tst_cal, LOCAL_OUTPUT_DIR / f"tft_test_predictions_cal_{tag}_{RUN_SUFFIX}.parquet")
-
-        # 4) DM payload for TEST only
-        if df_tst is not None and not df_tst.empty:
-            df_dm = _augment_with_pointwise_losses_for_dm(df_tst, floor=float(globals().get("EVAL_VOL_FLOOR", 1e-8)))
-            _save_parquet(df_dm, LOCAL_OUTPUT_DIR / f"dm_payload_test_{tag}_{RUN_SUFFIX}.parquet")
-            df_dm_cal = _augment_with_pointwise_losses_for_dm(
-                df_tst_cal, floor=float(globals().get("EVAL_VOL_FLOOR", 1e-8))
-            )
-            _save_parquet(df_dm_cal, LOCAL_OUTPUT_DIR / f"dm_payload_test_cal_{tag}_{RUN_SUFFIX}.parquet")
-
-    @torch.no_grad()
-    def on_fit_end(self, trainer, pl_module):
-        # Always save for the in-memory (last) model
-        try:
-            self._save_pred_bundles(trainer, pl_module, tag="last")
-            print("✓ Saved LAST (in-memory) VAL/TEST uncal+cal predictions and TEST DM payload.")
-        except Exception as e:
-            print(f"[WARN] Could not save LAST prediction bundles: {e}")
-
-        # If we have a best checkpoint, load and save under tag='best'
-        best_path = self._find_best_ckpt_path(trainer)
-        if not best_path:
-            print("[DM] No best checkpoint path found; skipping BEST bundles.")
-            return
-        try:
-            cls = type(pl_module)
-            best_model = cls.load_from_checkpoint(best_path, strict=False)
-            # Move to same device as current module if possible
-            try:
-                dev = getattr(pl_module, "device", None)
-                if dev is not None:
-                    best_model.to(dev)
-            except Exception:
-                pass
-            best_model.eval()
-            self._save_pred_bundles(trainer, best_model, tag="best")
-            print(f"✓ Saved BEST checkpoint bundles from: {best_path}")
-        except Exception as e:
-            print(f"[WARN] Could not load/save BEST checkpoint bundles: {e}")
 
 def _save_parquet(df: pd.DataFrame, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2667,7 +2435,6 @@ EXTRA_CALLBACKS = [
           save_top_k=2,
           save_last=True,
       ),
-      StochasticWeightAveraging(swa_lrs = 4.25e5 , annealing_epochs = 1, annealing_strategy="cos", swa_epoch_start=max(1, int(0.9 * MAX_EPOCHS))),
       CosineLR(start_epoch=8, eta_min_ratio=0.05, hold_last_epochs=1, warmup_steps=0),
       ]
 
@@ -3090,7 +2857,7 @@ if __name__ == "__main__":
     train_df = add_calendar_features(train_df)
     val_df   = add_calendar_features(val_df)
     test_df  = add_calendar_features(test_df)
-     
+    '''
     # --- Drop MVMD features (for runs without MVMD) ---
     def drop_mvmd_cols(df: pd.DataFrame) -> pd.DataFrame:
         if df is not None:
@@ -3103,7 +2870,7 @@ if __name__ == "__main__":
     train_df = drop_mvmd_cols(train_df)
     val_df   = drop_mvmd_cols(val_df)
     test_df  = drop_mvmd_cols(test_df)
-    
+    '''
     # Optional quick-run subsetting for speed
     _mode = getattr(ARGS, "subset_mode", "per_asset_tail")
     if getattr(ARGS, "train_max_rows", None):
@@ -3358,7 +3125,7 @@ if __name__ == "__main__":
 
 
     FIXED_VOL_WEIGHT = 1.0
-    FIXED_DIR_WEIGHT = 0.1
+    FIXED_DIR_WEIGHT = 0.0
  
 
     tft = TemporalFusionTransformer.from_dataset(
@@ -3426,8 +3193,7 @@ if __name__ == "__main__":
         enable_progress_bar=False,
     )
 
-    # Hard-coded: write DM TEST payload at end of training
-    trainer.callbacks.append(SaveTestDMPayloadCallback())
+
     from types import MethodType
 
     # Completely skip PF's internal figure creation & TensorBoard logging during validation.
@@ -3461,6 +3227,452 @@ if __name__ == "__main__":
     # Train the model
     trainer.fit(tft, train_dataloader, val_dataloader, ckpt_path=resume_ckpt)
 
+    # ---------- AFTER trainer.fit(model, ...) ----------
+
+    # ensure split DFs are available (for Time merge)
+    globals()["val_df"]  = val_df
+    globals()["test_df"] = test_df
+
+    # quick ranges (sanity)
+    def _split_range(df: pd.DataFrame):
+        if "Time" in df.columns:
+            t = pd.to_datetime(df["Time"], errors="coerce")
+            t = t[ t.notna() ]
+            if not t.empty:
+                return t.min(), t.max(), len(df)
+        return None, None, len(df)
+
+    vmin, vmax, vn = _split_range(val_df)
+    tmin, tmax, tn = _split_range(test_df)
+    print(f"[VAL]  N={vn}  Time[{vmin} → {vmax}]")
+    print(f"[TEST] N={tn}  Time[{tmin} → {tmax}]")
+
+    # 1) last-epoch predictions, uncalibrated
+    val_uncal_df  = collect_split_predictions(trainer, val_dataloader,  split="val")
+    test_uncal_df = collect_split_predictions(trainer, test_dataloader, split="test")
+
+    # normalize asset case for consistency
+    for _df in (train_df, val_df, test_df, val_uncal_df, test_uncal_df):
+        _df["asset"] = _df["asset"].astype(str).str.upper()
+
+    # warn if overlap by (asset,time_idx)
+    def _overlap(a: pd.DataFrame, b: pd.DataFrame) -> int:
+        cols = [c for c in ("asset","time_idx") if c in a.columns and c in b.columns]
+        if len(cols) < 2:
+            return 0
+        ka = a[cols].dropna().astype({cols[0]: str, cols[1]: int}).drop_duplicates()
+        kb = b[cols].dropna().astype({cols[0]: str, cols[1]: int}).drop_duplicates()
+        return int(ka.merge(kb, on=cols, how="inner").shape[0])
+    ov = _overlap(val_uncal_df, test_uncal_df)
+    if ov > 0:
+        print(f"[WARN] VAL/TEST predictions share {ov} rows by (asset,time_idx). Check your splits/data loaders.")
+
+    # 2) fit per-asset log calibrator on VAL, nudge intercept toward TRAIN
+    def _per_asset_mean(df: pd.DataFrame, col="realised_vol", asset_col="asset") -> dict:
+        g = df[[asset_col, col]].replace([np.inf, -np.inf], np.nan).dropna()
+        return g.groupby(asset_col)[col].mean().to_dict() if not g.empty else {}
+
+    calib_raw = fit_log_calibrator_per_asset(
+        df_val=val_uncal_df.rename(columns={"y_vol":"y_vol","y_vol_pred":"y_vol_pred"}),
+        asset_col="asset", y_col="y_vol", p_col="y_vol_pred"
+    )
+    train_means = _per_asset_mean(train_df, col="realised_vol")
+    val_means   = _per_asset_mean(val_df,   col="realised_vol")
+    calib_adj   = adjust_calibrator_level(calib_raw, train_means, val_means, tau=0.9, cap_abs_log=np.log(2.0))
+
+    # 3) apply calibrator to both VAL and TEST
+    def _apply_cal(df_in: pd.DataFrame, label: str) -> pd.DataFrame:
+        df = df_in.copy()
+
+        # Ensure required columns exist
+        if "y_vol_pred" not in df.columns:
+            # fall back: if missing, just copy y_vol into pred to keep shape
+            df["y_vol_pred"] = df.get("y_vol", pd.Series(index=df.index, dtype="float64"))
+
+        # Normalise asset case for lookup
+        a = df["asset"].astype(str).str.upper().to_numpy() if "asset" in df.columns else np.array(["UNK"] * len(df))
+
+        # Always create the calibrated columns (fall back to identity on failure)
+        try:
+            cal_vals = apply_log_calibrator_on_array(df["y_vol_pred"].to_numpy(), a, calib_adj)
+        except Exception:
+            cal_vals = df["y_vol_pred"].to_numpy()
+        df["y_vol_pred_cal"] = cal_vals
+
+        if "y_vol_pred_q05" in df.columns and df["y_vol_pred_q05"].notna().any():
+            try:
+                df["y_vol_pred_q05_cal"] = apply_log_calibrator_on_array(df["y_vol_pred_q05"].to_numpy(), a, calib_adj)
+            except Exception:
+                df["y_vol_pred_q05_cal"] = df["y_vol_pred_q05"]
+
+        if "y_vol_pred_q95" in df.columns and df["y_vol_pred_q95"].notna().any():
+            try:
+                df["y_vol_pred_q95_cal"] = apply_log_calibrator_on_array(df["y_vol_pred_q95"].to_numpy(), a, calib_adj)
+            except Exception:
+                df["y_vol_pred_q95_cal"] = df["y_vol_pred_q95"]
+
+        df["split"] = label
+        return df
+
+    val_cal_df  = _apply_cal(val_uncal_df,  "val_cal")
+    test_cal_df = _apply_cal(test_uncal_df, "test_cal")
+
+    # === [CAL ALIGNMENT] Per-asset affine alignment (mean+std), TRAIN-anchored ===
+    # Why: VAL < TRAIN/TEST volatility → pure VAL-based calibration under-scales TEST.
+    # Fix: use VAL for slope (std ratio) but anchor intercept to a TRAIN/VAL blended mean per asset.
+
+    def _per_asset_means(df, y_col="y_vol", p_col="y_vol_pred_cal", asset_col="asset"):
+        g = df[[asset_col, y_col, p_col]].replace([np.inf, -np.inf], np.nan).dropna()
+        return (g.groupby(asset_col)[y_col].mean().to_dict(),
+                g.groupby(asset_col)[p_col].mean().to_dict())
+
+    def _per_asset_stds(df, y_col="y_vol", p_col="y_vol_pred_cal", asset_col="asset"):
+        g = df[[asset_col, y_col, p_col]].replace([np.inf, -np.inf], np.nan).dropna()
+        return (g.groupby(asset_col)[y_col].std(ddof=0).to_dict(),
+                g.groupby(asset_col)[p_col].std(ddof=0).to_dict())
+
+    def _compute_affine_alignment_blended(train_df_in, val_df_in,
+                                        y_col="y_vol", p_col="y_vol_pred_cal",
+                                        asset_col="asset", slope_clip=(0.8, 1.6),
+                                        train_weight_if_uplift=0.75, uplift_thresh=1.2):
+        """
+        Per-asset affine: p' = a + b p
+        b  ← clip(std_y_VAL / std_p_VAL)
+        a  ← sets mean(p') to a TRAIN/VAL blend:
+                mu_target = w*mu_train + (1-w)*mu_val
+            with w=0.75 if mu_train/mu_val > 1.2 (train clearly higher vol), else 0.5
+        """
+        eps = 1e-12
+        mu_tr_y, mu_tr_p = _per_asset_means(train_df_in, y_col, p_col, asset_col)
+        mu_va_y, mu_va_p = _per_asset_means(val_df_in,   y_col, p_col, asset_col)
+        sd_va_y, sd_va_p = _per_asset_stds(val_df_in,    y_col, p_col, asset_col)
+        out = {}
+        assets = set(list(mu_va_y.keys()) + list(mu_tr_y.keys()))
+        for a in assets:
+            my_tr = float(mu_tr_y.get(a, np.nan))
+            mp_tr = float(mu_tr_p.get(a, np.nan))
+            my_va = float(mu_va_y.get(a, np.nan))
+            mp_va = float(mu_va_p.get(a, np.nan))
+            sy_va = float(sd_va_y.get(a, np.nan))
+            sp_va = float(sd_va_p.get(a, np.nan))
+            # slope from VAL (std ratio), clipped
+            if not np.isfinite(sp_va) or sp_va < eps or not np.isfinite(sy_va):
+                b = 1.0
+            else:
+                b = float(np.clip(sy_va / max(sp_va, eps), slope_clip[0], slope_clip[1]))
+            # blend weight toward TRAIN if uplift vs VAL is large
+            w = 0.5
+            if np.isfinite(my_tr) and np.isfinite(my_va) and my_tr > 0 and my_va > 0:
+                if (my_tr / my_va) > uplift_thresh:
+                    w = float(train_weight_if_uplift)
+            mu_target = (w * (my_tr if np.isfinite(my_tr) else my_va)) + ((1.0 - w) * (my_va if np.isfinite(my_va) else my_tr))
+            if not np.isfinite(mu_target):
+                mu_target = my_va if np.isfinite(my_va) else my_tr
+            mu_p_anchor = mp_va if np.isfinite(mp_va) else mp_tr
+            if not np.isfinite(mu_p_anchor):
+                mu_p_anchor = 0.0
+            a0 = float(mu_target) - b * float(mu_p_anchor)
+            out[str(a)] = (a0, b)
+        return out
+
+    def _apply_affine_alignment(df, params, asset_col="asset",
+                                cols=("y_vol_pred_cal","y_vol_pred_q05_cal","y_vol_pred_q95_cal")):
+        if not params:
+            return df
+        out = df.copy()
+        for a, (A, B) in params.items():
+            m = out[asset_col].astype(str) == str(a)
+            for c in cols:
+                if c in out.columns:
+                    out.loc[m, c] = A + B * out.loc[m, c].astype(float)
+        return out
+
+    # Build TRAIN stats frame. If you don't have train preds, use y_vol as proxy (neutral).
+    try:
+        train_stats_df = train_df.rename(columns={"realised_vol": "y_vol"}).copy()
+        if "y_vol_pred_cal" not in train_stats_df.columns:
+            train_stats_df["y_vol_pred_cal"] = train_stats_df["y_vol"]
+    except Exception:
+        train_stats_df = val_cal_df  # safe fallback
+
+    # Compute and apply the affine mapping (VAL→ slope, TRAIN/VAL→ intercept target)
+    aff_blend = _compute_affine_alignment_blended(train_stats_df, val_cal_df,
+                                                y_col="y_vol", p_col="y_vol_pred_cal",
+                                                asset_col="asset",
+                                                slope_clip=(0.8, 1.4),
+                                                train_weight_if_uplift=0.75,
+                                                uplift_thresh=1.2)
+    val_cal_df  = _apply_affine_alignment(val_cal_df,  aff_blend, asset_col="asset")
+    test_cal_df = _apply_affine_alignment(test_cal_df, aff_blend, asset_col="asset")
+    print("[CAL] TRAIN-anchored affine alignment:", {k:(round(a,6), round(b,3)) for k,(a,b) in aff_blend.items()})
+
+    # === [CAL ALIGNMENT 2] Low-end fix via log-space isotonic multiplier + conditional q05/q95 ===
+    # Inserted AFTER affine alignment and BEFORE diagnostics/saving.
+
+    def _calib_fit_iso_mult_log(val_df, y_col="y_vol", p_col="y_vol_pred_cal", asset_col="asset",
+                                y_floor=1e-9, mult_clip=(0.3, 3.0), min_unique=40):
+        """
+        Learn per-asset monotone multiplier m(p) in log-space on VAL:
+            x = log(p), t = log(y) - log(p),   m = exp( iso(x) )
+        Returns dict[asset] -> (IsotonicRegression, use_log=True)
+        """
+        try:
+            from sklearn.isotonic import IsotonicRegression
+        except Exception:
+            print("[CAL] IsotonicRegression not available; skipping iso multiplier.")
+            return {}
+
+        models = {}
+        g = val_df[[asset_col, y_col, p_col]].replace([np.inf, -np.inf], np.nan).dropna()
+        if g.empty:
+            return models
+        for a, d in g.groupby(asset_col):
+            p = d[p_col].astype(float).to_numpy()
+            y = d[y_col].astype(float).to_numpy()
+            p = np.clip(p, y_floor, None)
+            y = np.clip(y, y_floor, None)
+            x = np.log(p)
+            t = np.log(y) - np.log(p)                     # ideal multiplier in log-space
+            lo, hi = np.log(mult_clip[0]), np.log(mult_clip[1])
+            if np.unique(x).size < max(10, min_unique):
+                continue
+            iso = IsotonicRegression(y_min=lo, y_max=hi, increasing=True, out_of_bounds="clip")
+            iso.fit(x, t)
+            models[str(a)] = (iso, True)
+        return models
+
+    def _calib_apply_iso_mult_log(df, models, asset_col="asset",
+                                  p_cols=("y_vol_pred_cal","y_vol_pred_q05_cal","y_vol_pred_q95_cal"),
+                                  y_floor=1e-9):
+        """
+        Apply m(p) to median and (optionally) to quantiles. Keeps non-negativity and quantile monotonicity.
+        """
+        if not models:
+            return df
+        out = df.copy()
+        for a, pack in models.items():
+            iso, use_log = pack
+            sel = out[asset_col].astype(str) == str(a)
+            if not np.any(sel) or iso is None:
+                continue
+            for c in p_cols:
+                if c in out.columns:
+                    p = out.loc[sel, c].astype(float).to_numpy()
+                    p = np.clip(p, y_floor, None)
+                    m = np.exp(iso.predict(np.log(p))) if use_log else iso.predict(p)
+                    out.loc[sel, c] = np.maximum(p * m, y_floor)
+        # keep quantiles monotone if present
+        if all(c in out.columns for c in ("y_vol_pred_q05_cal","y_vol_pred_cal","y_vol_pred_q95_cal")):
+            q05 = out["y_vol_pred_q05_cal"].to_numpy()
+            q50 = out["y_vol_pred_cal"].to_numpy()
+            q95 = out["y_vol_pred_q95_cal"].to_numpy()
+            out["y_vol_pred_q05_cal"] = np.minimum(q05, q50)
+            out["y_vol_pred_q95_cal"] = np.maximum(q95, q50)
+        return out
+
+    def _calib_fit_cond_residual_iso(val_df, y_col="y_vol", p_col="y_vol_pred_cal", asset_col="asset",
+                                     q_low=0.05, q_high=0.95, y_floor=1e-9, min_unique=40, use_log_x=True):
+        """
+        Learn per-asset conditional residual quantiles:
+            x = log(p_mid) if use_log_x else p_mid, r = y - p_mid
+        Fit isotonic models f05(x) ≈ Q_{0.05}(r|x), f95(x) ≈ Q_{0.95}(r|x)
+        Returns dict[asset] -> (iso05, iso95, use_log_x)
+        """
+        try:
+            from sklearn.isotonic import IsotonicRegression
+        except Exception:
+            print("[CAL] IsotonicRegression not available; skipping q05/q95 residual models.")
+            return {}
+        out = {}
+        g = val_df[[asset_col, y_col, p_col]].replace([np.inf, -np.inf], np.nan).dropna()
+        if g.empty:
+            return out
+        for a, d in g.groupby(asset_col):
+            p = d[p_col].astype(float).to_numpy()
+            y = d[y_col].astype(float).to_numpy()
+            p = np.clip(p, y_floor, None)
+            y = np.clip(y, y_floor, None)
+            r = y - p
+            x = np.log(p) if use_log_x else p
+            if np.unique(x).size < max(10, min_unique):
+                continue
+            # bin x, compute sample q05/q95 per bin, then isotonic-smooth
+            nb = max(20, int(np.sqrt(len(x))))
+            idx = np.argsort(x)
+            xb = x[idx]; rb = r[idx]
+            bins = np.array_split(np.arange(len(xb)), nb)
+            x_cent = np.array([xb[b].mean() for b in bins])
+            r05 = np.array([np.nanquantile(rb[b], q_low) for b in bins])
+            r95 = np.array([np.nanquantile(rb[b], q_high) for b in bins])
+            iso05 = IsotonicRegression(increasing=True, out_of_bounds="clip")
+            iso95 = IsotonicRegression(increasing=True, out_of_bounds="clip")
+            iso05.fit(x_cent, r05)
+            iso95.fit(x_cent, r95)
+            out[str(a)] = (iso05, iso95, use_log_x)
+        return out
+
+    def _calib_apply_cond_residual_iso(df, models, asset_col="asset",
+                                       p_mid="y_vol_pred_cal",
+                                       p_lo="y_vol_pred_q05_cal",
+                                       p_hi="y_vol_pred_q95_cal",
+                                       floor=1e-9):
+        """
+        Apply conditional residual quantiles to set q05/q95 around the calibrated median.
+        Enforces non-negativity and q05 ≤ q50 ≤ q95.
+        """
+        if not models:
+            return df
+        out = df.copy()
+        for a, pack in models.items():
+            iso05, iso95, use_log_x = pack
+            sel = out[asset_col].astype(str) == str(a)
+            if not np.any(sel) or p_mid not in out.columns or iso05 is None or iso95 is None:
+                continue
+            mid = out.loc[sel, p_mid].astype(float).to_numpy()
+            x = np.log(np.clip(mid, floor, None)) if use_log_x else np.clip(mid, floor, None)
+            lo = mid + iso05.predict(x)
+            hi = mid + iso95.predict(x)
+            lo = np.maximum(lo, floor)
+            hi = np.maximum(hi, lo)
+            if p_lo in out.columns:
+                out.loc[sel, p_lo] = lo
+            if p_hi in out.columns:
+                out.loc[sel, p_hi] = hi
+        return out
+
+    # ---- Fit on VAL (after affine), then apply to both VAL and TEST ----
+    _iso_models = _calib_fit_iso_mult_log(
+        val_cal_df,
+        y_col="y_vol", p_col="y_vol_pred_cal", asset_col="asset",
+        y_floor=float(globals().get("EVAL_VOL_FLOOR", 1e-9)),
+        mult_clip=(0.3, 2.5), min_unique=40,
+    )
+    if _iso_models:
+        val_cal_df  = _calib_apply_iso_mult_log(val_cal_df,  _iso_models, asset_col="asset")
+        test_cal_df = _calib_apply_iso_mult_log(test_cal_df, _iso_models, asset_col="asset")
+        print("[CAL] Applied per-asset isotonic multiplier (log-space).")
+
+    _res_models = _calib_fit_cond_residual_iso(
+        val_cal_df,
+        y_col="y_vol", p_col="y_vol_pred_cal", asset_col="asset",
+        q_low=0.05, q_high=0.95,
+        y_floor=float(globals().get("EVAL_VOL_FLOOR", 1e-9)),
+        min_unique=40, use_log_x=True,
+    )
+    if _res_models:
+        val_cal_df  = _calib_apply_cond_residual_iso(val_cal_df,  _res_models, asset_col="asset")
+        test_cal_df = _calib_apply_cond_residual_iso(test_cal_df, _res_models, asset_col="asset")
+        print("[CAL] Calibrated q05/q95 conditionally on the calibrated median.")
+
+    # --- [POST-ISO MEAN ANCHOR] Per-asset gentle mean re-alignment on VAL, applied to VAL & TEST ---
+    def _per_asset_mean_anchor(val_df, y_col="y_vol", p_col="y_vol_pred_cal",
+                            asset_col="asset", mult_clip=(0.9, 1.1), eps=1e-12):
+        """
+        Compute per-asset multiplicative factor c so that mean(c*p) ≈ mean(y) on VAL.
+        Clip c to avoid over-correction, then reuse c for TEST.
+        Returns dict[asset] -> c
+        """
+        factors = {}
+        g = val_df[[asset_col, y_col, p_col]].replace([np.inf, -np.inf], np.nan).dropna()
+        if g.empty:
+            return factors
+        for a, d in g.groupby(asset_col):
+            my = float(d[y_col].mean())
+            mp = float(d[p_col].mean())
+            if not np.isfinite(my) or not np.isfinite(mp) or mp <= eps:
+                c = 1.0
+            else:
+                c = np.clip(my / mp, mult_clip[0], mult_clip[1])
+            factors[str(a)] = float(c)
+        return factors
+
+    def _apply_mean_anchor(df, factors, asset_col="asset",
+                        cols=("y_vol_pred_cal","y_vol_pred_q05_cal","y_vol_pred_q95_cal"),
+                        floor=1e-9):
+        if not factors:
+            return df
+        out = df.copy()
+        for a, c in factors.items():
+            sel = out[asset_col].astype(str) == str(a)
+            if not np.any(sel):
+                continue
+            for ccol in cols:
+                if ccol in out.columns:
+                    v = out.loc[sel, ccol].astype(float).to_numpy()
+                    out.loc[sel, ccol] = np.maximum(v * float(c), floor)
+        # keep quantiles monotone if present
+        if all(cc in out.columns for cc in ("y_vol_pred_q05_cal","y_vol_pred_cal","y_vol_pred_q95_cal")):
+            q05 = out["y_vol_pred_q05_cal"].to_numpy()
+            q50 = out["y_vol_pred_cal"].to_numpy()
+            q95 = out["y_vol_pred_q95_cal"].to_numpy()
+            out["y_vol_pred_q05_cal"] = np.minimum(q05, q50)
+            out["y_vol_pred_q95_cal"] = np.maximum(q95, q50)
+        return out
+
+    _anchor = _per_asset_mean_anchor(val_cal_df, y_col="y_vol", p_col="y_vol_pred_cal",
+                                    asset_col="asset", mult_clip=(0.88, 1.12))
+    if _anchor:
+        val_cal_df  = _apply_mean_anchor(val_cal_df,  _anchor, asset_col="asset")
+        test_cal_df = _apply_mean_anchor(test_cal_df, _anchor, asset_col="asset")
+        print("[CAL] Applied post-iso mean anchor per asset:", {k: round(v, 4) for k, v in _anchor.items()})
+
+    # Diagnostics (means/stds by asset after alignment)
+    def _diag_by_asset(df, asset_col="asset", y_col="y_vol", p_col="y_vol_pred_cal", label="VAL"):
+        g = df[[asset_col, y_col, p_col]].replace([np.inf, -np.inf], np.nan).dropna()
+        rows = []
+        for a, d in g.groupby(asset_col):
+            rows.append((str(a),
+                        float(d[y_col].mean()), float(d[p_col].mean()),
+                        float(d[y_col].std(ddof=0)), float(d[p_col].std(ddof=0))))
+        if rows:
+            print(f"[CAL][{label}] asset  mean_y  mean_p  std_y  std_p")
+            for r in rows:
+                print(f"[CAL][{label}] {r[0]:>4}  {r[1]:.6g}  {r[2]:.6g}  {r[3]:.6g}  {r[4]:.6g}")
+
+    _diag_by_asset(val_cal_df,  label="VAL")
+    _diag_by_asset(test_cal_df, label="TEST")
+
+    _p_cal_mean = float(val_cal_df["y_vol_pred_cal"].mean()) if "y_vol_pred_cal" in val_cal_df.columns else float("nan")
+    print("VAL means:  y={:.6g}  p={:.6g}  p_cal={:.6g}".format(
+        val_uncal_df["y_vol"].mean(),  val_uncal_df["y_vol_pred"].mean(), _p_cal_mean))
+    _t_cal_mean = float(test_cal_df["y_vol_pred_cal"].mean()) if "y_vol_pred_cal" in test_cal_df.columns else float("nan")
+    print("TEST means: y={:.6g}  p={:.6g}  p_cal={:.6g}".format(
+        test_uncal_df["y_vol"].mean(), test_uncal_df["y_vol_pred"].mean(), _t_cal_mean))
+
+    # 4) save 4 parquets
+    OUT = Path(LOCAL_OUTPUT_DIR); OUT.mkdir(parents=True, exist_ok=True)
+    p_val_uncal = OUT / f"tft_val_predictions_uncal_last_{RUN_SUFFIX}.parquet"
+    p_val_cal   = OUT / f"tft_val_predictions_cal_last_{RUN_SUFFIX}.parquet"
+    p_tst_uncal = OUT / f"tft_test_predictions_uncal_last_{RUN_SUFFIX}.parquet"
+    p_tst_cal   = OUT / f"tft_test_predictions_cal_last_{RUN_SUFFIX}.parquet"
+
+    val_uncal_df.to_parquet(p_val_uncal, index=False)
+    val_cal_df.to_parquet(p_val_cal, index=False)
+    test_uncal_df.to_parquet(p_tst_uncal, index=False)
+    test_cal_df.to_parquet(p_tst_cal, index=False)
+
+    print(f"✓ Wrote VAL uncal → {p_val_uncal}")
+    print(f"✓ Wrote VAL  cal → {p_val_cal}")
+    print(f"✓ Wrote TEST uncal → {p_tst_uncal}")
+    print(f"✓ Wrote TEST  cal → {p_tst_cal}")
+    # Optional: upload to GCS if configured
+    try:
+        upload_file_to_gcs(str(p_val_uncal), f"{GCS_OUTPUT_PREFIX}/{p_val_uncal.name}")
+        upload_file_to_gcs(str(p_val_cal),   f"{GCS_OUTPUT_PREFIX}/{p_val_cal.name}")
+        upload_file_to_gcs(str(p_tst_uncal), f"{GCS_OUTPUT_PREFIX}/{p_tst_uncal.name}")
+        upload_file_to_gcs(str(p_tst_cal),   f"{GCS_OUTPUT_PREFIX}/{p_tst_cal.name}")
+    except Exception as e:
+        print(f"[WARN] GCS upload skipped: {e}")
+
+    # Resolve the best checkpoint
+    model_for_fi = _resolve_best_model(trainer, fallback=tft)
+
+    # Extract the same normalizer used for volatility during training
+    try:
+        train_vol_norm = _extract_norm_from_dataset(training_dataset)
+    except Exception as e:
+        print(f"[WARN] could not extract vol_norm from training dataset: {e}")
+        train_vol_norm = None
     # ---- Permutation Importance (decoded) ----
 if ENABLE_FEATURE_IMPORTANCE:
     fi_csv = str(LOCAL_OUTPUT_DIR / f"TFTPFI_e{MAX_EPOCHS}_{RUN_SUFFIX}.csv")
