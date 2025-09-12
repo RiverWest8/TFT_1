@@ -3326,7 +3326,7 @@ if __name__ == "__main__":
     print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.00091}")
     
     es_cb = EarlyStopping(
-    monitor="val_qlike_overall",
+    monitor="direction_overall",#direction_overall val_qlike_overall
     patience=EARLY_STOP_PATIENCE,
     mode="min",
     min_delta = 1e-4
