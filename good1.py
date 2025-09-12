@@ -1800,7 +1800,7 @@ class BiasWarmupCallback(pl.Callback):
         guard_patience: int = 2,
         guard_tol: float = 0.0,
         alpha_step: float = 0.05,
-        scale_ema_alpha: float = 0.5,
+        scale_ema_alpha: float = 0.88,
     ):
         super().__init__()
         self._vol_loss_hint = vol_loss
@@ -1860,7 +1860,7 @@ class BiasWarmupCallback(pl.Callback):
             vms = trainer.callback_metrics.get("val_mean_scale", None)
             if vms is not None:
                 s = float(vms.item() if hasattr(vms, "item") else vms)
-                a = getattr(self, "scale_ema_alpha", 0.5)
+                a = getattr(self, "scale_ema_alpha", 0.88)
                 self._scale_ema = s if (self._scale_ema is None) else (1.0 - a) * self._scale_ema + a * s
         except Exception:
             pass
@@ -1946,7 +1946,7 @@ class BiasWarmupCallback(pl.Callback):
         if hasattr(vol_loss, "qlike_weight") and self.qlike_target_weight is not None:
             q_target = float(self.qlike_target_weight)
             q_prog   = min(1.0, float(e) / float(max(self.warm, 8)))
-            near_ok  = (self._scale_ema is None) or (0.995 <= self._scale_ema <= 1.005)
+            near_ok  = (self._scale_ema is None) or (0.98 <= self._scale_ema <= 1.02)
 
             qlike_floor = 0.02  # keep some scale pressure even when gated
             if near_ok:
@@ -2626,7 +2626,7 @@ class ReduceLROnPlateauCallback(pl.Callback):
 VOL_LOSS = AsymmetricQuantileLoss(
     quantiles=VOL_QUANTILES,
     underestimation_factor=1.00,  # managed by BiasWarmupCallback
-    mean_bias_weight=0.02,        # small centering on the median for MAE
+    mean_bias_weight=0.01,        # small centering on the median for MAE
     tail_q=0.85,
     tail_weight=1.0,              # will be ramped by TailWeightRamp
     qlike_weight=0.0,             # QLIKE weight is ramped safely in BiasWarmupCallback
@@ -2636,15 +2636,15 @@ VOL_LOSS = AsymmetricQuantileLoss(
 EXTRA_CALLBACKS = [
       BiasWarmupCallback(
           vol_loss=VOL_LOSS,
-          target_under=1.06,
+          target_under=1.05,
           target_mean_bias=0.04,
-          warmup_epochs=8,
+          warmup_epochs=6,
           qlike_target_weight=0.05,   # keep out of the loss; diagnostics only
           start_mean_bias=0.02,
           mean_bias_ramp_until=6,
           guard_patience=getattr(ARGS, "warmup_guard_patience", 2),
           guard_tol=getattr(ARGS, "warmup_guard_tol", 0.005),
-          alpha_step=0.01,
+          alpha_step=0.04,
       ),
       TailWeightRamp(
           vol_loss=VOL_LOSS,
@@ -3356,8 +3356,8 @@ if __name__ == "__main__":
     DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.02, pos_weight=pos_weight)
 
 
-    FIXED_VOL_WEIGHT = 0
-    FIXED_DIR_WEIGHT = 1.0
+    FIXED_VOL_WEIGHT = 1.0
+    FIXED_DIR_WEIGHT = 0.1
  
 
     tft = TemporalFusionTransformer.from_dataset(
