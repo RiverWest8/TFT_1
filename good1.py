@@ -3422,7 +3422,7 @@ if __name__ == "__main__":
 
 
     FIXED_VOL_WEIGHT = 1.0
-    FIXED_DIR_WEIGHT = 0.1
+    FIXED_DIR_WEIGHT = 0.0000000
  
 
     tft = TemporalFusionTransformer.from_dataset(
@@ -3556,7 +3556,7 @@ if ENABLE_FEATURE_IMPORTANCE:
         if isinstance(x, tuple):
             casted = tuple(_deep_cpu_float(v) for v in x)
             try:
-                # preserve namedtuple types
+                # preserve namedtuple types 
                 return x.__class__(*casted)
             except Exception:
                 return casted
