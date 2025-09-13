@@ -2691,7 +2691,7 @@ class ReduceLROnPlateauCallback(pl.Callback):
 VOL_LOSS = AsymmetricQuantileLoss(
     quantiles=VOL_QUANTILES,
     underestimation_factor=1.00,  # managed by BiasWarmupCallback
-    mean_bias_weight=0.01,        # small centering on the median for MAE
+    mean_bias_weight=0.05,        # small centering on the median for MAE
     tail_q=0.85,
     tail_weight=1.0,              # will be ramped by TailWeightRamp
     qlike_weight=0.0,             # QLIKE weight is ramped safely in BiasWarmupCallback
@@ -2858,7 +2858,7 @@ try:
     torch.backends.cudnn.benchmark = False
 except Exception:
     pass
-WEIGHT_DECAY = 0.0001 #0.00578350719515325     # weight decay for AdamW
+WEIGHT_DECAY = 0.0004 #0.00578350719515325     # weight decay for AdamW
 GRADIENT_CLIP_VAL = 0.78 #0.78    # gradient clipping value for Trainer
 # Feature-importance controls
 ENABLE_FEATURE_IMPORTANCE = False   # gate FI so you can toggle it
@@ -3277,7 +3277,7 @@ if __name__ == "__main__":
                 GroupNormalizer(
                     groups=GROUP_ID,
                     center=False,
-                    scale_by_group= True, #True
+                    scale_by_group= False, #True
                     transformation="log1p",
                 ),
                 TorchNormalizer(method="identity", center=False),   # direction
@@ -3429,7 +3429,7 @@ if __name__ == "__main__":
         training_dataset,
         hidden_size=96,
         attention_head_size=4,
-        dropout=0.13, #0.0833704625250354,
+        dropout=0.15, #0.0833704625250354,
         hidden_continuous_size=24,
         learning_rate=(LR_OVERRIDE if LR_OVERRIDE is not None else 0.00085), #0.0019 0017978
         optimizer="AdamW",
