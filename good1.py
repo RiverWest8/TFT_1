@@ -51,6 +51,71 @@ import pandas as pd
 import math
 import pandas as _pd
 pd = _pd  # Ensure pd always refers to pandas module
+
+# --- Single-asset / drop-list filtering (applied right after any parquet load) ---
+import argparse as _argparse
+
+# Defaults updated by a lightweight pre-parse of CLI flags (won't conflict with the main parser)
+ASSET_KEEP = None            # e.g. "--asset BTC"
+ASSETS_DROP = set()          # e.g. "--drop_assets BTC,ETH,SOL"
+
+try:
+    _asset_parser = _argparse.ArgumentParser(add_help=False)
+    _asset_parser.add_argument("--asset", "--keep_asset", dest="keep_asset", type=str, default=None)
+    _asset_parser.add_argument("--drop_assets", type=str, default=None,
+                               help="Comma-separated list of assets to DROP after loading.")
+    _asset_args, _ = _asset_parser.parse_known_args()
+    if _asset_args.keep_asset:
+        ASSET_KEEP = str(_asset_args.keep_asset).strip()
+    if _asset_args.drop_assets:
+        ASSETS_DROP = {a.strip() for a in _asset_args.drop_assets.split(",") if a.strip()}
+except Exception:
+    # leave defaults
+    pass
+
+def _std_asset_col(df):
+    """
+    Ensure an 'asset' column exists and is uppercase.
+    Accepts common aliases: symbol/ticker/instrument (case-insensitive).
+    """
+    import pandas as _p
+    if df is None or not isinstance(df, _p.DataFrame):
+        return df
+    cand = None
+    for c in df.columns:
+        cl = str(c).strip().lower()
+        if cl in ("asset", "symbol", "ticker", "instrument"):
+            cand = c
+            break
+    if cand is None:
+        return df
+    if cand != "asset":
+        df = df.rename(columns={cand: "asset"})
+    df["asset"] = df["asset"].astype(str).str.upper()
+    return df
+
+def _apply_asset_filter(df):
+    """Apply keep/drop filters if set; otherwise, return df unchanged."""
+    try:
+        df = _std_asset_col(df)
+        if "asset" not in df.columns:
+            return df
+        if ASSET_KEEP:
+            return df[df["asset"] == str(ASSET_KEEP).upper()].copy()
+        if ASSETS_DROP:
+            drop_u = {a.upper() for a in ASSETS_DROP}
+            return df[~df["asset"].isin(drop_u)].copy()
+        return df
+    except Exception:
+        return df
+
+# Patch pandas.read_parquet so every parquet load is filtered automatically.
+_orig_read_parquet = pd.read_parquet
+def _read_parquet_patched(*args, **kwargs):
+    _df = _orig_read_parquet(*args, **kwargs)
+    return _apply_asset_filter(_df)
+pd.read_parquet = _read_parquet_patched
+# --- end single-asset / drop-list filtering block ---
 import lightning.pytorch as pl
 
 
