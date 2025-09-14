@@ -2727,7 +2727,7 @@ EXTRA_CALLBACKS = [
       ModelCheckpoint(
           dirpath=str(LOCAL_CKPT_DIR),
           filename="tft-{epoch:02d}-{val_mae_overall:.4f}",
-          monitor="val_comp_overall",
+          monitor="val_acc_overall",
           mode="min",
           save_top_k=2,
           save_last=True,
@@ -3470,7 +3470,7 @@ if __name__ == "__main__":
     checkpoint_callback = ModelCheckpoint(
         dirpath=str(LOCAL_OUTPUT_DIR),
         filename="tft-{epoch:02d}-{val_loss:.4f}",
-        monitor="val_qlike_overall",      # or val_qlike_overall if you want
+        monitor="val_acc_overall",      # or val_qlike_overall if you want
         save_top_k=1,            # keep best only
         save_last = True,
         auto_insert_metric_name=False,
