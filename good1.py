@@ -3421,8 +3421,8 @@ if __name__ == "__main__":
     DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.02, pos_weight=pos_weight)
 
 
-    FIXED_VOL_WEIGHT = 0.00000000
-    FIXED_DIR_WEIGHT = 1.0
+    FIXED_VOL_WEIGHT = 1.0
+    FIXED_DIR_WEIGHT = 0.1
  
 
     tft = TemporalFusionTransformer.from_dataset(
@@ -3470,7 +3470,7 @@ if __name__ == "__main__":
     checkpoint_callback = ModelCheckpoint(
         dirpath=str(LOCAL_OUTPUT_DIR),
         filename="tft-{epoch:02d}-{val_loss:.4f}",
-        monitor="val_acc_overall",      # or val_qlike_overall if you want
+        monitor="val_qlike_overall",      # or val_qlike_overall if you want
         save_top_k=1,            # keep best only
         save_last = True,
         auto_insert_metric_name=False,
