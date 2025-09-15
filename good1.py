@@ -1580,7 +1580,6 @@ class PerAssetMetrics(pl.Callback):
         trainer.callback_metrics["val_qlike_overall"]     = torch.tensor(overall_qlike)
         trainer.callback_metrics["val_qlike_cal"]     = torch.tensor(overall_qlike_cal)
         trainer.callback_metrics["val_N_overall"]         = torch.tensor(float(N))
-        trainer.callback_metrics["val_acc_overall"]   = torch.tensor(acc)
 
         msg = (
             f"[VAL EPOCH {epoch_num}] "
@@ -3392,7 +3391,7 @@ if __name__ == "__main__":
     print(f"[LR] learning_rate={LR_OVERRIDE if LR_OVERRIDE is not None else 0.00091}")
     
     es_cb = EarlyStopping(
-    monitor="val_acc_overall",#direction_overall val_qlike_overall
+    monitor="val_qlike_overall",#direction_overall val_qlike_overall
     patience=EARLY_STOP_PATIENCE,
     mode="min",
     min_delta = 1e-4
@@ -3422,8 +3421,8 @@ if __name__ == "__main__":
     DIR_LOSS = LabelSmoothedBCEWithBrier(smoothing=0.02, pos_weight=pos_weight)
 
 
-    FIXED_VOL_WEIGHT = 0.0
-    FIXED_DIR_WEIGHT = 1.0
+    FIXED_VOL_WEIGHT = 1.0
+    FIXED_DIR_WEIGHT = 0.1
  
 
     tft = TemporalFusionTransformer.from_dataset(
@@ -3471,7 +3470,7 @@ if __name__ == "__main__":
     checkpoint_callback = ModelCheckpoint(
         dirpath=str(LOCAL_OUTPUT_DIR),
         filename="tft-{epoch:02d}-{val_loss:.4f}",
-        monitor="val_acc_overall",      # or val_qlike_overall if you want
+        monitor="val_qlike_overall",      # or val_qlike_overall if you want
         save_top_k=1,            # keep best only
         save_last = True,
         auto_insert_metric_name=False,
@@ -3568,4 +3567,3 @@ if ENABLE_FEATURE_IMPORTANCE:
                 return x.astype(np.int64, copy=False)
             return x.astype(np.float32, copy=False)
         return x
-
